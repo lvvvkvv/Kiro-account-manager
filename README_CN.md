@@ -27,23 +27,24 @@
 
 ---
 
+## 🌐 广告 | Swiftproxy 住宅代理
+
 <img width="1774" height="887" alt="632547d8a6f9064ac8496b6cda4f4d81" src="https://github.com/user-attachments/assets/3d91a903-1c66-434b-a8d6-e73342920e7d" />
 
-## 🌐 推荐代理服务 - Swiftproxy
-
-> **🚀 Swiftproxy | 高质量全球住宅代理**
+> **📢 广告推广 · Advertisement**
 >
-> [**Swiftproxy**](https://www.swiftproxy.net/?ref=kiro) 提供高质量的动态和静态住宅代理，拥有 **9000 万+ 住宅 IP**，覆盖全球 **220+ 个地区**，支持 **HTTP(S)、SOCKS5、IP 轮换和粘性会话**。
+> **[Swiftproxy](https://www.swiftproxy.net/?ref=kiro)** 提供高质量动态和静态住宅代理，拥有 **9000 万+ 住宅 IP**，覆盖全球 **220+ 个地区**，支持 HTTP(S)、SOCKS5、IP 轮换与粘性会话。
 >
-> 无论是 **Kiro 账号管理、自动化注册，还是多账号网络访问**，Swiftproxy 都能提供灵活、稳定的住宅代理支持。
+> 无论是 **Kiro 账号管理、自动化注册还是多账号网络访问**，都能提供灵活的住宅代理支持。
 >
 > 💰 **动态住宅代理低至 $0.7/GB**
 >
-> 🎁 **专属优惠码：`PROXY90`，下单享受 9 折优惠！**
+> 🎁 **专属优惠码：`PROXY90`，享受 9 折优惠**
 >
-> 👉 **[点击访问 Swiftproxy 官网 →](https://www.swiftproxy.net/?ref=kiro)**
+> 👉 **[访问 Swiftproxy 官网 →](https://www.swiftproxy.net/?ref=kiro)**
 
 ---
+
 
 ## ✨ 功能特性
 
