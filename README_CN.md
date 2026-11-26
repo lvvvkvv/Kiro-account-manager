@@ -272,6 +272,7 @@ npx electron-builder --linux --arm64
 - 移除关于页面的作者、赞助支持、支付二维码，以及加入交流群按钮和弹窗。
 - 删除仓库中的 OpenSpec 目录。
 - 将上一版安装包已有的默认简体中文行为同步到源码，保留已保存的语言偏好。
+- 修复 Windows 构建环境兼容性和 macOS 临时签名，移除重复的 macOS 构建任务，并提供下载校验文件。
 
 ### v1.7.5 (2026-6-7) — 思考模式支持 + Enterprise profileArn 完整修复 + Agent 模式与 Steering + 工具调用泄漏修复
 

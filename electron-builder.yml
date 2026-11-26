@@ -1,5 +1,6 @@
 appId: com.kiro.account-manager
 productName: Kiro Account Manager
+afterPack: build/after-pack.cjs
 directories:
   buildResources: build
 files:

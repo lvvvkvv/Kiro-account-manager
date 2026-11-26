@@ -154,9 +154,6 @@ jobs:
   build-macos:
     needs: get-version
     runs-on: macos-latest
-    strategy:
-      matrix:
-        arch: [x64, arm64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -184,16 +181,16 @@ jobs:
         working-directory: ${{ env.WORKING_DIR }}
         run: npm run build
 
-      - name: Package macOS ${{ matrix.arch }}
+      - name: Package macOS x64 and arm64
         working-directory: ${{ env.WORKING_DIR }}
-        run: npx electron-builder --mac --${{ matrix.arch }} -p never
+        run: npx electron-builder --mac -p never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}
+          name: macos
           path: |
             ${{ env.WORKING_DIR }}/dist/*.dmg
             ${{ env.WORKING_DIR }}/dist/*.zip
@@ -294,6 +291,10 @@ jobs:
           echo "=== Release assets (deduplicated) ==="
           ls -lh release-assets/
 
+      - name: Generate download checksums
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -311,6 +312,9 @@ jobs:
             ---
 
             ${{ needs.get-version.outputs.changelog_en }}
+
+            macOS 安装包使用 ad-hoc 签名，未进行 Apple Developer ID 签名或公证。
+            macOS packages are ad-hoc signed, without Apple Developer ID signing or notarization.
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
