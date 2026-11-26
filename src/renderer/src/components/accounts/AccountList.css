@@ -1,0 +1,57 @@
+.account-list {
+  container-type: inline-size;
+}
+
+.account-list-row {
+  display: grid;
+  min-height: 72px;
+  grid-template-columns: 16px minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas:
+    'select identity identity'
+    '. badges badges'
+    '. usage time'
+    '. actions actions';
+}
+
+.account-list-select {
+  grid-area: select;
+}
+
+.account-list-identity {
+  grid-area: identity;
+}
+
+.account-list-badges {
+  grid-area: badges;
+}
+
+.account-list-usage {
+  grid-area: usage;
+}
+
+.account-list-time {
+  grid-area: time;
+}
+
+.account-list-actions {
+  grid-area: actions;
+}
+
+/* 使用列表容器宽度，侧栏展开和窗口缩放都会触发重排。 */
+@container (min-width: 640px) {
+  .account-list-row {
+    grid-template-columns: 16px minmax(0, 1fr) 96px minmax(0, 1fr);
+    grid-template-areas:
+      'select identity badges badges'
+      '. usage time actions';
+  }
+}
+
+@container (min-width: 1000px) {
+  .account-list-row {
+    grid-template-columns:
+      16px minmax(140px, 1fr) minmax(220px, 1.3fr)
+      minmax(120px, 0.8fr) 88px 188px;
+    grid-template-areas: 'select identity badges usage time actions';
+  }
+}

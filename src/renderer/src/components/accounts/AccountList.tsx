@@ -6,13 +6,14 @@ import { AccountListRow } from './AccountListRow'
 import { AccountDetailDialog } from './AccountDetailDialog'
 import type { Account } from '@/types/account'
 import { Plus } from 'lucide-react'
+import './AccountList.css'
 
 interface AccountListProps {
   onAddAccount: () => void
   onEditAccount: (account: Account) => void
 }
 
-// 列表行高度（紧凑型，对齐卡片视觉细节）
+// 估算紧凑行高度；换行后的实际高度由虚拟列表测量。
 const ROW_HEIGHT = 72
 // 行间距（虚拟行之间保留间距）
 const ROW_GAP = 10
@@ -28,11 +29,11 @@ export function AccountList({ onAddAccount, onEditAccount }: AccountListProps): 
 
   const accounts = getFilteredAccounts()
 
-  const handleShowDetail = (account: Account) => {
+  const handleShowDetail = (account: Account): void => {
     setDetailAccount(account)
   }
 
-  const handleRefreshDetail = async () => {
+  const handleRefreshDetail = async (): Promise<void> => {
     if (!detailAccount) return
     setIsRefreshing(true)
     try {
@@ -44,23 +45,28 @@ export function AccountList({ onAddAccount, onEditAccount }: AccountListProps): 
     }
   }
 
-  // 虚拟列表（每项含一个行高 + 间距）
+  // 按账号缓存实际行高，支持响应式换行与筛选、排序。
   const virtualizer = useVirtualizer({
     count: accounts.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => ROW_HEIGHT + ROW_GAP,
+    estimateSize: () => ROW_HEIGHT,
+    getItemKey: (index) => accounts[index].id,
+    gap: ROW_GAP,
     overscan: 8
   })
 
   const items = virtualizer.getVirtualItems()
 
   return (
-    <div ref={parentRef} className="h-full overflow-auto" style={{ contain: 'strict' }}>
+    <div
+      ref={parentRef}
+      className="account-list h-full min-w-0 overflow-x-hidden overflow-y-auto"
+      style={{ contain: 'strict' }}
+    >
       <div
         style={{
           height: `${virtualizer.getTotalSize() + 80}px`,
           width: '100%',
-          minWidth: accounts.length ? '1480px' : undefined,
           position: 'relative'
         }}
       >
@@ -70,12 +76,13 @@ export function AccountList({ onAddAccount, onEditAccount }: AccountListProps): 
           return (
             <div
               key={virtualRow.key}
+              data-index={virtualRow.index}
+              ref={virtualizer.measureElement}
               style={{
                 position: 'absolute',
                 top: 0,
                 left: 0,
                 width: '100%',
-                height: `${ROW_HEIGHT}px`,
                 transform: `translateY(${virtualRow.start}px)`
               }}
             >
@@ -96,7 +103,7 @@ export function AccountList({ onAddAccount, onEditAccount }: AccountListProps): 
           <div
             style={{
               position: 'absolute',
-              top: `${virtualizer.getTotalSize()}px`,
+              top: `${virtualizer.getTotalSize() + ROW_GAP}px`,
               left: 0,
               width: '100%'
             }}

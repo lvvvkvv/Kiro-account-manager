@@ -23,7 +23,6 @@ import {
 import { cn } from '@/lib/utils'
 import {
   toRgba,
-  getSubscriptionColor,
   getStatusBadgeClass,
   StatusLabelsZh,
   StatusLabelsEn,
@@ -41,7 +40,7 @@ interface AccountListRowProps {
 }
 
 // 紧凑列表行 — 视觉对齐 AccountCard
-// 高度 ~72px，公共圆角与边框状态
+// 最小高度 72px，随容器宽度换行。
 function AccountListRowComponent({
   account,
   tags,
@@ -295,7 +294,7 @@ function AccountListRowComponent({
   return (
     <div
       className={cn(
-        'group relative flex items-center gap-3 pl-3 pr-3 py-2.5 h-full rounded-panel border bg-card transition-colors cursor-pointer overflow-hidden',
+        'account-list-row group relative items-center gap-3 px-3 py-2.5 rounded-panel border bg-card transition-colors cursor-pointer',
         'hover:bg-muted/20',
         account.isActive && 'border-border-strong',
         isSelected && 'ring-2 ring-inset ring-ring bg-muted/30',
@@ -308,7 +307,7 @@ function AccountListRowComponent({
       {/* Checkbox */}
       <div
         className={cn(
-          'flex-shrink-0 w-4 h-4 rounded-[4px] border-[1.5px] flex items-center justify-center transition-colors cursor-pointer',
+          'account-list-select flex-shrink-0 w-4 h-4 rounded-[4px] border-[1.5px] flex items-center justify-center transition-colors cursor-pointer',
           isSelected
             ? 'bg-primary border-primary text-primary-foreground'
             : 'border-muted-foreground/30 hover:border-primary'
@@ -321,13 +320,13 @@ function AccountListRowComponent({
         {isSelected && <Check className="h-3 w-3" />}
       </div>
 
-      {/* === 邮箱列（固定 280px） === */}
-      <div className="w-[280px] flex-shrink-0 flex flex-col gap-1 min-w-0">
-        {/* 上行：邮箱/昵称 + 副邮箱 */}
-        <div className="flex items-center gap-2 min-w-0">
+      {/* === 邮箱列（随可用空间收缩） === */}
+      <div className="account-list-identity flex flex-col gap-1 min-w-0">
+        {/* 昵称与邮箱分行显示，避免窄列里互相挤压。 */}
+        <div className="flex flex-col items-start gap-0.5 min-w-0">
           <h3
             className={cn(
-              'font-medium text-strong truncate cursor-pointer transition-colors min-w-0',
+              'font-medium text-strong truncate cursor-pointer transition-colors min-w-0 max-w-full',
               emailCopied ? 'text-success' : 'text-foreground/90 hover:text-primary'
             )}
             title={`${displayName} (${isEn ? 'Click to copy' : '点击复制'})`}
@@ -337,7 +336,7 @@ function AccountListRowComponent({
           </h3>
           {account.nickname && (
             <span
-              className="text-caption text-muted-foreground truncate min-w-0"
+              className="text-caption text-muted-foreground truncate min-w-0 max-w-full"
               title={maskedEmail}
             >
               {maskedEmail}
@@ -402,8 +401,8 @@ function AccountListRowComponent({
         </div>
       </div>
 
-      {/* === 徽章固定列（紧贴邮箱列，每个徽章等宽确保跨行对齐） === */}
-      <div className="flex-shrink-0 flex items-center gap-1.5">
+      {/* === 徽章列（空间不足时换行） === */}
+      <div className="account-list-badges min-w-0 flex flex-wrap items-center gap-1.5">
         {/* 状态徽章（min-w 保持等宽） */}
         <div
           className={cn(
@@ -427,16 +426,6 @@ function AccountListRowComponent({
             (isEn ? StatusLabelsEn : StatusLabelsZh)[account.status] || account.status
           )}
         </div>
-
-        {/* 订阅徽章（min-w 保持等宽，PRO+/FREE 视觉对齐） */}
-        <Badge
-          className={cn(
-            'text-white text-badge h-5 px-[7px] border-0 min-w-[90px] flex items-center justify-center',
-            getSubscriptionColor(account.subscription.type, account.subscription.title)
-          )}
-        >
-          {account.subscription.title || account.subscription.type}
-        </Badge>
 
         {/* IDP（固定宽度，所有账号视觉对齐） */}
         <Badge
@@ -478,23 +467,17 @@ function AccountListRowComponent({
           </Badge>
         )}
 
-        {/* Active 容器（始终保留宽度，确保后续元素位置固定） */}
-        <div className="w-[60px] flex items-center">
-          {account.isActive && (
-            <Badge className="h-5 px-[7px] bg-success text-white border-0 hover:bg-success/90 text-badge flex items-center justify-center w-full">
-              <Power className="h-2.5 w-2.5 mr-0.5" />
-              {isEn ? 'Active' : '当前'}
-            </Badge>
-          )}
-        </div>
+        {account.isActive && (
+          <Badge className="h-5 px-[7px] bg-success text-white border-0 hover:bg-success/90 text-badge flex items-center justify-center shrink-0">
+            <Power className="h-2.5 w-2.5 mr-0.5" />
+            {isEn ? 'Active' : '当前'}
+          </Badge>
+        )}
       </div>
 
-      {/* === 弹性间隔（吃剩余空间） === */}
-      <div className="flex-1 min-w-0" />
-
       {/* === Credits 区（中右） === */}
-      <div className="flex-shrink-0 w-40 flex flex-col gap-0.5 px-2">
-        <div className="flex items-center justify-between text-caption">
+      <div className="account-list-usage min-w-0 flex flex-col gap-0.5">
+        <div className="flex flex-wrap items-center justify-between gap-x-1 text-caption">
           <span className="text-muted-foreground">{isEn ? 'Usage' : '使用量'}</span>
           <span
             className={cn(
@@ -538,7 +521,7 @@ function AccountListRowComponent({
             </div>
           )
         })()}
-        <div className="flex justify-between text-caption text-muted-foreground pt-0.5">
+        <div className="flex flex-wrap justify-between gap-x-1 break-all text-caption text-muted-foreground pt-0.5">
           <span className={cn(isCritical && 'text-destructive font-semibold')}>
             {formatUsage(account.usage.current)}
             {isCritical && ` (+${formatUsage(account.usage.current - account.usage.limit)})`}
@@ -548,7 +531,7 @@ function AccountListRowComponent({
       </div>
 
       {/* === 时间信息区 === */}
-      <div className="flex-shrink-0 flex flex-col leading-tight gap-0.5 text-caption text-muted-foreground w-28">
+      <div className="account-list-time min-w-0 flex flex-col leading-tight gap-0.5 text-caption text-muted-foreground break-words [&_svg]:shrink-0">
         <div
           className="flex items-center gap-1"
           title={isEn ? 'Subscription days left' : '订阅剩余天数'}
@@ -581,8 +564,8 @@ function AccountListRowComponent({
         </div>
       </div>
 
-      {/* === 操作区（hover 显示） === */}
-      <div className="flex-shrink-0 flex items-center gap-2 [&_svg]:size-4 [&_svg]:stroke-[1.5] opacity-100 transition-opacity duration-200 border-l border-border/40 pl-2 ml-1">
+      {/* === 操作区（始终可见，窄窗口下换行） === */}
+      <div className="account-list-actions min-w-0 flex flex-wrap items-center justify-end gap-1 [&>button]:shrink-0 [&>a]:shrink-0 [&_svg]:size-4 [&_svg]:stroke-[1.5]">
         {isUnauthorized && (
           <>
             <Button

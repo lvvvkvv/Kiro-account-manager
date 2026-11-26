@@ -265,6 +265,13 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.8 (2026-11-26) — Responsive Account List
+
+- Make the account list adapt to the available width without horizontal scrolling.
+- Wrap account details and actions in narrow windows, with dynamically measured row heights to prevent overlap.
+- Display nicknames and email addresses on separate lines and remove subscription badges from list view.
+- Include the About page cleanup and packaging fixes described in v1.7.7 below.
+
 ### v1.7.7 (2026-11-26) — About Page Cleanup
 
 - Remove the author and sponsorship sections, payment QR codes, and group invitation button and dialog from the About page.
