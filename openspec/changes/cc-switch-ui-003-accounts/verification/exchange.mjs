@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { mount, unmount } from "./dialogs.mjs";
 import { seed, state } from "./accounts.mjs";
 const require = createRequire(
-  new URL("../../../../Kiro-account-manager/package.json", import.meta.url),
+  new URL("../../../../package.json", import.meta.url),
 );
 const normalize = (content) => {
   try {

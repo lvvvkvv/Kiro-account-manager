@@ -9,7 +9,7 @@ import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 
-const appRoot = fileURLToPath(new URL('../../../Kiro-account-manager/', import.meta.url))
+const appRoot = fileURLToPath(new URL('../../../', import.meta.url))
 const require = createRequire(path.join(appRoot, 'package.json'))
 const { createServer } = await import(pathToFileURL(require.resolve('vite')))
 const { default: react } = await import(pathToFileURL(require.resolve('@vitejs/plugin-react')))

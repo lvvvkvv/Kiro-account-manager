@@ -23,4 +23,4 @@
 
 ## Impact
 
-实施代码范围为 `Kiro-account-manager/src/renderer/src/styles/globals.css`、`components/ui/`，必要时增加纯呈现辅助组件。基础 DOM 和自绘控件需兼容现有调用方；不替换技术栈、不添加 CC Switch 业务、不修改 main／preload、凭据或持久化字段结构；store 仅调整外观和语言的选项解析与生效逻辑。基线见 `../../baselines/cc-switch-ui-function-preservation.md` 的 G02 及全局保留口径。
+实施代码范围为 `src/renderer/src/styles/globals.css`、`components/ui/`，必要时增加纯呈现辅助组件。基础 DOM 和自绘控件需兼容现有调用方；不替换技术栈、不添加 CC Switch 业务、不修改 main／preload、凭据或持久化字段结构；store 仅调整外观和语言的选项解析与生效逻辑。基线见 `../../baselines/cc-switch-ui-function-preservation.md` 的 G02 及全局保留口径。

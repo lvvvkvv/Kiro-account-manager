@@ -8,7 +8,7 @@
 
 ### P2：语义字号、尺寸和圆角未注册到类名合并器（已修复）
 
-位置：`Kiro-account-manager/src/renderer/src/lib/utils.ts:5`。原先直接使用默认twMerge，未配置001新建的语义Token。`text-badge`被识别为颜色，与`text-action-text`等互斥而被移除；实际Badge及任务状态字体为13/20，参考为11/16/500。`h-control h-auto`同时残留，关闭选项最终被固定高度和min-height约束为52px，38px的两行内容上下实际只剩7px，声明的12px内距无法实现。
+位置：`src/renderer/src/lib/utils.ts:5`。原先直接使用默认twMerge，未配置001新建的语义Token。`text-badge`被识别为颜色，与`text-action-text`等互斥而被移除；实际Badge及任务状态字体为13/20，参考为11/16/500。`h-control h-auto`同时残留，关闭选项最终被固定高度和min-height约束为52px，38px的两行内容上下实际只剩7px，声明的12px内距无法实现。
 
 按参考`src/lib/utils.ts`使用extendTailwindMerge，注册本项目实际的text、radius、spacing键。修复后五种实际Badge均为11/16/500、高20；八种字体角色与颜色类组合后仍正确；高度和圆角调用方覆盖正确生效。关闭选项在当前两行内容下自然高64px，内容距边框上下各13px（12px内距＋1px边框），保留原最小52px和换行能力。
 

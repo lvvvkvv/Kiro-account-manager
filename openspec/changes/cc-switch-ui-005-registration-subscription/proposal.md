@@ -24,4 +24,4 @@
 
 ## Impact
 
-本次涉及 `Kiro-account-manager/src/renderer/src/components/pages/RegisterPage.tsx`、`SubscriptionPage.tsx`，可拆出纯呈现子组件。两文件的 module 状态、localStorage、任务回调、业务计算及 API 调用保持；不改注册实现、rateLimiter、store、计费或支付流程。保留清单 R01～R05、S01～S04；本轮已获用户授权实施，验证与外部流程限制见 implementation.md。
+本次涉及 `src/renderer/src/components/pages/RegisterPage.tsx`、`SubscriptionPage.tsx`，可拆出纯呈现子组件。两文件的 module 状态、localStorage、任务回调、业务计算及 API 调用保持；不改注册实现、rateLimiter、store、计费或支付流程。保留清单 R01～R05、S01～S04；本轮已获用户授权实施，验证与外部流程限制见 implementation.md。

@@ -1,7 +1,7 @@
 # Kiro Account Manager
 
 <p align="center">
-  <img src="Kiro-account-manager/resources/icon.png" width="128" height="128" alt="Kiro Logo">
+  <img src="resources/icon.png" width="128" height="128" alt="Kiro Logo">
 </p>
 
 <p align="center">
@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="Kiro-account-manager/src/renderer/src/assets/交流群.png" width="200" alt="QQ Group">
+  <img src="src/renderer/src/assets/交流群.png" width="200" alt="QQ Group">
 </p>
 
 <p align="center">
@@ -91,37 +91,37 @@
 ### Home
 Shows account statistics, current account details, subscription info and quota breakdown.
 
-![Home](Kiro-account-manager/resources/主页.png)
+![Home](resources/主页.png)
 
 ### Account Management
 Manage all accounts, search, filter, batch operations, one-click switch.
 
-![Account Management](Kiro-account-manager/resources/账户管理.png)
+![Account Management](resources/账户管理.png)
 
 ### Machine ID Management
 Manage device identifier, prevent account association bans, backup and restore.
 
-![Machine ID Management](Kiro-account-manager/resources/机器码管理.png)
+![Machine ID Management](resources/机器码管理.png)
 
 ### Settings
 Configure theme colors, privacy mode, auto refresh, proxy and more.
 
-![Settings](Kiro-account-manager/resources/设置.png)
+![Settings](resources/设置.png)
 
 ### API Proxy Service
 Provides OpenAI and Claude compatible API endpoints with multi-account rotation, auto token refresh, request retry and more.
 
-![API Proxy Service](Kiro-account-manager/resources/API%20反代服务.png)
+![API Proxy Service](resources/API%20反代服务.png)
 
 ### Kiro IDE Settings
 Sync Kiro IDE settings, edit MCP servers, manage user rules (Steering).
 
-![Kiro Settings](Kiro-account-manager/resources/Kiro%20设置.png)
+![Kiro Settings](resources/Kiro%20设置.png)
 
 ### About
 View version info, feature list, tech stack and author info.
 
-![About](Kiro-account-manager/resources/关于.png)
+![About](resources/关于.png)
 
 ---
 
@@ -203,6 +203,8 @@ xattr -cr /Applications/Kiro\ Account\ Manager.app
 ---
 
 ## 💻 Development Guide
+
+The repository root is the application root. Run all commands below beside `package.json`. Earlier application documentation is preserved in [docs/legacy](docs/legacy/README.md).
 
 ### Requirements
 

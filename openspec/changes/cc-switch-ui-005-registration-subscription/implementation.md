@@ -4,7 +4,7 @@
 
 ## Scope
 
-- 仅迁移 `Kiro-account-manager/src/renderer/src/components/pages/RegisterPage.tsx` 与 `SubscriptionPage.tsx` 的领域呈现，并增加本成员隔离验证资料。
+- 仅迁移 `src/renderer/src/components/pages/RegisterPage.tsx` 与 `SubscriptionPage.tsx` 的领域呈现，并增加本成员隔离验证资料。
 - 改前两页保存于 `/tmp/cc-registration-20261126/before/pages/`，内容对应实施前仓库版本；实施过程中仓库 HEAD 前进至 `f5553c2`（004 提交），两页的原业务基线没有改变。
 - 参考 `/Users/kang/cc-switch` 固定提交 `f29d0804b05ce374ee650c64706399cd0da01805`，引用 [001 公共 UI 契约](../cc-switch-ui-001-foundations/ui-contract.md) 与 002 `PageHeader`。未修改参考仓库、main、preload、store、类型、依赖、注册实现或计费服务。
 

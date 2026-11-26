@@ -8,13 +8,13 @@
 
 ### P2: 长方案徽标溢出订阅行
 
-位置：[SubscriptionPage.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/SubscriptionPage.tsx:2594)，同时修正超额页订阅列表及保留的旧列表分支。
+位置：[SubscriptionPage.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/SubscriptionPage.tsx:2594)，同时修正超额页订阅列表及保留的旧列表分支。
 
 原徽标虽固定 20px 高、11/16 字体，但允许文字换行且 overflow 可见。长方案样例的 clientHeight 为 20、scrollHeight 为 218，文本可跨越多行，破坏原 47px 虚拟行与相邻操作的可辨性。现按参考 chip 的单行约束截断，保持高 20、左右 7、字号 11/16/500、胶囊和完整 title。同一样例 scrollHeight 为 20，名称完整保留在 DOM 与 title，原门户／选择动作不变。
 
 ### P2: 模板菜单越过最小窗口底边
 
-位置：[RegisterPage.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/RegisterPage.tsx:3946)、新增纯呈现 [TemplateMenu.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/registration/TemplateMenu.tsx:5)。
+位置：[RegisterPage.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/RegisterPage.tsx:3946)、新增纯呈现 [TemplateMenu.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/registration/TemplateMenu.tsx:5)。
 
 800×600 中将模板按钮置于底部附近，原菜单 top=567.5、height=400、bottom=967.5，页面滚动容器会裁切菜单。现用 body portal、上下空间判断及视口 16px 边距定位，宽最多 360、高最多 400，并随窗口／滚动／渲染重排更新。菜单维持公共圆角 10、内距 4；原模板保存、导入导出、删除、加载与开关状态仍在原页面，不新增外部点击关闭等业务行为。
 
@@ -22,7 +22,7 @@
 
 ### P3: 混合邮箱源按钮偏离公共控件尺度
 
-位置：[RegisterPage.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/RegisterPage.tsx:3189)。
+位置：[RegisterPage.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/RegisterPage.tsx:3189)。
 
 原选择按钮实测 38px 高、左右 12、图文间距 8，未与 32px 输入控件及 CC Switch 常规按钮一致。现为 32 高、左右 14、图文 6、13/20/500、圆角 6。混合源集合、权重、原校验与禁用属性及 onClick 保持。
 

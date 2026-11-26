@@ -6,7 +6,7 @@ on:
 
 # 设置工作目录
 env:
-  WORKING_DIR: Kiro-account-manager
+  WORKING_DIR: .
 
 jobs:
   # 获取版本号

@@ -15,7 +15,7 @@ import { verifyDialogs } from "./verification/dialogs.mjs";
 import { verifyAccounts } from "./verification/accounts.mjs";
 
 const appRoot = fileURLToPath(
-  new URL("../../../Kiro-account-manager/", import.meta.url),
+  new URL("../../../", import.meta.url),
 );
 const require = createRequire(path.join(appRoot, "package.json"));
 const { createServer } = await import(pathToFileURL(require.resolve("vite")));

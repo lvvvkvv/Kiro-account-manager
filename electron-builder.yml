@@ -3,6 +3,9 @@ productName: Kiro Account Manager
 directories:
   buildResources: build
 files:
+  # Keep repository-only files out of the packaged application.
+  - '!{openspec,docs,test,scripts,.github,.cursor,.kiro}/**'
+  - '!{README_CN.md,.editorconfig}'
   - '!**/.vscode/*'
   - '!src/*'
   - '!electron.vite.config.{js,ts,mjs,cjs}'

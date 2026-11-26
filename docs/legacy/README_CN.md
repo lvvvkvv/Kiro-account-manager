@@ -1,7 +1,9 @@
+> 应用上移时保留的旧版说明。请以[当前 README](../../README_CN.md)为准，开发命令在仓库根目录执行。
+
 # Kiro 账户管理器
 
 <p align="center">
-  <img src="resources/icon.png" width="128" height="128" alt="Kiro Logo">
+  <img src="../../resources/icon.png" width="128" height="128" alt="Kiro Logo">
 </p>
 
 <p align="center">
@@ -86,25 +88,25 @@
 ## 📸 截图
 
 ### 主页
-![主页](resources/主页.png)
+![主页](../../resources/主页.png)
 
 ### 账户管理
-![账户管理](resources/账户管理.png)
+![账户管理](../../resources/账户管理.png)
 
 ### 机器码管理
-![机器码管理](resources/机器码管理.png)
+![机器码管理](../../resources/机器码管理.png)
 
 ### 设置
-![设置](resources/设置.png)
+![设置](../../resources/设置.png)
 
 ### Kiro IDE 设置
-![Kiro 设置](resources/Kiro%20设置.png)
+![Kiro 设置](../../resources/Kiro%20设置.png)
 
 ### 主题颜色
-![主题颜色](resources/主题色.png)
+![主题颜色](../../resources/主题色.png)
 
 ### 关于
-![关于](resources/关于.png)
+![关于](../../resources/关于.png)
 
 ---
 

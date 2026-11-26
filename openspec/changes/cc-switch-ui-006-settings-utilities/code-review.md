@@ -10,7 +10,7 @@
 
 ### [P2] Kiro 长配置撑宽整页，编辑／删除操作移出可视区域（已修复）
 
-位置：[KiroSettingsPage.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/KiroSettingsPage.tsx:706)，同页 Steering 文件名及命令／工具列表。
+位置：[KiroSettingsPage.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/KiroSettingsPage.tsx:706)，同页 Steering 文件名及命令／工具列表。
 
 MCP command、trustedCommands、trustedTools 存在连续长字符串时，flex 子项的自动最小宽度阻止收缩。800×600 且侧栏展开的样例中，内容区 clientWidth=600、scrollWidth=2022，MCP 编辑／删除按钮在视口右侧。006 公共长内容规范未覆盖到这些行。
 
@@ -24,13 +24,13 @@ MCP command、trustedCommands、trustedTools 存在连续长字符串时，flex 
 
 ### [P3] 多处图标操作沿用文本按钮尺寸，关闭按钮圆角不一致（已修复）
 
-位置：[McpServerEditor.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/kiro/McpServerEditor.tsx:131)、[LogsPage.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/LogsPage.tsx:232)，以及 Webhook、Kiro 配置、机器码、Steering、设置中的图标操作。
+位置：[McpServerEditor.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/kiro/McpServerEditor.tsx:131)、[LogsPage.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/LogsPage.tsx:232)，以及 Webhook、Kiro 配置、机器码、Steering、设置中的图标操作。
 
 原图标按钮使用 size=sm 的左右 12px 内距，实际为 40×28（描边时 42×28），日志页为 40×32；机器码关闭按钮仍是 10px 圆角。001 公共契约的常规图标按钮要求 32 方、图标 16、圆角 6。改用 size=icon／等价原生样式、零内距与 rounded-control，操作组间距统一 8；补齐缺失的 title。保留所有 click、disabled、加载图标与原关闭条件。专项累计 33 项图标操作测量均为 32×32／6px；不改变有文字的紧凑按钮尺寸。
 
 ### [P3] Kiro 设置分组同时使用父级 divide-y 与自身 border-t（已修复）
 
-位置：[KiroSettingsPage.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/KiroSettingsPage.tsx:483)，同页通知及 MCP 分区。
+位置：[KiroSettingsPage.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/KiroSettingsPage.tsx:483)，同页通知及 MCP 分区。
 
 相邻前项 border-bottom=1 与当前项 border-top=1 叠加为 2px，与参考 SettingsCard 的单条分隔线不同。移除直接分组重复的 border-t，保留父级 divide-y 和内部行分隔；不改变折叠条件或字段分组。
 

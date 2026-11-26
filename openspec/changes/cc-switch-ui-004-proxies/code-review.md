@@ -14,15 +14,15 @@
 
 ### P2: 长日志分类撑出弹窗，日志内容与操作被裁切
 
-位置：[ProxyDetailedLogsDialog.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/proxy/ProxyDetailedLogsDialog.tsx:70)、[日志行分类](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/proxy/ProxyDetailedLogsDialog.tsx:687)。
+位置：[ProxyDetailedLogsDialog.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/proxy/ProxyDetailedLogsDialog.tsx:70)、[日志行分类](/Users/kang/Kiro-account-manager/src/renderer/src/components/proxy/ProxyDetailedLogsDialog.tsx:687)。
 
 800×600、60类长名称样例中，分类选择框原宽1366.89px、右边界1407.89px，超过弹窗右边界784px；日志行的分类也不收缩，挤走消息与复制按钮。原菜单受触发器宽度约105.5px限制，长选项大量折行，滚动高度26438px。此前几何验证只检查外层弹窗，没有检查内部可达性。
 
-修复：触发器最大240px，保留完整名称title；日志分类限制160px并截断，消息允许收缩，原数据与复制内容不变。新建[ProxyDropdownMenu.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/proxy/ProxyDropdownMenu.tsx:4)，在原DOM内按弹窗／视口限制宽高和水平位置，保留外部点击与选择关闭边界。修复后菜单256px、边界385～641，底部532；触发器宽240px。验证最后一类选择、复制原日志、外部点击关闭、800↔1200调整和重置过滤通过。
+修复：触发器最大240px，保留完整名称title；日志分类限制160px并截断，消息允许收缩，原数据与复制内容不变。新建[ProxyDropdownMenu.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/proxy/ProxyDropdownMenu.tsx:4)，在原DOM内按弹窗／视口限制宽高和水平位置，保留外部点击与选择关闭边界。修复后菜单256px、边界385～641，底部532；触发器宽240px。验证最后一类选择、复制原日志、外部点击关闭、800↔1200调整和重置过滤通过。
 
 ### P3: 账号选择行仍使用旧字号、内距和无圆角行
 
-位置：[AccountSelectDialog.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/proxy/AccountSelectDialog.tsx:181)。
+位置：[AccountSelectDialog.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/proxy/AccountSelectDialog.tsx:181)。
 
 名称原13/20、说明13/20、行内距16、圆角0，与参考供应商行14/20/500名称、12/18说明、10/12/10/8内距和10圆角不符；40px圆头像亦未对齐32px图标位。
 
@@ -30,7 +30,7 @@
 
 ### P3: 32px映射选择框仍保留16px纵向内衬，操作组间距只有4px
 
-位置：[ModelMappingDialog.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/proxy/ModelMappingDialog.tsx:312)、[映射类型字段](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/proxy/ModelMappingDialog.tsx:369)。
+位置：[ModelMappingDialog.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/proxy/ModelMappingDialog.tsx:312)、[映射类型字段](/Users/kang/Kiro-account-manager/src/renderer/src/components/proxy/ModelMappingDialog.tsx:369)。
 
 迁移将选择框由40改为32高后仍保留上下各8px，扣除边框后文本可用高度仅14px；规则动作组gap4也不同于公共gap8。原上移／下移／删除和移除目标图标缺少可识别名称。
 
@@ -38,7 +38,7 @@
 
 ### P3: 绑定指标与徽标字重、表头对齐未按角色统一
 
-位置：[ProxyPoolPage.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/ProxyPoolPage.tsx:1386)、[绑定徽标](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/ProxyPoolPage.tsx:1536)、[表头](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/pages/ProxyPoolPage.tsx:1579)。
+位置：[ProxyPoolPage.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/ProxyPoolPage.tsx:1386)、[绑定徽标](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/ProxyPoolPage.tsx:1536)、[表头](/Users/kang/Kiro-account-manager/src/renderer/src/components/pages/ProxyPoolPage.tsx:1579)。
 
 四个绑定指标仍为16/24局部标题，未使用24/32指标角色；手写绑定徽标缺少500字重；表头左内距12、数据行8，导致所有列水平错位4px。
 
@@ -46,7 +46,7 @@
 
 ### P3: KProxy错误通知条仍使用旧内距和图文间距
 
-位置：[KProxyPanel.tsx](/Users/kang/Kiro-account-manager/Kiro-account-manager/src/renderer/src/components/kproxy/KProxyPanel.tsx:296)。
+位置：[KProxyPanel.tsx](/Users/kang/Kiro-account-manager/src/renderer/src/components/kproxy/KProxyPanel.tsx:296)。
 
 原内距上下8／左右16、gap8，与参考通知10/14/10/19、gap10不符；关闭按钮另有横向内衬覆盖。
 

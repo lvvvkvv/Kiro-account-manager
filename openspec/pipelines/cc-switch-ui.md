@@ -1,7 +1,7 @@
 # CC Switch 风格 UI 与交互改版执行计划
 
 - 日期：2026-11-26（Asia/Shanghai）
-- 规划根／代码仓库：`/Users/kang/Kiro-account-manager`；应用目录：`Kiro-account-manager/`。
+- 规划根／代码仓库：`/Users/kang/Kiro-account-manager`；应用目录：仓库根目录 `.`。
 - Schema：`spec-driven`；store：未使用，规划随当前仓库维护。
 - 需求：视觉与交互参照 `/Users/kang/cc-switch` 当前 v7；完整保留当前应用功能。初始阶段只完成 OpenSpec 规划；用户后续分别授权实施001、002、003、004、005，结果见执行记录。
 - 代码基线：`8f11db50f64cc4faf3f9c0dff8eca543c01cdc15`；起始分支：`main`。

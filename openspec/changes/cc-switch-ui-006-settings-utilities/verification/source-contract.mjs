@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 const require = createRequire(
-  new URL("../../../../Kiro-account-manager/package.json", import.meta.url),
+  new URL("../../../../package.json", import.meta.url),
 );
 const ts = require("typescript");
 export const files = [

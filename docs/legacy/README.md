@@ -1,7 +1,9 @@
+> Historical application README preserved during the root migration. See the [current README](../../README.md); run development commands from the repository root.
+
 # Kiro Account Manager
 
 <p align="center">
-  <img src="resources/icon.png" width="128" height="128" alt="Kiro Logo">
+  <img src="../../resources/icon.png" width="128" height="128" alt="Kiro Logo">
 </p>
 
 <p align="center">
@@ -86,25 +88,25 @@
 ## 📸 Screenshots
 
 ### Home
-![Home](resources/主页.png)
+![Home](../../resources/主页.png)
 
 ### Account Management
-![Account Management](resources/账户管理.png)
+![Account Management](../../resources/账户管理.png)
 
 ### Machine ID Management
-![Machine ID Management](resources/机器码管理.png)
+![Machine ID Management](../../resources/机器码管理.png)
 
 ### Settings
-![Settings](resources/设置.png)
+![Settings](../../resources/设置.png)
 
 ### Kiro IDE Settings
-![Kiro Settings](resources/Kiro%20设置.png)
+![Kiro Settings](../../resources/Kiro%20设置.png)
 
 ### Theme Colors
-![Theme Colors](resources/主题色.png)
+![Theme Colors](../../resources/主题色.png)
 
 ### About
-![About](resources/关于.png)
+![About](../../resources/关于.png)
 
 ---
 

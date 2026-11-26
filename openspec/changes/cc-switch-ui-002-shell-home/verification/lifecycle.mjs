@@ -10,7 +10,7 @@ const baseline = "ed7dc85";
 export async function verifyLifecycle({ page, out, navigate, appRoot }) {
   const require = createRequire(path.join(appRoot, "package.json"));
   const ts = require("typescript");
-  const root = path.dirname(appRoot);
+  const root = appRoot;
   const printer = ts.createPrinter({ removeComments: true });
   const source = async (file, before) =>
     before
@@ -111,22 +111,45 @@ export async function verifyLifecycle({ page, out, navigate, appRoot }) {
       );
     results[file] = { effects: oldEffects.length, logicUnchanged: true };
   }
-  const protectedPaths = [
-    "Kiro-account-manager/src/main",
-    "Kiro-account-manager/src/preload",
-    "Kiro-account-manager/src/renderer/src/store",
-    "Kiro-account-manager/package.json",
-    "Kiro-account-manager/package-lock.json",
-  ];
-  assert.equal(
-    (
-      await run(
-        "git",
-        ["diff", baseline, "--name-only", "--", ...protectedPaths],
-        { cwd: root },
-      )
-    ).stdout.trim(),
-    "",
+  // The baseline predates the root migration. Compare file contents across
+  // the old and new paths so directory renames do not hide business changes.
+  const oldPrefix = "Kiro-account-manager/";
+  const protectedDirs = ["src/main", "src/preload", "src/renderer/src/store"];
+  const oldFiles = (
+    await run(
+      "git",
+      ["ls-tree", "-r", "--name-only", baseline, "--",
+        ...protectedDirs.map((dir) => oldPrefix + dir)],
+      { cwd: root },
+    )
+  ).stdout.trim().split("\n").map((file) => file.slice(oldPrefix.length));
+  const listFiles = async (dir) => {
+    const files = [];
+    for (const entry of await fs.readdir(path.join(root, dir), { withFileTypes: true })) {
+      const file = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) files.push(...await listFiles(file));
+      else files.push(file);
+    }
+    return files;
+  };
+  const currentFiles = (await Promise.all(protectedDirs.map(listFiles))).flat();
+  assert.deepEqual(currentFiles.sort(), oldFiles.sort(), "protected file inventory");
+  for (const file of [...oldFiles, "package-lock.json"]) {
+    const before = (await run("git", ["show", `${baseline}:${oldPrefix}${file}`], {
+      cwd: root, encoding: "buffer", maxBuffer: 5e6,
+    })).stdout;
+    assert.deepEqual(await fs.readFile(path.join(root, file)), before, file);
+  }
+  const oldPackage = JSON.parse((await run(
+    "git", ["show", `${baseline}:${oldPrefix}package.json`], { cwd: root },
+  )).stdout);
+  // The sole package change removes the Windows-only shell command.
+  assert.equal(oldPackage.scripts.dev, "chcp 65001 >nul && electron-vite dev");
+  oldPackage.scripts.dev = "electron-vite dev";
+  assert.deepEqual(
+    JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8")),
+    oldPackage,
+    "package metadata and dependencies",
   );
 
   const names = [

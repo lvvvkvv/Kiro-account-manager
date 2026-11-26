@@ -38,9 +38,22 @@ docs/Kiro API.md
 kiro_token.json
 Kiro.code-workspace
 Kiro register.code-workspace
-Kiro-account-manager/.kiro
+.kiro/
 Kiro register
 
 # 抓包数据（可能含 token/cookie 等敏感信息，不入库）
 docs/mail.chatgpt.org.uk.har
 docs/mail.chatgpt.org.uk/
+# Application dependencies, build output and local configuration
+node_modules
+dist
+out
+.DS_Store
+.eslintcache
+*.log*
+
+# TypeScript 增量构建产物
+*.tsbuildinfo
+
+# 编辑器/插件工作区配置
+.cursor/
