@@ -102,8 +102,8 @@ interface I18nState {
 }
 
 export const useI18n = create<I18nState>((set, get) => ({
-  language: detectSystemLanguage(),
-  actualLanguage: detectSystemLanguage(),
+  language: resolveLanguage(undefined),
+  actualLanguage: resolveLanguage(undefined),
   
   setLanguage: (language: Language) => {
     const actualLanguage = getActualLanguage(language)

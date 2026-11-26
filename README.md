@@ -265,6 +265,12 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.7 (2026-11-26) — About Page Cleanup
+
+- Remove the author and sponsorship sections, payment QR codes, and group invitation button and dialog from the About page.
+- Remove the repository OpenSpec directory.
+- Commit the default Simplified Chinese behavior already included in the previous release; saved language preferences remain supported.
+
 ### v1.7.5 (2026-6-7) — Thinking Mode + Enterprise profileArn Full Fix + Agent Mode & Steering + Tool Use Leak Fix
 
 #### 🧠 Thinking Mode Support (Claude 4.6+)

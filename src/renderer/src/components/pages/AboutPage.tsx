@@ -2,13 +2,9 @@ import { PageHeader } from '../layout/PageHeader'
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button } from '../ui'
 import {
-  Github,
   Heart,
   Code,
   ExternalLink,
-  User,
-  Coffee,
-  MessageCircle,
   X,
   RefreshCw,
   Download,
@@ -18,10 +14,6 @@ import {
   Zap
 } from 'lucide-react'
 import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
-import alipayQR from '@/assets/支付宝支付.png'
-import wechatQR from '@/assets/微信支付.png'
-import groupQR from '@/assets/交流群.png'
-import authorAvatar from '@/assets/author-avatar.png'
 import { useAccountsStore } from '@/store/accounts'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -44,7 +36,6 @@ interface UpdateInfo {
 
 export function AboutPage() {
   const [version, setVersion] = useState('...')
-  const [showGroupQR, setShowGroupQR] = useState(false)
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
   const [showUpdateModal, setShowUpdateModal] = useState(false)
@@ -124,15 +115,6 @@ export function AboutPage() {
                   : isEn
                     ? 'Check Updates'
                     : '检查更新'}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                className="gap-1.5"
-                onClick={() => setShowGroupQR(true)}
-              >
-                <MessageCircle className="h-4 w-4" />
-                {isEn ? 'Join Group' : '加入交流群'}
               </Button>
             </div>
 
@@ -288,38 +270,6 @@ export function AboutPage() {
           </div>
         )}
 
-        {/* 交流群弹窗 */}
-        {showGroupQR && (
-          <div className="ui-dialog-overlay">
-            <div
-              className="absolute inset-0 bg-transparent"
-              onClick={() => setShowGroupQR(false)}
-            />
-            <div className="ui-dialog-panel max-w-[320px]" role="dialog" aria-modal="true">
-              <button
-                className="absolute top-4 right-4 flex items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground h-control w-control p-0 rounded-control [&_svg]:size-4"
-                onClick={() => setShowGroupQR(false)}
-                title={isEn ? 'Close' : '关闭'}
-              >
-                <X className="h-5 w-5" />
-              </button>
-              <div className="ui-dialog-header">
-                <h2 className="text-title font-semibold">
-                  {isEn ? 'Join Group' : '扫码加入交流群'}
-                </h2>
-              </div>
-              <div className="ui-dialog-body py-3 text-center space-y-3">
-                <div className="bg-[#07C160]/5 rounded-panel p-3 border border-[#07C160]/20">
-                  <img src={groupQR} alt="Group" className="w-48 h-48 mx-auto object-contain" />
-                </div>
-                <p className="text-caption text-muted-foreground">
-                  {isEn ? 'Scan with WeChat' : 'QQ 扫码加入'}
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* Description */}
         <Card className="">
           <CardHeader className="pb-3">
@@ -440,75 +390,6 @@ export function AboutPage() {
                   </span>
                 )
               )}
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Author */}
-        <Card className="">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-section flex items-center gap-3 min-w-0 flex-wrap [&_svg]:text-muted-foreground">
-              <User className="h-4 w-4 text-primary" />
-              {isEn ? 'Author' : '作者'}
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <img src={authorAvatar} alt="chaogei666" className="w-10 h-10 rounded-full" />
-                <p className="font-medium">chaogei666</p>
-              </div>
-              <a
-                href="https://github.com/chaogei/Kiro-account-manager"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-1.5 text-body text-muted-foreground hover:text-foreground transition-colors px-3 py-1.5 rounded-panel hover:bg-muted"
-              >
-                <Github className="h-4 w-4" />
-                GitHub
-                <ExternalLink className="h-3 w-3" />
-              </a>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Sponsor */}
-        <Card className="">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-section flex items-center gap-3 min-w-0 flex-wrap [&_svg]:text-muted-foreground">
-              <Coffee className="h-4 w-4 text-primary" />
-              {isEn ? 'Sponsor' : '赞助支持'}
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-caption text-muted-foreground mb-4">
-              {isEn
-                ? 'If this project helps you, buy me a coffee ☕'
-                : '如果这个项目对你有帮助，可以请作者喝杯咖啡 ☕'}
-            </p>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="text-center space-y-2">
-                <div className="bg-[#1677FF]/5 rounded-panel p-3 border border-[#1677FF]/20">
-                  <img
-                    src={alipayQR}
-                    alt="Alipay"
-                    className="w-full aspect-square object-contain rounded-panel"
-                  />
-                </div>
-                <p className="text-body font-medium text-[#1677FF]">{isEn ? 'Alipay' : '支付宝'}</p>
-              </div>
-              <div className="text-center space-y-2">
-                <div className="bg-[#07C160]/5 rounded-panel p-3 border border-[#07C160]/20">
-                  <img
-                    src={wechatQR}
-                    alt="WeChat Pay"
-                    className="w-full aspect-square object-contain rounded-panel"
-                  />
-                </div>
-                <p className="text-body font-medium text-[#07C160]">
-                  {isEn ? 'WeChat Pay' : '微信支付'}
-                </p>
-              </div>
             </div>
           </CardContent>
         </Card>
