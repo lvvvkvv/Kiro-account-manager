@@ -94,6 +94,16 @@
 
 ## 📥 安装说明
 
+安装包统一在 [GitHub Releases](https://github.com/lvvvkvv/Kiro-account-manager/releases/latest) 下载，作为 Release 附件发布，不提交到源码目录。
+
+v1.7.6 当前提供 **macOS Apple Silicon（M 系列芯片，arm64）** 安装包：
+
+- [DMG 安装包](https://github.com/lvvvkvv/Kiro-account-manager/releases/download/v1.7.6/kiro-account-manager-1.7.6-arm64.dmg)：打开后将应用拖入「应用程序」。
+- [ZIP 压缩包](https://github.com/lvvvkvv/Kiro-account-manager/releases/download/v1.7.6/kiro-account-manager-1.7.6-arm64-mac.zip)：解压后将应用移入「应用程序」。
+- [SHA-256 校验文件](https://github.com/lvvvkvv/Kiro-account-manager/releases/download/v1.7.6/SHA256SUMS.txt)。
+
+本次未提供 Intel Mac、Windows 和 Linux 安装包，这些平台可按开发指南从源码构建。
+
 ### Windows
 直接运行安装程序 `.exe` 文件即可。
 

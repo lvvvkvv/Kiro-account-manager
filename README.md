@@ -92,6 +92,16 @@ View version info, feature list, tech stack and author info.
 
 ## 📥 Installation
 
+Download installers from [GitHub Releases](https://github.com/lvvvkvv/Kiro-account-manager/releases/latest). Release binaries are attached to Releases, not committed to the source tree.
+
+The v1.7.6 release currently provides **macOS Apple Silicon (M-series, arm64)** packages:
+
+- [DMG installer](https://github.com/lvvvkvv/Kiro-account-manager/releases/download/v1.7.6/kiro-account-manager-1.7.6-arm64.dmg): open it and drag the app into Applications.
+- [ZIP archive](https://github.com/lvvvkvv/Kiro-account-manager/releases/download/v1.7.6/kiro-account-manager-1.7.6-arm64-mac.zip): extract it and move the app into Applications.
+- [SHA-256 checksums](https://github.com/lvvvkvv/Kiro-account-manager/releases/download/v1.7.6/SHA256SUMS.txt).
+
+Intel Mac, Windows and Linux packages are not included in this release; build from source for those platforms.
+
 ### Windows
 Simply run the `.exe` installer.
 
