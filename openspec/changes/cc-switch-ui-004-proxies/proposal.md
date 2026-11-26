@@ -25,4 +25,4 @@ API 反代、KProxy 和代理池各有大量配置与状态，当前配色和操
 
 ## Impact
 
-未来涉及应用 renderer 的 `pages/ProxyPage.tsx`、`KProxyPage.tsx`、`ProxyPoolPage.tsx`、`components/proxy/` 和 `components/kproxy/`。不修改 main 代理实现、网络策略、协议、证书权限流程或账号存储；003 的绑定入口继续共享现有数据。保留清单 P01～P08；本轮仅规划。
+未来涉及应用 renderer 的 `pages/ProxyPage.tsx`、`KProxyPage.tsx`、`ProxyPoolPage.tsx`、`components/proxy/` 和 `components/kproxy/`。不修改 main 代理实现、网络策略、协议、证书权限流程或账号存储；003 的绑定入口继续共享现有数据。保留清单 P01～P08；用户于 2026-11-26 授权实施；结果见 implementation.md。

@@ -3,7 +3,7 @@
 - 日期：2026-11-26（Asia/Shanghai）
 - 规划根／代码仓库：`/Users/kang/Kiro-account-manager`；应用目录：`Kiro-account-manager/`。
 - Schema：`spec-driven`；store：未使用，规划随当前仓库维护。
-- 需求：视觉与交互参照 `/Users/kang/cc-switch` 当前 v7；完整保留当前应用功能。初始阶段只完成 OpenSpec 规划；用户后续分别授权实施001、002、003，结果见执行记录。
+- 需求：视觉与交互参照 `/Users/kang/cc-switch` 当前 v7；完整保留当前应用功能。初始阶段只完成 OpenSpec 规划；用户后续分别授权实施001、002、003、004，结果见执行记录。
 - 代码基线：`8f11db50f64cc4faf3f9c0dff8eca543c01cdc15`；起始分支：`main`。
 - 参考项目基线：`/Users/kang/cc-switch`，提交 `f29d0804b05ce374ee650c64706399cd0da01805`；不修改参考项目。
 - 功能依据：[功能保留清单](../baselines/cc-switch-ui-function-preservation.md)。统一复核记录：[规划复核](../reviews/cc-switch-ui-plan-review.md)。
@@ -23,7 +23,7 @@
 | [001 foundations](../changes/cc-switch-ui-001-foundations/proposal.md) | 无 | Token、基础组件、公共交互外观 | 中性实色、固定橙色操作；三档外观、中文／英文、账号遮罩与控件契约 | 完整／已复核 | 完成（9/9）／未开始／本地复核及修复完成，DM网络受阻 |
 | [002 shell-home](../changes/cc-switch-ui-002-shell-home/proposal.md) | 001 | 窗口框架、导航、首页、任务中心、全局关闭／更新弹窗 | 15 页可达；窗口操作、任务与后台生命周期等价 | 完整／已复核 | 完成（11/11）／未开始／本地复核及修复完成，DM HTTP403受阻 |
 | [003 accounts](../changes/cc-switch-ui-003-accounts/proposal.md) | 001、002 | 账号卡片／列表、工具栏、筛选、全部账号弹窗 | 导入导出、选择、切换、分组标签、订阅和绑定入口不丢失 | 完整／已复核 | 完成（11/11）／未开始／本地复核及修复完成，DM HTTP403受阻 |
-| [004 proxies](../changes/cc-switch-ui-004-proxies/proposal.md) | 001、002 | API 反代、KProxy、代理池及其弹窗 | 服务配置、证书、API Key、账号绑定、验活和日志保持 | 完整／已复核 | 未开始／未开始／未开始 |
+| [004 proxies](../changes/cc-switch-ui-004-proxies/proposal.md) | 001、002 | API 反代、KProxy、代理池及其弹窗 | 服务配置、证书、API Key、账号绑定、验活和日志保持 | 完整／已复核 | 完成（13/13）／未开始／本地复核及修复完成，DM HTTP403受阻 |
 | [005 registration-subscription](../changes/cc-switch-ui-005-registration-subscription/proposal.md) | 001、002 | 注册、批量订阅／超额／订阅管理 | 6 种注册模式与三类订阅工作流、批量生命周期保持 | 完整／已复核 | 未开始／未开始／未开始 |
 | [006 settings-utilities](../changes/cc-switch-ui-006-settings-utilities/proposal.md) | 001、002 | 机器码、Kiro 设置、Webhook、诊断、配置同步、系统日志、设置、关于 | 8 页操作、两条配置同步、全部设置兼容；无业务变更 | 完整／已复核 | 未开始／未开始／未开始 |
 
@@ -61,8 +61,10 @@
 | 002 代码审查与修复 | 本地完成，DM HTTP403受阻 | main（工作区改动） | cn语义Token注册、折叠品牌／提示、PageHeader附加区；实际组件回归 | 3类问题已修复；002完整回归、001回归及build通过，lint无新增error；独立DM覆盖0，详见002 code-review.md | 工作区保留，未提交 |
 | 003 accounts 实现 | 完成（11/11） | main（工作区改动） | 账号工具区、卡片／列表、全部账号弹窗与无调用视觉工具清理；未改业务 store／API | 003完整renderer、001／002回归、typecheck／build／严格校验通过；lint既有371 error无新增。真实外部服务待测，见003 implementation.md | 工作区保留，未提交 |
 | 003 代码审查与修复 | 本地完成，DM HTTP403受阻 | main（工作区改动） | 账号浮层可达、徽标／菜单／操作／分段尺度及隐私回退；原动作不变 | 003完整与78项源码回归、参考几何、build通过，lint既有371 error无新增；独立DM覆盖0，详见003 code-review.md | 工作区保留，未提交 |
-| 003简化及004～006实现与后续复核 | 未开始 | 待实施时记录 | 待记录 | 未执行 | 无 |
+| 004 proxies 实现 | 完成（13/13） | main（工作区改动） | 三页页头、反代／KProxy／代理池面板与全部领域弹窗；未改main／preload／store | 816项业务结构、004完整renderer及88组页面／弹窗几何、001参考对照、typecheck／build通过；lint既有371 error无新增；真实证书／客户端写入／接口E2E待隔离环境，见004 implementation.md | 工作区保留，未提交 |
+| 004 代码审查与修复 | 本地完成，DM HTTP403受阻 | main（工作区改动） | 长分类菜单可达性、列表／字段／指标／通知几何与表头对齐；原业务保持 | 822项源码结构、004完整回归、参考几何、build通过，lint既有371 error无新增；独立DM覆盖0，见004 code-review.md | 工作区保留，未提交 |
+| 003／004简化及005～006实现与后续复核 | 未开始 | 待实施时记录 | 待记录 | 未执行 | 无 |
 | 整体集成 | 未开始 | 待记录 | 15 页与交叉入口 | 未执行 | 无 |
 | 整体简化／代码审查／修复验证 | 未开始 | 待记录 | 待记录 | 未执行 | 无 |
 
-001 实现完成（9/9），公共UI审查修复已完成；002经用户后续授权实现完成（11/11）。003经用户后续授权实现完成（11/11）；004～006仍未实施。主题／语言／隐私决定见001 implementation.md与ui-contract.md；公共页面框架与平台验证限制见002 implementation.md。
+001 实现完成（9/9），公共UI审查修复已完成；002经用户后续授权实现完成（11/11）。003经用户后续授权实现完成（11/11），004实现完成（13/13）；005～006仍未实施。主题／语言／隐私决定见001 implementation.md与ui-contract.md；公共页面框架与平台验证限制见002 implementation.md。
