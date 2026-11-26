@@ -11,6 +11,7 @@ import {
   Info,
   AlertCircle,
   Power,
+  ArrowRightLeft,
   LogOut,
   RotateCcw,
   ExternalLink,
@@ -603,7 +604,7 @@ function AccountListRowComponent({
             onClick={handleSwitch}
             title={isEn ? 'Switch to this account' : '切换到该账号'}
           >
-            <Power className="h-3.5 w-3.5" />
+            <ArrowRightLeft className="h-3.5 w-3.5" />
           </Button>
         )}
 

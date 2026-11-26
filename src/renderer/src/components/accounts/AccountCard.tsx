@@ -15,7 +15,7 @@ import {
   Loader2,
   Info,
   FolderOpen,
-  Power,
+  ArrowRightLeft,
   Calendar,
   AlertCircle,
   KeyRound,
@@ -936,7 +936,7 @@ export const AccountCard = memo(function AccountCard({
                 }}
                 title={isEn ? 'Switch to this account' : '切换到此账号'}
               >
-                <Power className="h-3.5 w-3.5" />
+                <ArrowRightLeft className="h-3.5 w-3.5" />
               </Button>
             )}
 

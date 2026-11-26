@@ -265,6 +265,11 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.10 (2026-11-26) — Account Card Layout and Switch Icons
+
+- Reduce account grid row height to 336px (320px cards with 16px spacing) for a more compact layout; additional reward details remain scrollable inside each card.
+- Use a bidirectional arrow icon for switching accounts in both card and list views.
+
 ### v1.7.9 (2026-11-26) — Update Check Fix
 
 - Fix the About page update check querying the upstream repository instead of this repository, which incorrectly reported no updates.
