@@ -269,6 +269,7 @@ The project is configured with GitHub Actions workflow for auto building all pla
 
 - Reduce account grid row height to 336px (320px cards with 16px spacing) for a more compact layout; additional reward details remain scrollable inside each card.
 - Use a bidirectional arrow icon for switching accounts in both card and list views.
+- Remove the redundant description panel below the display language selector in Settings.
 
 ### v1.7.9 (2026-11-26) — Update Check Fix
 

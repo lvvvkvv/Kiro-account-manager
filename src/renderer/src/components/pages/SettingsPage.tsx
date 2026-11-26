@@ -308,11 +308,6 @@ export function SettingsPage() {
                 <option value="en">English</option>
               </select>
             </div>
-            <div className="text-caption text-muted-foreground bg-muted/50 rounded-panel p-3 space-y-1">
-              {isEn
-                ? 'Choose Chinese or English for the interface.'
-                : '选择中文或英文作为界面语言。'}
-            </div>
           </div>
         </section>
 
