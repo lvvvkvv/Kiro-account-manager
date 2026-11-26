@@ -71,8 +71,7 @@
 - Configurable balance threshold and check interval
 
 ### 🎨 Personalization
-- 21 theme colors available (grouped by color family)
-- Dark/Light mode toggle
+- System, light and dark appearance modes
 - Privacy mode to hide sensitive information
 
 ### 🌐 Proxy Support
@@ -88,40 +87,42 @@
 
 ## 📸 Screenshots
 
+Current v1.7.6 interface in light mode, captured from the application renderer with example data.
+
 ### Home
 Shows account statistics, current account details, subscription info and quota breakdown.
 
-![Home](resources/主页.png)
+![Home](docs/screenshots/en/home.png)
 
 ### Account Management
 Manage all accounts, search, filter, batch operations, one-click switch.
 
-![Account Management](resources/账户管理.png)
+![Account Management](docs/screenshots/en/accounts.png)
 
 ### Machine ID Management
 Manage device identifier, prevent account association bans, backup and restore.
 
-![Machine ID Management](resources/机器码管理.png)
+![Machine ID Management](docs/screenshots/en/machine-id.png)
 
 ### Settings
-Configure theme colors, privacy mode, auto refresh, proxy and more.
+Configure appearance, privacy mode, auto refresh, proxy and more.
 
-![Settings](resources/设置.png)
+![Settings](docs/screenshots/en/settings.png)
 
 ### API Proxy Service
 Provides OpenAI and Claude compatible API endpoints with multi-account rotation, auto token refresh, request retry and more.
 
-![API Proxy Service](resources/API%20反代服务.png)
+![API Proxy Service](docs/screenshots/en/api-proxy.png)
 
 ### Kiro IDE Settings
 Sync Kiro IDE settings, edit MCP servers, manage user rules (Steering).
 
-![Kiro Settings](resources/Kiro%20设置.png)
+![Kiro Settings](docs/screenshots/en/kiro-settings.png)
 
 ### About
 View version info, feature list, tech stack and author info.
 
-![About](resources/关于.png)
+![About](docs/screenshots/en/about.png)
 
 ---
 

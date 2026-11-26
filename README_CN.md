@@ -76,8 +76,7 @@
 - 可配置余额阈值和检查间隔
 
 ### 🎨 个性化设置
-- 21 种主题颜色可选（按色系分组显示）
-- 深色/浅色模式切换
+- 支持跟随系统、浅色和深色三种外观模式
 - 隐私模式隐藏敏感信息
 
 ### 🌐 代理支持
@@ -93,40 +92,42 @@
 
 ## 📸 界面预览
 
+以下为当前 v1.7.6 浅色界面截图，使用应用实际界面与示例数据。
+
 ### 主页
 显示账号统计、当前使用账号详情、订阅信息和额度明细。
 
-![主页](resources/主页.png)
+![主页](docs/screenshots/zh/home.png)
 
 ### 账户管理
 管理所有账号，支持搜索、筛选、批量操作，一键切换账号。
 
-![账户管理](resources/账户管理.png)
+![账户管理](docs/screenshots/zh/accounts.png)
 
 ### 机器码管理
 管理设备标识符，防止账号关联封禁，支持备份恢复。
 
-![机器码管理](resources/机器码管理.png)
+![机器码管理](docs/screenshots/zh/machine-id.png)
 
 ### 设置
-配置主题颜色、隐私模式、自动刷新、代理等选项。
+配置外观、隐私模式、自动刷新、代理等选项。
 
-![设置](resources/设置.png)
+![设置](docs/screenshots/zh/settings.png)
 
 ### API 反代服务
 提供 OpenAI 和 Claude 兼容的 API 端点，支持多账号轮询、Token 自动刷新、请求重试等功能。
 
-![API 反代服务](resources/API%20反代服务.png)
+![API 反代服务](docs/screenshots/zh/api-proxy.png)
 
 ### Kiro IDE 设置
 同步 Kiro IDE 设置，编辑 MCP 服务器，管理用户规则（Steering）。
 
-![Kiro 设置](resources/Kiro%20设置.png)
+![Kiro 设置](docs/screenshots/zh/kiro-settings.png)
 
 ### 关于
 查看版本信息、功能列表、技术栈和作者信息。
 
-![关于](resources/关于.png)
+![关于](docs/screenshots/zh/about.png)
 
 ---
 
