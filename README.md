@@ -259,6 +259,13 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 ## 📋 Changelog
 
 
+### v1.7.14 (2026-11-27) — Account List Redesign
+
+- Rebuild the account list with clear account/status, credit usage, validity and action sections; automatically switch to cards in narrower windows.
+- Distinguish current, refreshing, expired, suspended, error and unknown accounts, with explicit warnings for exhausted or exceeded quotas and expired access tokens.
+- Show error details, groups, expandable tags and proxy availability separately; keep frequent actions visible and management actions in the keyboard-accessible More menu.
+- Add loading skeletons and helpful empty states, simplify bulk controls, and preserve dark mode, English, privacy masking, credit precision and virtualized scrolling for large account lists.
+
 ### v1.7.13 (2026-11-27) — Responsive Account List Layout
 
 - Align account status, sign-in provider, usage and expiry information across list rows while adapting to the available window width.

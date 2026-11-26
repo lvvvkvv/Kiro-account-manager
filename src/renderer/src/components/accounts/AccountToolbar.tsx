@@ -91,7 +91,7 @@ export function AccountToolbar({
 
   // 点击外部关闭菜单
   useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
+    const handleClickOutside = (e: MouseEvent): void => {
       if (groupMenuRef.current && !groupMenuRef.current.contains(e.target as Node)) {
         setShowGroupMenu(false)
       }
@@ -173,24 +173,24 @@ export function AccountToolbar({
   const getSelectedAccountsTagStatus = useCallback(() => selectedTagStatus, [selectedTagStatus])
 
   // 处理分组操作
-  const handleMoveToGroup = (groupId: string | undefined) => {
+  const handleMoveToGroup = (groupId: string | undefined): void => {
     if (selectedIds.size === 0) return
     moveAccountsToGroup(Array.from(selectedIds), groupId)
     setShowGroupMenu(false)
   }
 
   // 处理标签操作
-  const handleAddTag = (tagId: string) => {
+  const handleAddTag = (tagId: string): void => {
     if (selectedIds.size === 0) return
     addTagToAccounts(Array.from(selectedIds), tagId)
   }
 
-  const handleRemoveTag = (tagId: string) => {
+  const handleRemoveTag = (tagId: string): void => {
     if (selectedIds.size === 0) return
     removeTagFromAccounts(Array.from(selectedIds), tagId)
   }
 
-  const handleToggleTag = (tagId: string) => {
+  const handleToggleTag = (tagId: string): void => {
     const { tagCounts, total } = getSelectedAccountsTagStatus()
     const count = tagCounts.get(tagId) || 0
 
@@ -312,7 +312,7 @@ export function AccountToolbar({
   }
 
   return (
-    <div className="space-y-3">
+    <div className="account-toolbar space-y-3" data-view={viewMode}>
       <div
         className="ui-tabs overflow-x-auto"
         role="tablist"
@@ -400,7 +400,7 @@ export function AccountToolbar({
         )}
       >
         {/* 左侧：统计信息 */}
-        <div className="flex items-center gap-4 text-body">
+        <div className="account-toolbar-summary flex flex-wrap items-center gap-3 text-body">
           <span className="text-muted-foreground">
             {isEn ? '' : '共 '}
             <span className="font-medium text-foreground">{stats.total}</span>{' '}
@@ -414,7 +414,10 @@ export function AccountToolbar({
             )}
           </span>
           {stats.expiringSoonCount > 0 && (
-            <Badge variant="destructive" className="gap-1">
+            <Badge
+              variant="outline"
+              className="gap-1 border-transparent bg-warning-soft text-warning-text"
+            >
               {stats.expiringSoonCount} {isEn ? 'expiring' : '个即将到期'}
             </Badge>
           )}
@@ -466,7 +469,7 @@ export function AccountToolbar({
                   count: number,
                   accentColor?: string,
                   moveAction?: { selCount: number; isAllInGroup: boolean; onMove: () => void }
-                ) => (
+                ): React.ReactNode => (
                   <div
                     key={key}
                     className={cn(
@@ -922,93 +925,97 @@ export function AccountToolbar({
             )}
           </div>
 
-          <div className="w-px h-6 bg-border mx-1" />
+          {(viewMode !== 'list' || selectedCount > 0) && (
+            <>
+              <div className="w-px h-6 bg-border mx-1" />
 
-          {/* 批量操作 — 纯图标 + tooltip（带选中计数）*/}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8"
-            onClick={handleBatchCheck}
-            disabled={isChecking || selectedCount === 0}
-            title={
-              selectedCount > 0
-                ? isEn
-                  ? `Check ${selectedCount} accounts info (usage / subscription / banned)`
-                  : `检查选中 ${selectedCount} 个账号信息：刷新用量、订阅详情、封禁状态`
-                : isEn
-                  ? 'Check accounts info (select first)'
-                  : '检查账户信息（请先选中账号）'
-            }
-          >
-            {/* 与 batchRefresh 区分图标：Activity 代表"查看状态/活动" */}
-            {isChecking ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Activity className="h-4 w-4" />
-            )}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 text-emerald-600 hover:text-emerald-600 hover:bg-emerald-500/10"
-            onClick={handleBatchLiveness}
-            disabled={selectedCount === 0}
-            title={
-              selectedCount > 0
-                ? isEn
-                  ? `Liveness test ${selectedCount} accounts via reverse-proxy`
-                  : `走反代对选中 ${selectedCount} 个账号批量测活`
-                : isEn
-                  ? 'Liveness test (select first)'
-                  : '账号测活（请先选中账号）'
-            }
-          >
-            <Zap className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10"
-            onClick={handleBatchDelete}
-            disabled={selectedCount === 0}
-            title={
-              selectedCount > 0
-                ? isEn
-                  ? `Delete ${selectedCount} selected accounts`
-                  : `删除选中的 ${selectedCount} 个账号`
-                : isEn
-                  ? 'Delete (select first)'
-                  : '删除选中账号（请先选中账号）'
-            }
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8"
-            onClick={handleBatchRefresh}
-            disabled={isRefreshing || selectedCount === 0}
-            title={
-              selectedCount > 0
-                ? isEn
-                  ? `Refresh ${selectedCount} access tokens`
-                  : `刷新选中 ${selectedCount} 个账号的访问令牌`
-                : isEn
-                  ? 'Refresh Token (select first)'
-                  : '刷新 Token（请先选中账号）'
-            }
-          >
-            {/* 与 batchCheck 区分图标：KeyRound 代表"刷新令牌"，与 AccountCard 单账号视图一致 */}
-            {isRefreshing ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <KeyRound className="h-4 w-4" />
-            )}
-          </Button>
+              {/* 批量操作 — 纯图标 + tooltip（带选中计数）*/}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={handleBatchCheck}
+                disabled={isChecking || selectedCount === 0}
+                title={
+                  selectedCount > 0
+                    ? isEn
+                      ? `Check ${selectedCount} accounts info (usage / subscription / banned)`
+                      : `检查选中 ${selectedCount} 个账号信息：刷新用量、订阅详情、封禁状态`
+                    : isEn
+                      ? 'Check accounts info (select first)'
+                      : '检查账户信息（请先选中账号）'
+                }
+              >
+                {/* 与 batchRefresh 区分图标：Activity 代表"查看状态/活动" */}
+                {isChecking ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Activity className="h-4 w-4" />
+                )}
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 text-emerald-600 hover:text-emerald-600 hover:bg-emerald-500/10"
+                onClick={handleBatchLiveness}
+                disabled={selectedCount === 0}
+                title={
+                  selectedCount > 0
+                    ? isEn
+                      ? `Liveness test ${selectedCount} accounts via reverse-proxy`
+                      : `走反代对选中 ${selectedCount} 个账号批量测活`
+                    : isEn
+                      ? 'Liveness test (select first)'
+                      : '账号测活（请先选中账号）'
+                }
+              >
+                <Zap className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10"
+                onClick={handleBatchDelete}
+                disabled={selectedCount === 0}
+                title={
+                  selectedCount > 0
+                    ? isEn
+                      ? `Delete ${selectedCount} selected accounts`
+                      : `删除选中的 ${selectedCount} 个账号`
+                    : isEn
+                      ? 'Delete (select first)'
+                      : '删除选中账号（请先选中账号）'
+                }
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={handleBatchRefresh}
+                disabled={isRefreshing || selectedCount === 0}
+                title={
+                  selectedCount > 0
+                    ? isEn
+                      ? `Refresh ${selectedCount} access tokens`
+                      : `刷新选中 ${selectedCount} 个账号的访问令牌`
+                    : isEn
+                      ? 'Refresh Token (select first)'
+                      : '刷新 Token（请先选中账号）'
+                }
+              >
+                {/* 与 batchCheck 区分图标：KeyRound 代表"刷新令牌"，与 AccountCard 单账号视图一致 */}
+                {isRefreshing ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <KeyRound className="h-4 w-4" />
+                )}
+              </Button>
 
-          <div className="w-px h-6 bg-border mx-1" />
+              <div className="w-px h-6 bg-border mx-1" />
+            </>
+          )}
 
           {/* 全选 / 取消全选 */}
           <Button

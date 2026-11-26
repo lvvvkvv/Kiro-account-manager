@@ -3,7 +3,7 @@ import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { AccountToolbar, type AccountViewMode } from './AccountToolbar'
 import { AccountGrid } from './AccountGrid'
-import { AccountList } from './AccountList'
+import { AccountList, AccountListSkeleton } from './AccountList'
 import { AddAccountDialog } from './AddAccountDialog'
 import { EditAccountDialog } from './EditAccountDialog'
 import { GroupManageDialog } from './GroupManageDialog'
@@ -13,7 +13,7 @@ import { Button } from '../ui'
 import type { Account } from '@/types/account'
 import { splitCredentialLine } from '@/lib/utils'
 import { PageHeader } from '../layout'
-import { ArrowLeft, Loader2, Users, Plus, Upload, Download } from 'lucide-react'
+import { ArrowLeft, Users, Plus, Upload, Download } from 'lucide-react'
 
 interface AccountManagerProps {
   onBack?: () => void
@@ -48,7 +48,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   const isEn = t('common.unknown') === 'Unknown'
 
   // 获取要导出的账号列表
-  const getExportAccounts = () => {
+  const getExportAccounts = (): Account[] => {
     const accountList = Array.from(accounts.values())
     if (selectedIds.size > 0) {
       return accountList.filter((acc) => selectedIds.has(acc.id))
@@ -242,10 +242,10 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="flex flex-col items-center gap-4">
-          <Loader2 className="h-8 w-8 animate-spin text-primary" />
-          <p className="text-muted-foreground">加载账号数据...</p>
+      <div className="flex flex-col h-full">
+        <PageHeader icon={<Users />} title={isEn ? 'Accounts' : '账户管理'} />
+        <div className="flex-1 min-h-0 px-6 pb-6">
+          <AccountListSkeleton />
         </div>
       </div>
     )

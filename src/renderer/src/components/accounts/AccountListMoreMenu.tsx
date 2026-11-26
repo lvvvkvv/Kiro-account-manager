@@ -22,6 +22,7 @@ export function AccountListMoreMenu({ label, actions }: AccountListMoreMenuProps
   const [open, setOpen] = useState(false)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const focusLast = useRef(false)
   const menuId = useId()
 
   useLayoutEffect(() => {
@@ -37,7 +38,8 @@ export function AccountListMoreMenu({ label, actions }: AccountListMoreMenuProps
     menu.style.maxHeight = `${Math.max(0, openBelow ? below : above)}px`
     menu.style.left = `${Math.max(8, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8))}px`
     menu.style.top = `${openBelow ? rect.bottom + 4 : rect.top - menu.offsetHeight - 4}px`
-    menu.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled)')?.focus()
+    const items = menu.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled)')
+    items[focusLast.current ? items.length - 1 : 0]?.focus()
 
     const dismissOutside = (event: PointerEvent): void => {
       if (!menu.contains(event.target as Node) && !trigger.contains(event.target as Node)) {
@@ -49,7 +51,7 @@ export function AccountListMoreMenu({ label, actions }: AccountListMoreMenuProps
       if (!menu.contains(event.target as Node)) dismiss()
     }
     // 侧栏展开也会改变容器宽度，此时关闭原位置的浮层。
-    const list = trigger.closest('.account-list')
+    const list = trigger.closest('.account-list-shell')
     const initialWidth = list?.clientWidth
     const observer = new ResizeObserver(() => {
       if (list?.clientWidth !== initialWidth) dismiss()
@@ -81,12 +83,14 @@ export function AccountListMoreMenu({ label, actions }: AccountListMoreMenuProps
         aria-controls={open ? menuId : undefined}
         onClick={(event) => {
           event.stopPropagation()
+          focusLast.current = false
           setOpen(!open)
         }}
         onKeyDown={(event) => {
           if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
             event.preventDefault()
             event.stopPropagation()
+            focusLast.current = event.key === 'ArrowUp'
             setOpen(true)
           }
         }}
