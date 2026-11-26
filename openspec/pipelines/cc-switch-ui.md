@@ -3,7 +3,7 @@
 - 日期：2026-11-26（Asia/Shanghai）
 - 规划根／代码仓库：`/Users/kang/Kiro-account-manager`；应用目录：`Kiro-account-manager/`。
 - Schema：`spec-driven`；store：未使用，规划随当前仓库维护。
-- 需求：视觉与交互参照 `/Users/kang/cc-switch` 当前 v7；完整保留当前应用功能。本次只初始化 OpenSpec、整理基线、编写规划和统一复核，不实施。
+- 需求：视觉与交互参照 `/Users/kang/cc-switch` 当前 v7；完整保留当前应用功能。初始阶段只完成 OpenSpec 规划；用户后续分别授权实施001、002，结果见执行记录。
 - 代码基线：`8f11db50f64cc4faf3f9c0dff8eca543c01cdc15`；起始分支：`main`。
 - 参考项目基线：`/Users/kang/cc-switch`，提交 `f29d0804b05ce374ee650c64706399cd0da01805`；不修改参考项目。
 - 功能依据：[功能保留清单](../baselines/cc-switch-ui-function-preservation.md)。统一复核记录：[规划复核](../reviews/cc-switch-ui-plan-review.md)。
@@ -21,7 +21,7 @@
 | 成员 | 直接依赖 | 目标范围 | 核心验收 | 规划 | 实现／简化／代码审查 |
 |---|---|---|---|---|---|
 | [001 foundations](../changes/cc-switch-ui-001-foundations/proposal.md) | 无 | Token、基础组件、公共交互外观 | 中性实色、固定橙色操作；三档外观、中文／英文、账号遮罩与控件契约 | 完整／已复核 | 完成（9/9）／未开始／本地复核及修复完成，DM网络受阻 |
-| [002 shell-home](../changes/cc-switch-ui-002-shell-home/proposal.md) | 001 | 窗口框架、导航、首页、任务中心、全局关闭／更新弹窗 | 15 页可达；窗口操作、任务与后台生命周期等价 | 完整／已复核 | 未开始／未开始／未开始 |
+| [002 shell-home](../changes/cc-switch-ui-002-shell-home/proposal.md) | 001 | 窗口框架、导航、首页、任务中心、全局关闭／更新弹窗 | 15 页可达；窗口操作、任务与后台生命周期等价 | 完整／已复核 | 完成（11/11）／未开始／本地复核及修复完成，DM HTTP403受阻 |
 | [003 accounts](../changes/cc-switch-ui-003-accounts/proposal.md) | 001、002 | 账号卡片／列表、工具栏、筛选、全部账号弹窗 | 导入导出、选择、切换、分组标签、订阅和绑定入口不丢失 | 完整／已复核 | 未开始／未开始／未开始 |
 | [004 proxies](../changes/cc-switch-ui-004-proxies/proposal.md) | 001、002 | API 反代、KProxy、代理池及其弹窗 | 服务配置、证书、API Key、账号绑定、验活和日志保持 | 完整／已复核 | 未开始／未开始／未开始 |
 | [005 registration-subscription](../changes/cc-switch-ui-005-registration-subscription/proposal.md) | 001、002 | 注册、批量订阅／超额／订阅管理 | 6 种注册模式与三类订阅工作流、批量生命周期保持 | 完整／已复核 | 未开始／未开始／未开始 |
@@ -57,8 +57,10 @@
 | 初始化／功能基线／6 个完整规划／统一复核 | 完成 | main（未创建实施分支） | 仅 openspec/ 配置与 Markdown | 严格校验与静态一致性检查见复核记录；未执行功能测试 | 无 |
 | 001 foundations 实现 | 完成（9/9） | main（工作区改动） | renderer公共样式／控件，主题和语言生效逻辑；规划引用同步 | typecheck／build／6项OpenSpec校验通过；隔离renderer验证通过；lint遗留371 errors，未新增error。详见001 implementation.md／ui-contract.md | 工作区保留，未提交 |
 | 001 公共UI代码审查与修复 | 本地完成，DM网络受阻 | main（工作区改动） | 公共字体／几何与低强调控件修正、参考对照回归 | typecheck／build／renderer回归通过；lint与审查前相同。问题和DM覆盖限制见001 code-review.md | 工作区保留，未提交 |
-| 002～006实现及各成员简化、代码审查与修复验证 | 未开始 | 待实施时记录 | 待记录 | 未执行 | 无 |
+| 002 shell-home 实现 | 完成（11/11） | main（工作区改动） | renderer外壳、PageHeader、首页、全局关闭／更新弹窗、任务中心；未改main／preload／store | typecheck／build／严格校验、002完整UI、001回归通过；lint371个既有error，无新增；macOS独立原生窗口实测通过，拖动与Windows/Linux原生待测。详见002 implementation.md | 工作区保留，未提交 |
+| 002 代码审查与修复 | 本地完成，DM HTTP403受阻 | main（工作区改动） | cn语义Token注册、折叠品牌／提示、PageHeader附加区；实际组件回归 | 3类问题已修复；002完整回归、001回归及build通过，lint无新增error；独立DM覆盖0，详见002 code-review.md | 工作区保留，未提交 |
+| 003～006实现及各成员简化、代码审查与修复验证 | 未开始 | 待实施时记录 | 待记录 | 未执行 | 无 |
 | 整体集成 | 未开始 | 待记录 | 15 页与交叉入口 | 未执行 | 无 |
 | 整体简化／代码审查／修复验证 | 未开始 | 待记录 | 待记录 | 未执行 | 无 |
 
-001 实现完成（9/9），002～006仍未实施。用户最终确认本次仅执行001，覆盖全部公共UI规范；主题／语言范围更新及验证证据见001 implementation.md与ui-contract.md。
+001 实现完成（9/9），公共UI审查修复已完成；002经用户后续授权实现完成（11/11）。003～006仍未实施。主题／语言／隐私决定见001 implementation.md与ui-contract.md；公共页面框架与平台验证限制见002 implementation.md。

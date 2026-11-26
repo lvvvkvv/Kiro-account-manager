@@ -53,6 +53,8 @@
 
 ## 兼容与迁移
 
+语义Token必须同步注册到`lib/utils.ts`的extendTailwindMerge（text／radius／spacing），与CC Switch一致；否则字号可能被颜色类移除，尺寸与圆角覆盖也可能失效。002审查已补齐此公共依赖；真实组件合并后的验证见002 verification/review.mjs。
+
 旧 Button／Card 变体不删；gradient 与 glass 只作为兼容名称，不再产生对应装饰。组件 className／style／ref 和值、回调、disabled仍透传。调用方处理中的按钮沿原有 disabled和 spinner表达状态；不新增 loading业务状态。
 
 所有图标操作由调用方提供 aria-label、title 或可见文字；Select 的触发器使用当前选项文字，也支持显式 aria-label／labelledby。新增菜单键只用于该原生选择控件的方向键浏览、Enter选择、Escape取消，不建立任何业务快捷键。

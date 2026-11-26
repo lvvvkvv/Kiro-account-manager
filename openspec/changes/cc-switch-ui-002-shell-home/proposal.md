@@ -23,4 +23,4 @@
 
 ## Impact
 
-未来涉及应用目录内 `src/renderer/src/App.tsx` 的呈现部分、`components/layout/`、`pages/HomePage.tsx`、`UpdateDialog.tsx`、`CloseConfirmDialog.tsx`，必要时新增纯页面框架组件。不改 App 中现有后台订阅、main 窗口配置或托盘逻辑。保留清单 G01、G03～G07、H01～H02；本轮仅规划。
+涉及应用目录内 `src/renderer/src/App.tsx` 的呈现部分、`components/layout/`、`pages/HomePage.tsx`、`UpdateDialog.tsx`、`CloseConfirmDialog.tsx`，必要时新增纯页面框架组件。不改 App 中现有后台订阅、main 窗口配置或托盘逻辑。保留清单 G01、G03～G07、H01～H02；本轮实施结果见 implementation.md。

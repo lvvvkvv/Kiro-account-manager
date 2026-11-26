@@ -357,16 +357,16 @@ function App(): React.JSX.Element {
   }
 
   return (
-    <div className="h-screen ambient-bg overflow-hidden flex flex-col">
+    <div className="h-screen bg-background overflow-hidden flex flex-col">
       <TitleBar />
-      <div className="flex-1 min-h-0 flex gap-2 p-2">
+      <div className="flex-1 min-h-0 flex">
         <Sidebar
           currentPage={currentPage}
           onPageChange={setCurrentPage}
           collapsed={sidebarCollapsed}
           onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
         />
-        <main className="flex-1 min-w-0 overflow-hidden rounded-3xl page-surface">
+        <main className="flex-1 min-w-0 overflow-hidden bg-background">
           <AnimatePresence mode="wait">
             <motion.div
               key={currentPage}

@@ -11,7 +11,7 @@ export async function verifyDialogs(page, out, navigate) {
       window.__calls.length = 0
       window.__events.onShowCloseConfirmDialog()
     }, { language, mode })
-    const close = page.locator('.glass-card-strong').filter({ hasText: isEn ? 'Close Window' : '关闭窗口' })
+    const close = page.getByRole('dialog', { name: isEn ? 'Close Window' : '关闭窗口', exact: true })
     await close.getByRole('button', { name: isEn ? 'Cancel' : '取消', exact: true }).click()
     assert.deepEqual(await page.evaluate(() => window.__calls.filter(x => x.name === 'sendCloseConfirmResponse').map(x => x.args)), [['cancel', false]])
     await page.evaluate(() => window.__events.onShowCloseConfirmDialog())

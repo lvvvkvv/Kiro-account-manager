@@ -1,5 +1,16 @@
 import { type ClassValue, clsx } from 'clsx'
-import { twMerge } from 'tailwind-merge'
+import { extendTailwindMerge } from 'tailwind-merge'
+
+// 与 CC Switch 一样注册语义 Token，避免字号被当成颜色、尺寸覆盖失效。
+const twMerge = extendTailwindMerge({
+  extend: {
+    theme: {
+      text: ['badge', 'caption', 'body', 'strong', 'section', 'title', 'page', 'metric'],
+      radius: ['control', 'panel', 'dialog'],
+      spacing: ['page', 'section', 'panel', 'nav-row', 'card-row', 'control', 'control-sm']
+    }
+  }
+})
 
 export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs))
