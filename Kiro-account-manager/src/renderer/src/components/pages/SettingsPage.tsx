@@ -1,160 +1,9 @@
 import { useAccountsStore } from '@/store/accounts'
 import { Card, CardContent, CardHeader, CardTitle, Button } from '../ui'
-import { Eye, EyeOff, RefreshCw, Clock, Trash2, Download, Upload, Globe, Repeat, Palette, Moon, Sun, Fingerprint, Info, ChevronDown, ChevronUp, Settings, Database, Layers, UserX, Monitor } from 'lucide-react'
+import { Eye, EyeOff, RefreshCw, Clock, Trash2, Download, Upload, Globe, Repeat, Palette, Moon, Sun, Fingerprint, Info, Settings, Database, Layers, UserX, Monitor } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { ExportDialog } from '../accounts/ExportDialog'
 import { useTranslation } from '@/hooks/useTranslation'
-
-// 主题配置 - 按色系分组
-const themeGroupsZh = [
-  {
-    name: '蓝色系',
-    themes: [
-      { id: 'default', name: '天空蓝', color: '#3b82f6' },
-      { id: 'indigo', name: '靖蓝', color: '#6366f1' },
-      { id: 'cyan', name: '清新青', color: '#06b6d4' },
-      { id: 'sky', name: '晴空蓝', color: '#0ea5e9' },
-      { id: 'teal', name: '水鸭蓝', color: '#14b8a6' },
-    ]
-  },
-  {
-    name: '紫红系',
-    themes: [
-      { id: 'purple', name: '优雅紫', color: '#a855f7' },
-      { id: 'violet', name: '紫罗兰', color: '#8b5cf6' },
-      { id: 'fuchsia', name: '洋红', color: '#d946ef' },
-      { id: 'pink', name: '粉红', color: '#ec4899' },
-      { id: 'rose', name: '玑瑰红', color: '#f43f5e' },
-    ]
-  },
-  {
-    name: '暖色系',
-    themes: [
-      { id: 'red', name: '热情红', color: '#ef4444' },
-      { id: 'orange', name: '活力橙', color: '#f97316' },
-      { id: 'amber', name: '琥珀金', color: '#f59e0b' },
-      { id: 'yellow', name: '明黄', color: '#eab308' },
-    ]
-  },
-  {
-    name: '绿色系',
-    themes: [
-      { id: 'emerald', name: '翠绿', color: '#10b981' },
-      { id: 'green', name: '草绿', color: '#22c55e' },
-      { id: 'lime', name: '青柠', color: '#84cc16' },
-    ]
-  },
-  {
-    name: '中性色',
-    themes: [
-      { id: 'slate', name: '石板灰', color: '#64748b' },
-      { id: 'zinc', name: '锌灰', color: '#71717a' },
-      { id: 'stone', name: '暖灰', color: '#78716c' },
-      { id: 'neutral', name: '中性灰', color: '#737373' },
-    ]
-  },
-  {
-    name: '奢华配色',
-    themes: [
-      { id: 'gold', name: '奢华金', color: '#C9A227' },
-      { id: 'navy', name: '海军蓝', color: '#1E40AF' },
-      { id: 'wine', name: '酒红', color: '#9F1239' },
-      { id: 'champagne', name: '香槟', color: '#B89968' },
-    ]
-  },
-  {
-    name: '莫兰迪',
-    themes: [
-      { id: 'dustyblue', name: '烟雾蓝', color: '#64748B' },
-      { id: 'terracotta', name: '陶土橙', color: '#B45434' },
-      { id: 'sage', name: '鼠尾草', color: '#6B8E5A' },
-      { id: 'mauve', name: '烟紫', color: '#8E7CC3' },
-    ]
-  },
-  {
-    name: '自然深色',
-    themes: [
-      { id: 'coral', name: '珊瑚粉', color: '#F87171' },
-      { id: 'forest', name: '森林绿', color: '#166534' },
-      { id: 'ocean', name: '深海青', color: '#155E75' },
-    ]
-  }
-]
-
-const themeGroupsEn = [
-  {
-    name: 'Blue',
-    themes: [
-      { id: 'default', name: 'Sky Blue', color: '#3b82f6' },
-      { id: 'indigo', name: 'Indigo', color: '#6366f1' },
-      { id: 'cyan', name: 'Cyan', color: '#06b6d4' },
-      { id: 'sky', name: 'Sky', color: '#0ea5e9' },
-      { id: 'teal', name: 'Teal', color: '#14b8a6' },
-    ]
-  },
-  {
-    name: 'Purple',
-    themes: [
-      { id: 'purple', name: 'Purple', color: '#a855f7' },
-      { id: 'violet', name: 'Violet', color: '#8b5cf6' },
-      { id: 'fuchsia', name: 'Fuchsia', color: '#d946ef' },
-      { id: 'pink', name: 'Pink', color: '#ec4899' },
-      { id: 'rose', name: 'Rose', color: '#f43f5e' },
-    ]
-  },
-  {
-    name: 'Warm',
-    themes: [
-      { id: 'red', name: 'Red', color: '#ef4444' },
-      { id: 'orange', name: 'Orange', color: '#f97316' },
-      { id: 'amber', name: 'Amber', color: '#f59e0b' },
-      { id: 'yellow', name: 'Yellow', color: '#eab308' },
-    ]
-  },
-  {
-    name: 'Green',
-    themes: [
-      { id: 'emerald', name: 'Emerald', color: '#10b981' },
-      { id: 'green', name: 'Green', color: '#22c55e' },
-      { id: 'lime', name: 'Lime', color: '#84cc16' },
-    ]
-  },
-  {
-    name: 'Neutral',
-    themes: [
-      { id: 'slate', name: 'Slate', color: '#64748b' },
-      { id: 'zinc', name: 'Zinc', color: '#71717a' },
-      { id: 'stone', name: 'Stone', color: '#78716c' },
-      { id: 'neutral', name: 'Neutral', color: '#737373' },
-    ]
-  },
-  {
-    name: 'Luxury',
-    themes: [
-      { id: 'gold', name: 'Gold', color: '#C9A227' },
-      { id: 'navy', name: 'Navy', color: '#1E40AF' },
-      { id: 'wine', name: 'Wine', color: '#9F1239' },
-      { id: 'champagne', name: 'Champagne', color: '#B89968' },
-    ]
-  },
-  {
-    name: 'Morandi',
-    themes: [
-      { id: 'dustyblue', name: 'Dusty Blue', color: '#64748B' },
-      { id: 'terracotta', name: 'Terracotta', color: '#B45434' },
-      { id: 'sage', name: 'Sage', color: '#6B8E5A' },
-      { id: 'mauve', name: 'Mauve', color: '#8E7CC3' },
-    ]
-  },
-  {
-    name: 'Natural',
-    themes: [
-      { id: 'coral', name: 'Coral', color: '#F87171' },
-      { id: 'forest', name: 'Forest', color: '#166534' },
-      { id: 'ocean', name: 'Ocean', color: '#155E75' },
-    ]
-  }
-]
 
 export function SettingsPage() {
   const { 
@@ -187,9 +36,7 @@ export function SettingsPage() {
     switchTarget,
     setSwitchTarget,
     theme,
-    darkMode,
     setTheme,
-    setDarkMode,
     language,
     setLanguage,
     accounts,
@@ -201,7 +48,6 @@ export function SettingsPage() {
   const [showExportDialog, setShowExportDialog] = useState(false)
   const [isImporting, setIsImporting] = useState(false)
   const [tempProxyUrl, setTempProxyUrl] = useState(proxyUrl)
-  const [themeExpanded, setThemeExpanded] = useState(false)
   const [isManualRefreshing, setIsManualRefreshing] = useState(false)
   
   // 托盘设置状态
@@ -364,7 +210,6 @@ export function SettingsPage() {
       setIsManualRefreshing(false)
     }
   }
-  const themeGroups = isEn ? themeGroupsEn : themeGroupsZh
 
   const handleExport = () => {
     setShowExportDialog(true)
@@ -434,19 +279,17 @@ export function SettingsPage() {
               <p className="text-sm text-muted-foreground">选择界面显示语言 / Select interface language</p>
             </div>
             <select
-              className="w-[160px] h-9 px-3 rounded-lg border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+              className="w-[160px] h-control px-2.5 rounded-control border border-input bg-card text-body focus:outline-none focus:ring-[3px] focus:ring-ring/20 focus:border-ring"
+              aria-label={isEn ? 'Display Language' : '显示语言'}
               value={language}
-              onChange={(e) => setLanguage(e.target.value as 'auto' | 'en' | 'zh')}
+              onChange={(e) => setLanguage(e.target.value as 'en' | 'zh')}
             >
-              <option value="auto">🌐 自动 (Auto)</option>
-              <option value="zh">🇨🇳 简体中文</option>
-              <option value="en">🇺🇸 English</option>
+              <option value="zh">简体中文</option>
+              <option value="en">English</option>
             </select>
           </div>
           <div className="text-xs text-muted-foreground bg-muted/50 rounded-lg p-3 space-y-1">
-            <p>• 自动模式会根据系统语言自动选择</p>
-            <p>• Auto mode will follow system language</p>
-            <p>• 支持自定义翻译文件扩展（开发中）</p>
+            {isEn ? 'Choose Chinese or English for the interface.' : '选择中文或英文作为界面语言。'}
           </div>
         </CardContent>
       </Card>
@@ -462,71 +305,21 @@ export function SettingsPage() {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* 深色模式 */}
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="font-medium">{isEn ? 'Dark Mode' : '深色模式'}</p>
-              <p className="text-sm text-muted-foreground">{isEn ? 'Toggle dark/light theme' : '切换深色/浅色主题'}</p>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="font-medium">{isEn ? 'Appearance' : '外观'}</p>
+            <div role="group" aria-label={isEn ? 'Appearance' : '外观'} className="ui-segmented ui-segmented-sm">
+              {([
+                { value: 'system', label: isEn ? 'System' : '跟随系统', icon: Monitor },
+                { value: 'light', label: isEn ? 'Light' : '浅色', icon: Sun },
+                { value: 'dark', label: isEn ? 'Dark' : '深色', icon: Moon }
+              ] as const).map(({ value, label, icon: Icon }) => (
+                <Button key={value} type="button" variant="ghost" size="sm" aria-pressed={theme === value}
+                  className={`h-full rounded-[5px] px-2.5 text-caption [&_svg]:size-3.5 ${theme === value ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground'}`}
+                  onClick={() => setTheme(value)}>
+                  <Icon aria-hidden="true" />{label}
+                </Button>
+              ))}
             </div>
-            <Button
-              variant={darkMode ? "default" : "outline"}
-              size="sm"
-              onClick={() => setDarkMode(!darkMode)}
-            >
-              {darkMode ? <Moon className="h-4 w-4 mr-2" /> : <Sun className="h-4 w-4 mr-2" />}
-              {darkMode ? (isEn ? 'Dark' : '深色') : (isEn ? 'Light' : '浅色')}
-            </Button>
-          </div>
-
-          {/* 主题颜色 */}
-          <div className="pt-2 border-t">
-            <button 
-              className="flex items-center justify-between w-full text-left"
-              onClick={() => setThemeExpanded(!themeExpanded)}
-            >
-              <div className="flex items-center gap-2">
-                <p className="font-medium">{isEn ? 'Theme Color' : '主题颜色'}</p>
-                {!themeExpanded && (
-                  <div 
-                    className="w-5 h-5 rounded-full ring-2 ring-primary ring-offset-1"
-                    style={{ backgroundColor: themeGroups.flatMap(g => g.themes).find(t => t.id === theme)?.color || '#3b82f6' }}
-                  />
-                )}
-              </div>
-              {themeExpanded ? (
-                <ChevronUp className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <ChevronDown className="h-4 w-4 text-muted-foreground" />
-              )}
-            </button>
-            {themeExpanded && (
-              <div className="space-y-3 mt-3">
-                {themeGroups.map((group) => (
-                  <div key={group.name} className="flex items-center gap-3">
-                    <span className="text-xs text-muted-foreground w-14 shrink-0">{group.name}</span>
-                    <div className="flex flex-wrap gap-2">
-                      {group.themes.map((t) => (
-                        <button
-                          key={t.id}
-                          className={`group relative w-7 h-7 rounded-full transition-all ${
-                            theme === t.id 
-                              ? 'ring-2 ring-primary ring-offset-2 scale-110' 
-                              : 'hover:scale-110 hover:shadow-md'
-                          }`}
-                          style={{ backgroundColor: t.color }}
-                          onClick={() => setTheme(t.id)}
-                          title={t.name}
-                        >
-                          <span className="absolute -bottom-6 left-1/2 -translate-x-1/2 text-[10px] text-muted-foreground whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity bg-popover px-1.5 py-0.5 rounded shadow-sm border pointer-events-none z-10">
-                            {t.name}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         </CardContent>
       </Card>

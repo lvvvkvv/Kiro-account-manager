@@ -328,7 +328,7 @@ export function AboutPage() {
             </li>
             <li className="flex items-start gap-2">
               <span className="text-primary mt-0.5">✓</span>
-              <strong>{isEn ? 'Themes' : '主题定制'}</strong>{isEn ? ': 32 colors, dark/light mode' : '：32 种主题颜色，深色/浅色模式'}
+              <strong>{isEn ? 'Themes' : '主题定制'}</strong>{isEn ? ': System, light and dark appearance' : '：跟随系统、浅色和深色外观'}
             </li>
           </ul>
         </CardContent>

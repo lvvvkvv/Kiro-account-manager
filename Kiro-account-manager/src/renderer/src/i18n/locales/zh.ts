@@ -84,7 +84,7 @@ const zh = {
         multiAccount: '管理多个 Kiro 账号',
         autoRefresh: 'Token 过期前自动刷新',
         machineId: '机器码管理防止封禁',
-        themes: '32 种主题颜色可选'
+        themes: '跟随系统、浅色和深色外观'
       }
     }
   },

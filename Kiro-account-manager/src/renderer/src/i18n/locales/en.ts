@@ -84,7 +84,7 @@ const en = {
         multiAccount: 'Manage multiple Kiro accounts',
         autoRefresh: 'Auto refresh tokens before expiration',
         machineId: 'Machine ID management to prevent bans',
-        themes: '32 theme colors available'
+        themes: 'System, light and dark appearance'
       }
     }
   },

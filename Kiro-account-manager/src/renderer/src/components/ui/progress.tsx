@@ -14,12 +14,16 @@ const Progress = React.forwardRef<HTMLDivElement, ProgressProps>(
     return (
       <div
         ref={ref}
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={max}
+        aria-valuenow={Math.min(max, Math.max(0, value))}
         className={cn('relative h-2 w-full overflow-hidden rounded-full bg-secondary', className)}
         {...props}
       >
         <div
           className={cn(
-            'h-full w-full flex-1 bg-primary transition-all',
+            'h-full w-full flex-1 bg-primary transition-transform duration-150 motion-reduce:transition-none',
             percentage > 80 && 'bg-warning',
             percentage > 95 && 'bg-destructive',
             indicatorClassName

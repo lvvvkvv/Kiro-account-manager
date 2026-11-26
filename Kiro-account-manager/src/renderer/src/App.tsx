@@ -1,3 +1,4 @@
+import { useColorScheme } from './hooks/useColorScheme'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AccountManager } from './components/accounts'
@@ -14,6 +15,7 @@ const TRAY_UPDATE_DEBOUNCE_MS = 400
 const BACKGROUND_RESULT_FLUSH_MS = 120
 
 function App(): React.JSX.Element {
+  useColorScheme()
   const [currentPage, setCurrentPage] = useState<PageType>('home')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true)
 
@@ -181,7 +183,7 @@ function App(): React.JSX.Element {
     if (!inGracePeriod && fresh.length > 0 && Notification.permission !== 'denied') {
       const fire = (): void => {
         const lang = useAccountsStore.getState().language
-        const isEn = lang === 'en' || (lang === 'auto' && !navigator.language.startsWith('zh'))
+        const isEn = lang === 'en'
         const title = fresh.length === 1
           ? (isEn ? 'Account banned' : '账号被封禁')
           : (isEn ? `${fresh.length} accounts banned` : `${fresh.length} 个账号被封禁`)

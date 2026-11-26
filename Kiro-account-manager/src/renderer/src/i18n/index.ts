@@ -1,3 +1,4 @@
+import { resolveLanguage, type Language } from '@/lib/language'
 /**
  * 国际化 (i18n) 系统
  * 支持中英双语，可扩展本地翻译文件
@@ -7,7 +8,7 @@ import { create } from 'zustand'
 import en from './locales/en'
 import zh from './locales/zh'
 
-export type Language = 'en' | 'zh' | 'auto'
+export type { Language } from '@/lib/language'
 
 export interface Translations {
   [key: string]: string | Translations
@@ -51,10 +52,7 @@ export function detectSystemLanguage(): 'en' | 'zh' {
  * 获取实际使用的语言
  */
 export function getActualLanguage(language: Language): 'en' | 'zh' {
-  if (language === 'auto') {
-    return detectSystemLanguage()
-  }
-  return language
+  return resolveLanguage(language)
 }
 
 /**
@@ -104,7 +102,7 @@ interface I18nState {
 }
 
 export const useI18n = create<I18nState>((set, get) => ({
-  language: 'auto',
+  language: detectSystemLanguage(),
   actualLanguage: detectSystemLanguage(),
   
   setLanguage: (language: Language) => {

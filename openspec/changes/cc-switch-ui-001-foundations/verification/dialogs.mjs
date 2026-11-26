@@ -1,0 +1,51 @@
+import assert from 'node:assert/strict'
+
+export async function verifyDialogs(page, out, navigate) {
+  await page.setViewportSize({ width: 800, height: 600 })
+  for (const language of ['zh', 'en']) for (const mode of ['light', 'dark']) {
+    const isEn = language === 'en'
+    await page.evaluate(async ({ language, mode }) => {
+      const { useAccountsStore } = await import('/src/store/accounts.ts')
+      useAccountsStore.getState().setLanguage(language)
+      useAccountsStore.getState().setTheme(mode)
+      window.__calls.length = 0
+      window.__events.onShowCloseConfirmDialog()
+    }, { language, mode })
+    const close = page.locator('.glass-card-strong').filter({ hasText: isEn ? 'Close Window' : '关闭窗口' })
+    await close.getByRole('button', { name: isEn ? 'Cancel' : '取消', exact: true }).click()
+    assert.deepEqual(await page.evaluate(() => window.__calls.filter(x => x.name === 'sendCloseConfirmResponse').map(x => x.args)), [['cancel', false]])
+    await page.evaluate(() => window.__events.onShowCloseConfirmDialog())
+    await page.screenshot({ path: `${out}/close-${language}-${mode}-800.png` })
+    await page.mouse.click(4, 300)
+    assert.deepEqual(await page.evaluate(() => window.__calls.filter(x => x.name === 'sendCloseConfirmResponse').map(x => x.args)), [['cancel', false], ['cancel', false]])
+    await navigate('accounts')
+    await page.getByRole('button', { name: isEn ? 'Add' : '添加账号', exact: true }).click()
+    const add = page.locator('.fixed.inset-0.z-50').last()
+    await add.getByRole('button', { name: isEn ? 'OIDC Token' : 'OIDC 凭证', exact: true }).click()
+    const confirm = add.getByRole('button', { name: isEn ? 'Add Account' : '确认添加', exact: true })
+    await add.getByPlaceholder('Client ID', { exact: true }).fill('')
+    await add.getByPlaceholder('Client Secret', { exact: true }).fill('')
+    await add.locator('textarea').fill('')
+    assert.equal(await confirm.isDisabled(), true)
+    await page.evaluate(() => { delete window.__resolveVerification })
+    await add.getByPlaceholder('Client ID', { exact: true }).fill('fixture-client')
+    await add.getByPlaceholder('Client Secret', { exact: true }).fill('fixture-value')
+    await add.locator('textarea').fill('fixture-refresh-value')
+    assert.equal(await confirm.isDisabled(), false)
+    await confirm.click()
+    await page.waitForFunction(() => typeof window.__resolveVerification === 'function')
+    assert.equal(await confirm.isDisabled(), true)
+    assert.equal(await confirm.locator('.animate-spin').count(), 1)
+    await confirm.evaluate(el => el.click())
+    assert.equal(await page.evaluate(() => window.__calls.filter(x => x.name === 'verifyAccountCredentials').length), 1)
+    await page.evaluate(() => window.__resolveVerification({ success: false, error: 'Fixture validation failed. '.repeat(18) }))
+    await add.getByText(/^Fixture validation failed/).waitFor()
+    await add.getByRole('button', { name: isEn ? 'Cancel' : '取消', exact: true }).scrollIntoViewIfNeeded()
+    await page.screenshot({ path: `${out}/account-error-${language}-${mode}-800.png` })
+    const countBefore = await page.evaluate(async () => { const { useAccountsStore } = await import('/src/store/accounts.ts'); return useAccountsStore.getState().accounts.size })
+    await add.getByRole('button', { name: isEn ? 'Cancel' : '取消', exact: true }).click()
+    assert.equal(await page.evaluate(async () => { const { useAccountsStore } = await import('/src/store/accounts.ts'); return useAccountsStore.getState().accounts.size }), countBefore)
+    assert.equal(await page.evaluate(() => window.__calls.some(x => ['startBuilderIdLogin', 'startIamSsoLogin', 'startSocialLogin', 'importFromFile'].includes(x.name))), false)
+  }
+  console.log('通过：关闭确认／账号弹窗，中文英文 × 浅深色 × 800×600，取消无提交，长错误可滚动到操作区，加载禁用且不重复请求')
+}

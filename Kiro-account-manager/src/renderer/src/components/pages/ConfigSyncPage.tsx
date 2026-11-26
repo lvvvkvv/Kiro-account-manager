@@ -1,3 +1,4 @@
+import { resolveLanguage } from '@/lib/language'
 import { useState, useCallback } from 'react'
 import {
   Archive, Download, Upload, FileJson, ShieldAlert, CheckCircle2,
@@ -280,8 +281,8 @@ export function ConfigSyncPage(): React.ReactNode {
       if (data.appSettings) {
         const s = data.appSettings
         if (s.theme != null) store.setTheme(s.theme)
-        if (s.darkMode != null) store.setDarkMode(s.darkMode)
-        if (s.language != null) store.setLanguage(s.language as 'auto' | 'en' | 'zh')
+        if (s.theme == null && s.darkMode != null) store.setDarkMode(s.darkMode)
+        if (s.language != null) store.setLanguage(resolveLanguage(s.language))
         if (s.autoRefreshEnabled != null) store.setAutoRefresh(s.autoRefreshEnabled, s.autoRefreshInterval)
         if (s.autoRefreshConcurrency != null) store.setAutoRefreshConcurrency(s.autoRefreshConcurrency)
         if (s.statusCheckInterval != null) store.setStatusCheckInterval(s.statusCheckInterval)

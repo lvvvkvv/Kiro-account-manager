@@ -1,3 +1,5 @@
+import { resolveLanguage, type Language } from '../lib/language'
+import { resolveThemeMode, type ThemeMode } from '../lib/theme'
 import { create } from 'zustand'
 import { v4 as uuidv4 } from 'uuid'
 import type {
@@ -303,11 +305,11 @@ interface AccountsState {
   switchTarget: 'ide' | 'cli' | 'both' // ide=仅 Kiro IDE, cli=仅 Kiro CLI, both=两者都切
 
   // 主题设置
-  theme: string // 主题名称: default, purple, emerald, orange, rose, cyan, amber
+  theme: ThemeMode // 与 CC Switch 一致：跟随系统／浅色／深色
   darkMode: boolean // 深色模式
 
   // 语言设置
-  language: 'auto' | 'en' | 'zh' // auto: 跟随系统
+  language: Language
 
   // 机器码管理
   machineIdConfig: {
@@ -427,7 +429,7 @@ interface AccountsActions {
   applyTheme: () => void
 
   // 语言设置
-  setLanguage: (language: 'auto' | 'en' | 'zh') => void
+  setLanguage: (language: Language) => void
 
   // 自动换号
   setAutoSwitch: (enabled: boolean, threshold?: number, interval?: number) => void
@@ -573,9 +575,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   batchImportConcurrency: 100,
   loginPrivateMode: false,
   switchTarget: 'ide' as const,
-  theme: 'default',
+  theme: 'system',
   darkMode: false,
-  language: 'auto',
+  language: resolveLanguage(undefined),
 
   machineIdConfig: {
     autoSwitchOnAccountChange: false,
@@ -1719,9 +1721,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           autoSwitchThreshold: data.autoSwitchThreshold ?? 0,
           autoSwitchInterval: data.autoSwitchInterval ?? 5,
           switchTarget: data.switchTarget ?? 'ide',
-          theme: data.theme ?? 'default',
+          theme: resolveThemeMode(data.theme),
           darkMode: data.darkMode ?? false,
-          language: data.language ?? 'auto',
+          language: resolveLanguage(data.language),
           machineIdConfig: data.machineIdConfig ?? {
             autoSwitchOnAccountChange: false,
             bindMachineIdToAccount: false,
@@ -1999,13 +2001,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   // ==================== 主题设置 ====================
 
   setTheme: (theme) => {
-    set({ theme })
+    set({ theme: resolveThemeMode(theme) })
     get().saveToStorage()
     get().applyTheme()
   },
 
   setDarkMode: (enabled) => {
-    set({ darkMode: enabled })
+    set({ theme: enabled ? 'dark' : 'light', darkMode: enabled })
     get().saveToStorage()
     get().applyTheme()
   },
@@ -2015,47 +2017,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   setLanguage: (language) => {
     set({ language })
     get().saveToStorage()
-    // 更新托盘菜单语言
-    const actualLang = language === 'auto' 
-      ? (navigator.language.startsWith('zh') ? 'zh' : 'en')
-      : language
-    window.api.updateTrayLanguage(actualLang)
+    window.api.updateTrayLanguage(language)
   },
 
   applyTheme: () => {
-    const { theme, darkMode } = get()
-    const root = document.documentElement
-    
-    // 移除所有主题类（包含所有 32 个主题）
-    root.classList.remove(
-      'dark', 
-      // 蓝色系
-      'theme-indigo', 'theme-cyan', 'theme-sky', 'theme-teal',
-      // 紫红系
-      'theme-purple', 'theme-violet', 'theme-fuchsia', 'theme-pink', 'theme-rose',
-      // 暖色系
-      'theme-red', 'theme-orange', 'theme-amber', 'theme-yellow',
-      // 绿色系
-      'theme-emerald', 'theme-green', 'theme-lime',
-      // 中性色
-      'theme-slate', 'theme-zinc', 'theme-stone', 'theme-neutral',
-      // 奢华配色
-      'theme-gold', 'theme-navy', 'theme-wine', 'theme-champagne',
-      // 莫兰迪
-      'theme-dustyblue', 'theme-terracotta', 'theme-sage', 'theme-mauve',
-      // 自然深色
-      'theme-coral', 'theme-forest', 'theme-ocean'
-    )
-    
-    // 应用深色模式
-    if (darkMode) {
-      root.classList.add('dark')
-    }
-    
-    // 应用主题颜色
-    if (theme !== 'default') {
-      root.classList.add(`theme-${theme}`)
-    }
+    const { theme } = get()
+    const darkMode = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+    document.documentElement.classList.toggle('dark', darkMode)
+    if (get().darkMode !== darkMode) set({ darkMode })
   },
 
   // ==================== 自动换号 ====================
