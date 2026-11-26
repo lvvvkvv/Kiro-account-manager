@@ -84,7 +84,7 @@ Sync Kiro IDE settings, edit MCP servers, manage user rules (Steering).
 ![Kiro Settings](docs/screenshots/en/kiro-settings.png)
 
 ### About
-View version info, feature list, tech stack and author info.
+View version info, feature list and author info.
 
 ![About](docs/screenshots/en/about.png)
 
@@ -258,6 +258,10 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 
 ## 📋 Changelog
 
+
+### v1.7.12 (2026-11-26) — About Page Cleanup
+
+- Remove the Tech Stack card from the About page in both Chinese and English.
 
 ### v1.7.11 (2026-11-26) — Unified Updates and Recoverable macOS Installation
 

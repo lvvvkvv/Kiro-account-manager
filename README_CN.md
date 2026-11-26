@@ -86,7 +86,7 @@
 ![Kiro 设置](docs/screenshots/zh/kiro-settings.png)
 
 ### 关于
-查看版本信息、功能列表、技术栈和作者信息。
+查看版本信息、功能列表和作者信息。
 
 ![关于](docs/screenshots/zh/about.png)
 
@@ -260,6 +260,10 @@ npx electron-builder --linux --arm64
 
 ## 📋 更新日志
 
+
+### v1.7.12 (2026-11-26) — 关于页面精简
+
+- 移除关于页面中的“技术栈”卡片，中英文界面同步生效。
 
 ### v1.7.11 (2026-11-26) — 统一更新流程与 macOS 安全升级
 

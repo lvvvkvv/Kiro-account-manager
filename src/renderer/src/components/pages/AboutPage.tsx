@@ -1,10 +1,10 @@
 import { PageHeader } from '../layout/PageHeader'
 import { Card, CardContent, CardHeader, CardTitle } from '../ui'
-import { Heart, Code, Info, Zap } from 'lucide-react'
+import { Heart, Info, Zap } from 'lucide-react'
 import { useTranslation } from '@/hooks/useTranslation'
 import { UpdateSection } from '../updates/UpdateSection'
 
-export function AboutPage() {
+export function AboutPage(): React.JSX.Element {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   return (
@@ -109,30 +109,6 @@ export function AboutPage() {
                 {isEn ? ': System, light and dark appearance' : '：跟随系统、浅色和深色外观'}
               </li>
             </ul>
-          </CardContent>
-        </Card>
-
-        {/* Tech Stack */}
-        <Card className="">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-section flex items-center gap-3 min-w-0 flex-wrap [&_svg]:text-muted-foreground">
-              <Code className="h-4 w-4 text-primary" />
-              {isEn ? 'Tech Stack' : '技术栈'}
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-2">
-              {['Electron', 'React', 'TypeScript', 'Tailwind CSS', 'Zustand', 'Vite'].map(
-                (tech) => (
-                  <span
-                    key={tech}
-                    className="inline-flex h-5 items-center px-[7px] text-badge font-medium bg-muted rounded-full text-muted-foreground"
-                  >
-                    {tech}
-                  </span>
-                )
-              )}
-            </div>
           </CardContent>
         </Card>
 
