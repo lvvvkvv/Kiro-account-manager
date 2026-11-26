@@ -2,26 +2,6 @@
 # Kiro 账户管理器
 
 <p align="center">
-  <img src="resources/icon.png" width="128" height="128" alt="Kiro Logo">
-</p>
-
-<p align="center">
-  <strong>QQ 交流群: 653516618</strong>
-</p>
-
-<p align="center">
-  <img src="src/renderer/src/assets/交流群.png" width="200" alt="QQ 交流群">
-</p>
-
-<p align="center">
-  <strong>一个功能强大的 Kiro IDE 多账号管理工具</strong>
-</p>
-
-<p align="center">
-  支持多账号快速切换、自动 Token 刷新、分组标签管理、机器码管理等功能
-</p>
-
-<p align="center">
   <a href="README.md">English</a> | <strong>简体中文</strong>
 </p>
 

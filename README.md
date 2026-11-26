@@ -1,26 +1,6 @@
 # Kiro Account Manager
 
 <p align="center">
-  <img src="resources/icon.png" width="128" height="128" alt="Kiro Logo">
-</p>
-
-<p align="center">
-  <strong>QQ Group: 653516618</strong>
-</p>
-
-<p align="center">
-  <img src="src/renderer/src/assets/交流群.png" width="200" alt="QQ Group">
-</p>
-
-<p align="center">
-  <strong>A powerful multi-account management tool for Kiro IDE</strong>
-</p>
-
-<p align="center">
-  Quick account switching, auto token refresh, group/tag management, machine ID management and more
-</p>
-
-<p align="center">
   <strong>English</strong> | <a href="README_CN.md">简体中文</a>
 </p>
 
