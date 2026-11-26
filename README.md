@@ -259,6 +259,13 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 ## 📋 Changelog
 
 
+### v1.7.13 (2026-11-27) — Responsive Account List Layout
+
+- Align account status, sign-in provider, usage and expiry information across list rows while adapting to the available window width.
+- Center usage and time information between account details and actions, keep usage bars compact, and balance visible spacing.
+- Show all account action icons when space permits; move secondary actions into an accessible More menu in narrower windows.
+- Keep menus within the window and support keyboard navigation, Escape, and dismissal when scrolling or resizing.
+
 ### v1.7.12 (2026-11-26) — About Page Cleanup
 
 - Remove the Tech Stack card from the About page in both Chinese and English.

@@ -5,11 +5,10 @@
 .account-list-row {
   display: grid;
   min-height: 72px;
-  grid-template-columns: 16px minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: 16px minmax(0, 1fr) auto;
   grid-template-areas:
-    'select identity identity'
-    '. badges badges'
-    '. usage time'
+    'select profile profile'
+    '. metrics metrics'
     '. actions actions';
 }
 
@@ -17,41 +16,115 @@
   grid-area: select;
 }
 
+.account-list-profile {
+  grid-area: profile;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
+}
+
 .account-list-identity {
-  grid-area: identity;
+  max-width: min(280px, 100%);
+}
+
+.account-list-row:lang(en) {
+  --account-status-width: 96px;
 }
 
 .account-list-badges {
-  grid-area: badges;
+  display: grid;
+  grid-template-columns: var(--account-status-width, 72px) 84px;
+  gap: 6px;
+  width: max-content;
+  max-width: 100%;
+}
+
+.account-list-status,
+.account-list-provider {
+  width: 100%;
+  min-width: 0;
+}
+
+/* 代理、当前账号等附加徽章另起一行，不挤动状态与登录方式列。 */
+.account-list-badges > :nth-child(n + 3) {
+  grid-column: 1 / -1;
+  justify-self: start;
+  max-width: 100%;
+}
+
+.account-list-metrics {
+  grid-area: metrics;
+  display: grid;
+  grid-template-columns: minmax(0, 240px) 80px;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  max-width: 332px;
+  min-width: 0;
+  justify-self: center;
 }
 
 .account-list-usage {
-  grid-area: usage;
+  width: 100%;
+  max-width: 240px;
 }
 
+/* 时间信息整体靠右，图标与数值保持紧凑，消除列末尾的隐形留白。 */
 .account-list-time {
-  grid-area: time;
+  align-items: flex-end;
+}
+
+.account-list-time > div {
+  max-width: 100%;
+}
+
+.account-list-time > div > span {
+  min-width: 0;
+  text-align: right;
 }
 
 .account-list-actions {
   grid-area: actions;
 }
 
+.account-list-secondary-actions {
+  display: none;
+}
+
 /* 使用列表容器宽度，侧栏展开和窗口缩放都会触发重排。 */
 @container (min-width: 640px) {
+  .account-list-profile {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
   .account-list-row {
-    grid-template-columns: 16px minmax(0, 1fr) 96px minmax(0, 1fr);
     grid-template-areas:
-      'select identity badges badges'
-      '. usage time actions';
+      'select profile profile'
+      '. metrics actions';
   }
 }
 
-@container (min-width: 1000px) {
+/* 各行共用响应式列宽，中间区域平分剩余留白并保持纵向对齐。 */
+@container (min-width: 840px) {
   .account-list-row {
-    grid-template-columns:
-      16px minmax(140px, 1fr) minmax(220px, 1.3fr)
-      minmax(120px, 0.8fr) 88px 188px;
-    grid-template-areas: 'select identity badges usage time actions';
+    grid-template-columns: 16px clamp(280px, 36%, 360px) minmax(280px, 1fr) 188px;
+    grid-template-areas: 'select profile metrics actions';
+  }
+
+  /* 让首尾操作占满统一列宽，避免右对齐产生额外的左侧空位。 */
+  .account-list-actions {
+    justify-content: space-between;
+    flex-wrap: nowrap;
+  }
+
+  /* 横排时右侧已足够容纳完整操作，无需再折叠到更多菜单。 */
+  .account-list-secondary-actions {
+    display: contents;
+  }
+
+  .account-list-more-trigger {
+    display: none;
   }
 }

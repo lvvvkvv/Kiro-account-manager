@@ -22,6 +22,7 @@ import {
   Copy
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { AccountListMoreMenu, type AccountListAction } from './AccountListMoreMenu'
 import {
   toRgba,
   getStatusBadgeClass,
@@ -290,6 +291,56 @@ function AccountListRowComponent({
     [account.email, account.userId]
   )
 
+  const secondaryActions: AccountListAction[] = [
+    ...(isUnauthorized
+      ? [
+          {
+            label: isEn ? 'Reset Suspended' : '重置封禁状态',
+            icon: isClearingSuspended ? (
+              <RefreshCw className="animate-spin text-warning" />
+            ) : (
+              <RotateCcw className="text-warning" />
+            ),
+            onClick: handleClearSuspended,
+            disabled: isClearingSuspended
+          },
+          {
+            label: isEn ? 'Contact Support' : '联系支持',
+            icon: <ExternalLink className="text-primary" />,
+            href: 'https://support.aws.amazon.com/#/contacts/kiro'
+          }
+        ]
+      : []),
+    {
+      label: isEn ? 'Details' : '详情',
+      icon: <Info />,
+      onClick: (event) => {
+        event.stopPropagation()
+        onShowDetail()
+      }
+    },
+    {
+      label: isEn ? 'Edit' : '编辑',
+      icon: <Edit />,
+      onClick: (event) => {
+        event.stopPropagation()
+        onEdit()
+      }
+    },
+    {
+      label: account.isActive
+        ? isEn
+          ? 'Logout (clear SSO cache)'
+          : '退出登录（清除 SSO 缓存）'
+        : isEn
+          ? 'Delete'
+          : '删除',
+      icon: account.isActive ? <LogOut /> : <Trash2 />,
+      onClick: account.isActive ? handleLogout : handleDelete,
+      destructive: true
+    }
+  ]
+
   // ============ 渲染 ============
 
   return (
@@ -303,6 +354,7 @@ function AccountListRowComponent({
         !account.isActive && !isUnauthorized && !isSelected && 'border-border'
       )}
       data-account-id={account.id}
+      lang={isEn ? 'en' : 'zh-CN'}
       onClick={() => toggleSelection(account.id)}
     >
       {/* Checkbox */}
@@ -321,281 +373,256 @@ function AccountListRowComponent({
         {isSelected && <Check className="h-3 w-3" />}
       </div>
 
-      {/* === 邮箱列（随可用空间收缩） === */}
-      <div className="account-list-identity flex flex-col gap-1 min-w-0">
-        {/* 昵称与邮箱分行显示，避免窄列里互相挤压。 */}
-        <div className="flex flex-col items-start gap-0.5 min-w-0">
-          <h3
-            className={cn(
-              'font-medium text-strong truncate cursor-pointer transition-colors min-w-0 max-w-full',
-              emailCopied ? 'text-success' : 'text-foreground/90 hover:text-primary'
-            )}
-            title={`${displayName} (${isEn ? 'Click to copy' : '点击复制'})`}
-            onClick={handleCopyEmail}
-          >
-            {emailCopied ? (isEn ? 'Copied!' : '已复制!') : displayName}
-          </h3>
-          {account.nickname && (
-            <span
-              className="text-caption text-muted-foreground truncate min-w-0 max-w-full"
-              title={maskedEmail}
+      <div className="account-list-profile">
+        {/* === 账号与徽章使用统一列宽，窄容器下整组换行 === */}
+        <div className="account-list-identity flex flex-col gap-1 min-w-0">
+          {/* 昵称与邮箱分行显示，避免窄列里互相挤压。 */}
+          <div className="flex flex-col items-start gap-0.5 min-w-0">
+            <h3
+              className={cn(
+                'font-medium text-strong truncate cursor-pointer transition-colors min-w-0 max-w-full',
+                emailCopied ? 'text-success' : 'text-foreground/90 hover:text-primary'
+              )}
+              title={`${displayName} (${isEn ? 'Click to copy' : '点击复制'})`}
+              onClick={handleCopyEmail}
             >
-              {maskedEmail}
-            </span>
-          )}
+              {emailCopied ? (isEn ? 'Copied!' : '已复制!') : displayName}
+            </h3>
+            {account.nickname && (
+              <span
+                className="text-caption text-muted-foreground truncate min-w-0 max-w-full"
+                title={maskedEmail}
+              >
+                {maskedEmail}
+              </span>
+            )}
+          </div>
+
+          {/* 下行：分组 + 标签 + 错误 + 复制 */}
+          <div className="flex items-center gap-1.5 min-w-0 text-caption overflow-hidden">
+            {accountGroup && (
+              <span
+                className="h-5 px-[7px] text-badge rounded-full flex items-center gap-1 flex-shrink-0"
+                style={{ color: accountGroup.color, backgroundColor: accountGroup.color + '15' }}
+              >
+                <FolderOpen className="w-3 h-3" />
+                {accountGroup.name}
+              </span>
+            )}
+            {accountTags.slice(0, 4).map((tag) => {
+              const tagColor = toRgba(tag.color)
+              return (
+                <span
+                  key={tag.id}
+                  className="h-5 px-[7px] text-badge inline-flex items-center rounded-full font-medium flex-shrink-0 border"
+                  style={{
+                    backgroundColor: tagColor.replace(/[\d.]+\)$/, '0.12)'),
+                    color: tagColor,
+                    borderColor: tagColor.replace(/[\d.]+\)$/, '0.30)')
+                  }}
+                >
+                  {tag.name}
+                </span>
+              )
+            })}
+            {accountTags.length > 4 && (
+              <span className="h-5 px-[7px] text-badge inline-flex items-center text-muted-foreground bg-muted rounded-full flex-shrink-0">
+                +{accountTags.length - 4}
+              </span>
+            )}
+
+            {/* 错误信息（非封禁，因为封禁已用红色徽章显示） */}
+            {account.lastError && !isUnauthorized && (
+              <span
+                className="text-destructive truncate flex-1 min-w-0 italic"
+                title={account.lastError}
+              >
+                {account.lastError}
+              </span>
+            )}
+
+            {/* 复制邮箱小图标 */}
+            {!account.nickname && (
+              <button
+                type="button"
+                onClick={handleCopyEmail}
+                className="ml-auto text-muted-foreground/60 hover:text-primary transition-colors flex-shrink-0"
+                title={isEn ? 'Copy email' : '复制邮箱'}
+              >
+                <Copy className="h-3 w-3" />
+              </button>
+            )}
+          </div>
         </div>
 
-        {/* 下行：分组 + 标签 + 错误 + 复制 */}
-        <div className="flex items-center gap-1.5 min-w-0 text-caption overflow-hidden">
-          {accountGroup && (
-            <span
-              className="h-5 px-[7px] text-badge rounded-full flex items-center gap-1 flex-shrink-0"
-              style={{ color: accountGroup.color, backgroundColor: accountGroup.color + '15' }}
-            >
-              <FolderOpen className="w-3 h-3" />
-              {accountGroup.name}
-            </span>
-          )}
-          {accountTags.slice(0, 4).map((tag) => {
-            const tagColor = toRgba(tag.color)
-            return (
+        {/* === 状态、登录方式分别固定列宽，附加徽章另起一行 === */}
+        <div className="account-list-badges min-w-0 items-center">
+          {/* 状态徽章（min-w 保持等宽） */}
+          <div
+            className={cn(
+              'account-list-status text-badge font-medium h-5 px-[7px] rounded-full flex items-center justify-center gap-1',
+              getStatusBadgeClass(account.status, isUnauthorized)
+            )}
+          >
+            {account.status === 'refreshing' && <Loader2 className="h-3 w-3 animate-spin" />}
+            {isUnauthorized && <AlertCircle className="h-3 w-3" />}
+            {isUnauthorized ? (
               <span
-                key={tag.id}
-                className="h-5 px-[7px] text-badge inline-flex items-center rounded-full font-medium flex-shrink-0 border"
-                style={{
-                  backgroundColor: tagColor.replace(/[\d.]+\)$/, '0.12)'),
-                  color: tagColor,
-                  borderColor: tagColor.replace(/[\d.]+\)$/, '0.30)')
+                className="cursor-pointer hover:underline"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onShowDetail()
                 }}
               >
-                {tag.name}
+                {isEn ? 'Banned' : '已封禁'}
               </span>
-            )
-          })}
-          {accountTags.length > 4 && (
-            <span className="h-5 px-[7px] text-badge inline-flex items-center text-muted-foreground bg-muted rounded-full flex-shrink-0">
-              +{accountTags.length - 4}
-            </span>
-          )}
+            ) : (
+              (isEn ? StatusLabelsEn : StatusLabelsZh)[account.status] || account.status
+            )}
+          </div>
 
-          {/* 错误信息（非封禁，因为封禁已用红色徽章显示） */}
-          {account.lastError && !isUnauthorized && (
-            <span
-              className="text-destructive truncate flex-1 min-w-0 italic"
-              title={account.lastError}
-            >
-              {account.lastError}
-            </span>
-          )}
-
-          {/* 复制邮箱小图标 */}
-          {!account.nickname && (
-            <button
-              type="button"
-              onClick={handleCopyEmail}
-              className="ml-auto text-muted-foreground/60 hover:text-primary transition-colors flex-shrink-0"
-              title={isEn ? 'Copy email' : '复制邮箱'}
-            >
-              <Copy className="h-3 w-3" />
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* === 徽章列（空间不足时换行） === */}
-      <div className="account-list-badges min-w-0 flex flex-wrap items-center gap-1.5">
-        {/* 状态徽章（min-w 保持等宽） */}
-        <div
-          className={cn(
-            'text-badge font-medium h-5 px-[7px] rounded-full flex items-center justify-center gap-1 min-w-[52px]',
-            getStatusBadgeClass(account.status, isUnauthorized)
-          )}
-        >
-          {account.status === 'refreshing' && <Loader2 className="h-3 w-3 animate-spin" />}
-          {isUnauthorized && <AlertCircle className="h-3 w-3" />}
-          {isUnauthorized ? (
-            <span
-              className="cursor-pointer hover:underline"
-              onClick={(e) => {
-                e.stopPropagation()
-                onShowDetail()
-              }}
-            >
-              {isEn ? 'Banned' : '已封禁'}
-            </span>
-          ) : (
-            (isEn ? StatusLabelsEn : StatusLabelsZh)[account.status] || account.status
-          )}
-        </div>
-
-        {/* IDP（固定宽度，所有账号视觉对齐） */}
-        <Badge
-          variant="outline"
-          className="text-badge h-5 px-[7px] text-muted-foreground font-medium border-muted-foreground/30 bg-muted/30 min-w-[72px] flex items-center justify-center"
-        >
-          {account.idp}
-        </Badge>
-
-        {/* 代理绑定徽章：可点击解绑（仅有绑定时显示） */}
-        {boundProxy && (
+          {/* IDP（固定宽度，所有账号视觉对齐） */}
           <Badge
             variant="outline"
-            className={cn(
-              'text-badge h-5 px-[7px] font-medium cursor-pointer group transition-colors',
-              boundProxy.enabled && boundProxy.status !== 'dead'
-                ? 'border-cyan-500/40 text-cyan-700 dark:text-cyan-300 bg-cyan-500/10 hover:bg-cyan-500/20'
-                : 'border-amber-500/40 text-amber-700 dark:text-amber-300 bg-amber-500/10'
-            )}
-            title={`${isEn ? 'Bound proxy:' : '绑定代理：'} ${boundProxy.host}:${boundProxy.port}${boundProxy.label ? ` (${boundProxy.label})` : ''}\n${isEn ? 'Click to unbind' : '点击解绑'}`}
-            onClick={(e) => {
-              e.stopPropagation()
-              if (
-                confirm(
-                  isEn
-                    ? `Unbind ${account.email} from ${boundProxy.host}:${boundProxy.port}?`
-                    : `解绑 ${account.email} 与 ${boundProxy.host}:${boundProxy.port}？`
-                )
-              ) {
-                unbindAccountFromProxy(account.id)
-              }
-            }}
+            className="account-list-provider text-badge h-5 px-[7px] text-muted-foreground font-medium border-muted-foreground/30 bg-muted/30 flex items-center justify-center"
           >
-            <span className="opacity-70 group-hover:hidden">⇄</span>
-            <span className="hidden group-hover:inline">✕</span>
-            <span className="ml-0.5 max-w-[80px] truncate inline-block align-middle">
-              {boundProxy.host}
-            </span>
+            {account.idp}
           </Badge>
-        )}
 
-        {account.isActive && (
-          <Badge className="h-5 px-[7px] bg-success text-white border-0 hover:bg-success/90 text-badge flex items-center justify-center shrink-0">
-            <Power className="h-2.5 w-2.5 mr-0.5" />
-            {isEn ? 'Active' : '当前'}
-          </Badge>
-        )}
+          {/* 代理绑定徽章：可点击解绑（仅有绑定时显示） */}
+          {boundProxy && (
+            <Badge
+              variant="outline"
+              className={cn(
+                'text-badge h-5 px-[7px] font-medium cursor-pointer group transition-colors',
+                boundProxy.enabled && boundProxy.status !== 'dead'
+                  ? 'border-cyan-500/40 text-cyan-700 dark:text-cyan-300 bg-cyan-500/10 hover:bg-cyan-500/20'
+                  : 'border-amber-500/40 text-amber-700 dark:text-amber-300 bg-amber-500/10'
+              )}
+              title={`${isEn ? 'Bound proxy:' : '绑定代理：'} ${boundProxy.host}:${boundProxy.port}${boundProxy.label ? ` (${boundProxy.label})` : ''}\n${isEn ? 'Click to unbind' : '点击解绑'}`}
+              onClick={(e) => {
+                e.stopPropagation()
+                if (
+                  confirm(
+                    isEn
+                      ? `Unbind ${account.email} from ${boundProxy.host}:${boundProxy.port}?`
+                      : `解绑 ${account.email} 与 ${boundProxy.host}:${boundProxy.port}？`
+                  )
+                ) {
+                  unbindAccountFromProxy(account.id)
+                }
+              }}
+            >
+              <span className="opacity-70 group-hover:hidden">⇄</span>
+              <span className="hidden group-hover:inline">✕</span>
+              <span className="ml-0.5 max-w-[80px] truncate inline-block align-middle">
+                {boundProxy.host}
+              </span>
+            </Badge>
+          )}
+
+          {account.isActive && (
+            <Badge className="h-5 px-[7px] bg-success text-white border-0 hover:bg-success/90 text-badge flex items-center justify-center shrink-0">
+              <Power className="h-2.5 w-2.5 mr-0.5" />
+              {isEn ? 'Active' : '当前'}
+            </Badge>
+          )}
+        </div>
       </div>
 
-      {/* === Credits 区（中右） === */}
-      <div className="account-list-usage min-w-0 flex flex-col gap-0.5">
-        <div className="flex flex-wrap items-center justify-between gap-x-1 text-caption">
-          <span className="text-muted-foreground">{isEn ? 'Usage' : '使用量'}</span>
-          <span
-            className={cn(
-              'font-mono font-medium tabular-nums',
-              isCritical ? 'text-destructive' : isHighUsage ? 'text-warning' : 'text-foreground'
-            )}
-          >
-            {percentUsed.toFixed(usagePrecision ? 2 : 0)}%
-            {isCritical && (
-              <span className="ml-1 text-caption text-destructive font-semibold">
-                +{(percentUsed - 100).toFixed(usagePrecision ? 2 : 0)}%
-              </span>
-            )}
-          </span>
-        </div>
-        {(() => {
-          if (isCritical) {
-            const planRatioPct = (100 / percentUsed) * 100
+      <div className="account-list-metrics">
+        {/* === 用量与时间作为整体居中 === */}
+        <div className="account-list-usage min-w-0 flex flex-col gap-0.5">
+          <div className="flex flex-wrap items-center justify-between gap-x-1 text-caption">
+            <span className="text-muted-foreground">{isEn ? 'Usage' : '使用量'}</span>
+            <span
+              className={cn(
+                'font-mono font-medium tabular-nums',
+                isCritical ? 'text-destructive' : isHighUsage ? 'text-warning' : 'text-foreground'
+              )}
+            >
+              {percentUsed.toFixed(usagePrecision ? 2 : 0)}%
+              {isCritical && (
+                <span className="ml-1 text-caption text-destructive font-semibold">
+                  +{(percentUsed - 100).toFixed(usagePrecision ? 2 : 0)}%
+                </span>
+              )}
+            </span>
+          </div>
+          {(() => {
+            if (isCritical) {
+              const planRatioPct = (100 / percentUsed) * 100
+              return (
+                <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-foreground/10">
+                  <div
+                    className="absolute inset-y-0 left-0 bg-warning transition-all duration-300"
+                    style={{ width: `${planRatioPct}%` }}
+                  />
+                  <div
+                    className="absolute inset-y-0 right-0 bg-destructive transition-all duration-300"
+                    style={{ left: `${planRatioPct}%` }}
+                  />
+                </div>
+              )
+            }
             return (
               <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-foreground/10">
                 <div
-                  className="absolute inset-y-0 left-0 bg-warning transition-all duration-300"
-                  style={{ width: `${planRatioPct}%` }}
-                />
-                <div
-                  className="absolute inset-y-0 right-0 bg-destructive transition-all duration-300"
-                  style={{ left: `${planRatioPct}%` }}
+                  className={cn(
+                    'absolute inset-y-0 left-0 transition-all duration-300',
+                    isHighUsage ? 'bg-warning' : 'bg-primary'
+                  )}
+                  style={{ width: `${Math.min(percentUsed, 100)}%` }}
                 />
               </div>
             )
-          }
-          return (
-            <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-foreground/10">
-              <div
-                className={cn(
-                  'absolute inset-y-0 left-0 transition-all duration-300',
-                  isHighUsage ? 'bg-warning' : 'bg-primary'
-                )}
-                style={{ width: `${Math.min(percentUsed, 100)}%` }}
-              />
-            </div>
-          )
-        })()}
-        <div className="flex flex-wrap justify-between gap-x-1 break-all text-caption text-muted-foreground pt-0.5">
-          <span className={cn(isCritical && 'text-destructive font-semibold')}>
-            {formatUsage(account.usage.current)}
-            {isCritical && ` (+${formatUsage(account.usage.current - account.usage.limit)})`}
-          </span>
-          <span>/ {formatUsage(account.usage.limit)}</span>
+          })()}
+          <div className="flex flex-wrap justify-between gap-x-1 break-all text-caption text-muted-foreground pt-0.5">
+            <span className={cn(isCritical && 'text-destructive font-semibold')}>
+              {formatUsage(account.usage.current)}
+              {isCritical && ` (+${formatUsage(account.usage.current - account.usage.limit)})`}
+            </span>
+            <span>/ {formatUsage(account.usage.limit)}</span>
+          </div>
+        </div>
+
+        {/* === 时间信息区 === */}
+        <div className="account-list-time min-w-0 flex flex-col leading-tight gap-0.5 text-caption text-muted-foreground break-words [&_svg]:shrink-0">
+          <div
+            className="flex items-center gap-1"
+            title={isEn ? 'Subscription days left' : '订阅剩余天数'}
+          >
+            <Clock className="h-3 w-3" />
+            <span className={isExpiringSoon ? 'text-warning font-medium' : ''}>
+              {daysRemaining !== undefined
+                ? isEn
+                  ? `${daysRemaining}d`
+                  : `${daysRemaining}天`
+                : '-'}
+            </span>
+          </div>
+          <div
+            className="flex items-center gap-1"
+            title={
+              account.credentials.expiresAt
+                ? new Date(account.credentials.expiresAt).toLocaleString(isEn ? 'en-US' : 'zh-CN')
+                : isEn
+                  ? 'Unknown'
+                  : '未知'
+            }
+          >
+            <KeyRound className="h-3 w-3" />
+            <span className={isTokenExpiringSoon ? 'text-destructive font-medium' : ''}>
+              {account.credentials.expiresAt
+                ? formatTokenExpiry(account.credentials.expiresAt, isEn)
+                : '-'}
+            </span>
+          </div>
         </div>
       </div>
 
-      {/* === 时间信息区 === */}
-      <div className="account-list-time min-w-0 flex flex-col leading-tight gap-0.5 text-caption text-muted-foreground break-words [&_svg]:shrink-0">
-        <div
-          className="flex items-center gap-1"
-          title={isEn ? 'Subscription days left' : '订阅剩余天数'}
-        >
-          <Clock className="h-3 w-3" />
-          <span className={isExpiringSoon ? 'text-warning font-medium' : ''}>
-            {daysRemaining !== undefined
-              ? isEn
-                ? `${daysRemaining}d`
-                : `${daysRemaining}天`
-              : '-'}
-          </span>
-        </div>
-        <div
-          className="flex items-center gap-1"
-          title={
-            account.credentials.expiresAt
-              ? new Date(account.credentials.expiresAt).toLocaleString(isEn ? 'en-US' : 'zh-CN')
-              : isEn
-                ? 'Unknown'
-                : '未知'
-          }
-        >
-          <KeyRound className="h-3 w-3" />
-          <span className={isTokenExpiringSoon ? 'text-destructive font-medium' : ''}>
-            {account.credentials.expiresAt
-              ? formatTokenExpiry(account.credentials.expiresAt, isEn)
-              : '-'}
-          </span>
-        </div>
-      </div>
-
-      {/* === 操作区（始终可见，窄窗口下换行） === */}
+      {/* === 窄窗口保留常用操作，次要操作收进更多菜单 === */}
       <div className="account-list-actions min-w-0 flex flex-wrap items-center justify-end gap-1 [&>button]:shrink-0 [&>a]:shrink-0 [&_svg]:size-4 [&_svg]:stroke-[1.5]">
-        {isUnauthorized && (
-          <>
-            <Button
-              size="icon"
-              variant="ghost"
-              className="h-7 w-7 text-warning hover:bg-warning/10"
-              onClick={handleClearSuspended}
-              disabled={isClearingSuspended}
-              title={isEn ? 'Reset Suspended' : '重置封禁状态'}
-            >
-              {isClearingSuspended ? (
-                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <RotateCcw className="h-3.5 w-3.5" />
-              )}
-            </Button>
-            <a
-              href="https://support.aws.amazon.com/#/contacts/kiro"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center justify-center h-7 w-7 rounded-control text-primary hover:bg-primary/10"
-              onClick={(e) => e.stopPropagation()}
-              title={isEn ? 'Contact Support' : '联系支持'}
-            >
-              <ExternalLink className="h-3.5 w-3.5" />
-            </a>
-          </>
-        )}
-
         {!account.isActive && !isUnauthorized && (
           <Button
             size="icon"
@@ -619,53 +646,45 @@ function AccountListRowComponent({
           <RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />
         </Button>
 
-        <Button
-          size="icon"
-          variant="ghost"
-          className="h-7 w-7 text-muted-foreground hover:text-foreground"
-          onClick={(e) => {
-            e.stopPropagation()
-            onShowDetail()
-          }}
-          title={isEn ? 'Details' : '详情'}
-        >
-          <Info className="h-3.5 w-3.5" />
-        </Button>
-
-        <Button
-          size="icon"
-          variant="ghost"
-          className="h-7 w-7 text-muted-foreground hover:text-foreground"
-          onClick={(e) => {
-            e.stopPropagation()
-            onEdit()
-          }}
-          title={isEn ? 'Edit' : '编辑'}
-        >
-          <Edit className="h-3.5 w-3.5" />
-        </Button>
-
-        {account.isActive ? (
-          <Button
-            size="icon"
-            variant="ghost"
-            className="h-7 w-7 hover:bg-destructive/10 hover:text-destructive"
-            onClick={handleLogout}
-            title={isEn ? 'Logout (clear SSO cache)' : '退出登录（清除 SSO 缓存）'}
-          >
-            <LogOut className="h-3.5 w-3.5" />
-          </Button>
-        ) : (
-          <Button
-            size="icon"
-            variant="ghost"
-            className="h-7 w-7 hover:bg-destructive/10 hover:text-destructive"
-            onClick={handleDelete}
-            title={isEn ? 'Delete' : '删除'}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </Button>
-        )}
+        <div className="account-list-secondary-actions">
+          {secondaryActions.map((action) =>
+            action.href ? (
+              <a
+                key={action.label}
+                href={action.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center justify-center h-7 w-7 shrink-0 rounded-control text-primary hover:bg-primary/10"
+                onClick={(event) => event.stopPropagation()}
+                title={action.label}
+                aria-label={action.label}
+              >
+                {action.icon}
+              </a>
+            ) : (
+              <Button
+                key={action.label}
+                type="button"
+                size="icon"
+                variant="ghost"
+                className={cn(
+                  'h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground',
+                  action.destructive && 'hover:bg-destructive/10 hover:text-destructive'
+                )}
+                onClick={action.onClick}
+                disabled={action.disabled}
+                title={action.label}
+                aria-label={action.label}
+              >
+                {action.icon}
+              </Button>
+            )
+          )}
+        </div>
+        <AccountListMoreMenu
+          label={isEn ? 'More actions' : '更多操作'}
+          actions={secondaryActions}
+        />
       </div>
     </div>
   )
