@@ -48,21 +48,28 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
     try {
       const serverConfig: McpServer = {
         command: command.trim(),
-        args: args.filter(a => a.trim()),
-        env: envVars.reduce((acc, { key, value }) => {
-          if (key.trim()) {
-            acc[key.trim()] = value
-          }
-          return acc
-        }, {} as Record<string, string>)
+        args: args.filter((a) => a.trim()),
+        env: envVars.reduce(
+          (acc, { key, value }) => {
+            if (key.trim()) {
+              acc[key.trim()] = value
+            }
+            return acc
+          },
+          {} as Record<string, string>
+        )
       }
 
       // 如果没有 args 或 env，不包含这些字段
       if (serverConfig.args?.length === 0) delete serverConfig.args
       if (Object.keys(serverConfig.env || {}).length === 0) delete serverConfig.env
 
-      const result = await window.api.saveMcpServer(name.trim(), serverConfig, isEdit ? serverName : undefined)
-      
+      const result = await window.api.saveMcpServer(
+        name.trim(),
+        serverConfig,
+        isEdit ? serverName : undefined
+      )
+
       if (result.success) {
         onSaved()
         onClose()
@@ -103,60 +110,76 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
   }
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div 
-        className="absolute inset-0 bg-black/50"
-        onClick={onClose}
-      />
-      
-      <div className="relative bg-background rounded-lg shadow-xl w-[90vw] max-w-lg max-h-[80vh] flex flex-col">
-        <div className="flex items-center justify-between px-4 py-3 border-b">
-          <h2 className="font-semibold">{isEdit ? (isEn ? 'Edit MCP Server' : '编辑 MCP 服务器') : (isEn ? 'Add MCP Server' : '添加 MCP 服务器')}</h2>
-          <Button variant="ghost" size="sm" onClick={onClose}>
+    <div className="ui-dialog-overlay">
+      <div className="absolute inset-0 bg-transparent" onClick={onClose} />
+
+      <div
+        className="ui-dialog-panel w-[512px] max-w-[min(512px,calc(100vw-32px))]"
+        role="dialog"
+        aria-modal="true"
+      >
+        <div className="ui-dialog-header flex-row items-center justify-between gap-2 border-b flex-wrap">
+          <h2 className="text-title font-semibold min-w-0 break-words">
+            {isEdit
+              ? isEn
+                ? 'Edit MCP Server'
+                : '编辑 MCP 服务器'
+              : isEn
+                ? 'Add MCP Server'
+                : '添加 MCP 服务器'}
+          </h2>
+          <Button variant="ghost" size="icon" title={isEn ? 'Close' : '关闭'} onClick={onClose}>
             <X className="h-4 w-4" />
           </Button>
         </div>
 
         {error && (
-          <div className="px-4 py-2 bg-destructive/10 text-destructive text-sm">
-            {error}
-          </div>
+          <div className="px-4 py-2 bg-destructive/10 text-destructive text-body">{error}</div>
         )}
 
-        <div className="flex-1 p-4 space-y-4 overflow-auto">
+        <div className="ui-dialog-body flex-auto min-h-0 py-3 space-y-4">
           {/* 服务器名称 */}
           <div>
-            <label className="block text-sm font-medium mb-1">{isEn ? 'Server Name' : '服务器名称'}</label>
+            <label className="block text-body font-medium mb-1">
+              {isEn ? 'Server Name' : '服务器名称'}
+            </label>
             <input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder={isEn ? 'e.g.: fetch, exa, context7' : '例如: fetch, exa, context7'}
-              className="w-full px-3 py-2 rounded-md border bg-background text-sm"
+              className="w-full border bg-background text-body min-w-0 rounded-control border-input bg-card px-2.5 focus:outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/20 h-control py-1"
               disabled={isEdit}
             />
           </div>
 
           {/* 命令 */}
           <div>
-            <label className="block text-sm font-medium mb-1">{isEn ? 'Command' : '命令'}</label>
+            <label className="block text-body font-medium mb-1">{isEn ? 'Command' : '命令'}</label>
             <input
               type="text"
               value={command}
               onChange={(e) => setCommand(e.target.value)}
               placeholder={isEn ? 'e.g.: uvx, npx, node' : '例如: uvx, npx, node'}
-              className="w-full px-3 py-2 rounded-md border bg-background text-sm"
+              className="w-full border bg-background text-body min-w-0 rounded-control border-input bg-card px-2.5 focus:outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/20 h-control py-1"
             />
           </div>
 
           {/* 参数 */}
           <div>
-            <label className="block text-sm font-medium mb-1">{isEn ? 'Arguments' : '参数'}</label>
+            <label className="block text-body font-medium mb-1">
+              {isEn ? 'Arguments' : '参数'}
+            </label>
             <div className="space-y-2">
               {args.map((arg, index) => (
                 <div key={index} className="flex gap-2">
-                  <code className="flex-1 px-2 py-1 bg-muted rounded text-sm">{arg}</code>
-                  <Button variant="ghost" size="sm" onClick={() => removeArg(index)}>
+                  <code className="flex-1 px-2 py-1 bg-muted rounded-control text-body">{arg}</code>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => removeArg(index)}
+                    title={isEn ? 'Delete' : '删除'}
+                  >
                     <Trash2 className="h-4 w-4 text-destructive" />
                   </Button>
                 </div>
@@ -167,10 +190,15 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
                   value={newArg}
                   onChange={(e) => setNewArg(e.target.value)}
                   placeholder={isEn ? 'Add argument' : '添加参数'}
-                  className="flex-1 px-3 py-1.5 rounded-md border bg-background text-sm"
+                  className="flex-1 border bg-background text-body min-w-0 rounded-control border-input bg-card px-2.5 focus:outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/20 h-control py-1"
                   onKeyDown={(e) => e.key === 'Enter' && addArg()}
                 />
-                <Button variant="outline" size="sm" onClick={addArg}>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={addArg}
+                  title={isEn ? 'Add' : '添加'}
+                >
                   <Plus className="h-4 w-4" />
                 </Button>
               </div>
@@ -179,7 +207,9 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
 
           {/* 环境变量 */}
           <div>
-            <label className="block text-sm font-medium mb-1">{isEn ? 'Environment Variables' : '环境变量'}</label>
+            <label className="block text-body font-medium mb-1">
+              {isEn ? 'Environment Variables' : '环境变量'}
+            </label>
             <div className="space-y-2">
               {envVars.map((env, index) => (
                 <div key={index} className="flex gap-2">
@@ -188,33 +218,40 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
                     value={env.key}
                     onChange={(e) => updateEnvVar(index, 'key', e.target.value)}
                     placeholder={isEn ? 'Key' : '变量名'}
-                    className="w-1/3 px-2 py-1.5 rounded-md border bg-background text-sm"
+                    className="w-1/3 border bg-background text-body min-w-0 rounded-control border-input bg-card px-2.5 focus:outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/20 h-control py-1"
                   />
                   <input
                     type="text"
                     value={env.value}
                     onChange={(e) => updateEnvVar(index, 'value', e.target.value)}
                     placeholder={isEn ? 'Value' : '值'}
-                    className="flex-1 px-2 py-1.5 rounded-md border bg-background text-sm"
+                    className="flex-1 border bg-background text-body min-w-0 rounded-control border-input bg-card px-2.5 focus:outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/20 h-control py-1"
                   />
-                  <Button variant="ghost" size="sm" onClick={() => removeEnvVar(index)}>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => removeEnvVar(index)}
+                    title={isEn ? 'Delete' : '删除'}
+                  >
                     <Trash2 className="h-4 w-4 text-destructive" />
                   </Button>
                 </div>
               ))}
               <Button variant="outline" size="sm" onClick={addEnvVar}>
-                <Plus className="h-4 w-4 mr-1" />
+                <Plus className="h-4 w-4 mr-0" />
                 {isEn ? 'Add Env Var' : '添加环境变量'}
               </Button>
             </div>
           </div>
         </div>
 
-        <div className="flex justify-end gap-2 px-4 py-3 border-t">
-          <Button variant="outline" onClick={onClose}>{isEn ? 'Cancel' : '取消'}</Button>
+        <div className="ui-dialog-footer border-t">
+          <Button variant="outline" onClick={onClose}>
+            {isEn ? 'Cancel' : '取消'}
+          </Button>
           <Button onClick={handleSave} disabled={saving}>
-            <Save className="h-4 w-4 mr-1" />
-            {saving ? (isEn ? 'Saving...' : '保存中...') : (isEn ? 'Save' : '保存')}
+            <Save className="h-4 w-4 mr-0" />
+            {saving ? (isEn ? 'Saving...' : '保存中...') : isEn ? 'Save' : '保存'}
           </Button>
         </div>
       </div>
@@ -222,5 +259,3 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
     document.body
   )
 }
-
-

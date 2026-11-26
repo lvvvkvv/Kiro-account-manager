@@ -30,4 +30,4 @@
 
 ## Impact
 
-未来涉及 renderer 的八个对应 `pages/*Page.tsx` 与 `components/kiro/`。领域弹窗只调整呈现；不改系统机器码、文件写入、存储格式、Webhook 发送机制、诊断逻辑或更新服务。保留清单 U01～U10；本轮仅规划。
+实施涉及 renderer 的八个对应 `pages/*Page.tsx` 与 `components/kiro/`。领域弹窗只调整呈现；不改系统机器码、文件写入、存储格式、Webhook 发送机制、诊断逻辑或更新服务。保留清单 U01～U10；实施与验证结果见 implementation.md。
