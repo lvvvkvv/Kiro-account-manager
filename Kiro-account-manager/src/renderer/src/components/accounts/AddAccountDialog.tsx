@@ -32,7 +32,7 @@ interface VerifiedData {
     upgradeCapability?: string
     overageCapability?: string
   }
-  usage: { 
+  usage: {
     current: number
     limit: number
     baseLimit?: number
@@ -61,11 +61,12 @@ type ImportMode = 'oidc' | 'sso' | 'login'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
-  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
+  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } =
+    useAccountsStore()
 
   // 检查账户是否已存在（同userId 或 同邮箱+同provider 才算重复）
   const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
-    return Array.from(accounts.values()).some(acc => {
+    return Array.from(accounts.values()).some((acc) => {
       // userId 相同则重复（主要判断依据）
       if (userId && acc.userId === userId) return true
       // email 非空且相同，且 provider 相同则重复（允许同邮箱不同登录方式）
@@ -87,16 +88,26 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [clientSecret, setClientSecret] = useState('')
   const [region, setRegion] = useState('us-east-1')
   const [authMethod, setAuthMethod] = useState<'IdC' | 'social'>('IdC')
-  const [provider, setProvider] = useState('BuilderId')  // 'BuilderId', 'Enterprise', 'Github', 'Google'
+  const [provider, setProvider] = useState('BuilderId') // 'BuilderId', 'Enterprise', 'Github', 'Google'
 
   // SSO Token 导入
   const [ssoToken, setSsoToken] = useState('')
-  const [batchImportResult, setBatchImportResult] = useState<{ total: number; success: number; failed: number; errors: string[] } | null>(null)
+  const [batchImportResult, setBatchImportResult] = useState<{
+    total: number
+    success: number
+    failed: number
+    errors: string[]
+  } | null>(null)
 
   // OIDC 批量导入
   const [oidcImportMode, setOidcImportMode] = useState<'single' | 'batch'>('single')
   const [oidcBatchData, setOidcBatchData] = useState('')
-  const [oidcBatchImportResult, setOidcBatchImportResult] = useState<{ total: number; success: number; failed: number; errors: string[] } | null>(null)
+  const [oidcBatchImportResult, setOidcBatchImportResult] = useState<{
+    total: number
+    success: number
+    failed: number
+    errors: string[]
+  } | null>(null)
 
   // 验证后的数据（保留用于条件渲染）
   const [verifiedData, setVerifiedData] = useState<VerifiedData | null>(null)
@@ -120,7 +131,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   } | null>(null)
   const [copied, setCopied] = useState(false)
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  
+
   // IAM SSO 登录相关状态
   const [ssoStartUrl, setSsoStartUrl] = useState('')
   const [iamSsoLoginData, setIamSsoLoginData] = useState<{
@@ -142,7 +153,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   // 打开弹窗时默认选中"当前打开的分组"（activeGroupTab 为真实分组时），否则未分组
   useEffect(() => {
     if (!isOpen) return
-    const isRealGroup = activeGroupTab !== 'all' && activeGroupTab !== 'ungrouped' && groups.has(activeGroupTab)
+    const isRealGroup =
+      activeGroupTab !== 'all' && activeGroupTab !== 'ungrouped' && groups.has(activeGroupTab)
     setSelectedGroupId(isRealGroup ? activeGroupTab : undefined)
   }, [isOpen, activeGroupTab, groups])
 
@@ -152,7 +164,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
     const unsubscribe = window.api.onSocialAuthCallback(async (data) => {
       console.log('[AddAccountDialog] Social auth callback:', data)
-      
+
       if (data.error) {
         setError(`登录失败: ${data.error}`)
         setIsLoggingIn(false)
@@ -195,7 +207,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     provider?: string
   }) => {
     console.log('[AddAccountDialog] Login successful, verifying credentials...')
-    
+
     try {
       // 验证凭证并获取账号信息
       const result = await window.api.verifyAccountCredentials({
@@ -210,13 +222,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       if (result.success && result.data) {
         const { email, userId } = result.data
         const providerName = tokenData.provider || 'BuilderId'
-        
+
         // 检查账户是否已存在
         if (isAccountExists(email, userId, providerName)) {
           setError(isEn ? 'This account already exists' : '该账号已存在，无需重复添加')
           return
         }
-        
+
         // 添加账号
         const now = Date.now()
         addAccount({
@@ -233,7 +245,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             clientSecret: tokenData.clientSecret || '',
             region: tokenData.region || 'us-east-1',
             startUrl: tokenData.startUrl,
-            expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
+            expiresAt: result.data.expiresIn
+              ? now + result.data.expiresIn * 1000
+              : now + 3600 * 1000,
             authMethod: tokenData.authMethod as 'IdC' | 'social',
             provider: (tokenData.provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google',
             profileArn: result.data.profileArn
@@ -251,9 +265,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           usage: {
             current: result.data.usage.current,
             limit: result.data.usage.limit,
-            percentUsed: result.data.usage.limit > 0 
-              ? result.data.usage.current / result.data.usage.limit 
-              : 0,
+            percentUsed:
+              result.data.usage.limit > 0 ? result.data.usage.current / result.data.usage.limit : 0,
             lastUpdated: now,
             baseLimit: result.data.usage.baseLimit,
             baseCurrent: result.data.usage.baseCurrent,
@@ -287,7 +300,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
     try {
       const result = await window.api.startBuilderIdLogin(region)
-      
+
       if (result.success && result.userCode && result.verificationUri) {
         setBuilderIdLoginData({
           userCode: result.userCode,
@@ -317,14 +330,14 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       setError(isEn ? 'Please enter SSO Start URL' : '请输入 SSO Start URL')
       return
     }
-    
+
     setIsLoggingIn(true)
     setError(null)
     setIamSsoLoginData(null)
 
     try {
       const result = await window.api.startIamSsoLogin(ssoStartUrl.trim(), region)
-      
+
       if (result.success && result.authorizeUrl) {
         // 设置登录数据（用于显示等待状态）
         setIamSsoLoginData({
@@ -344,7 +357,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         setIsLoggingIn(false)
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : (isEn ? 'Failed to start login' : '启动登录失败'))
+      setError(e instanceof Error ? e.message : isEn ? 'Failed to start login' : '启动登录失败')
       setIsLoggingIn(false)
     }
   }
@@ -358,7 +371,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     pollIntervalRef.current = setInterval(async () => {
       try {
         const result = await window.api.pollIamSsoAuth(region)
-        
+
         if (!result.success) {
           setError(result.error || (isEn ? 'Authorization failed' : '授权失败'))
           setIsLoggingIn(false)
@@ -375,7 +388,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             clearInterval(pollIntervalRef.current)
             pollIntervalRef.current = null
           }
-          
+
           await handleLoginSuccess({
             accessToken: result.accessToken!,
             refreshToken: result.refreshToken!,
@@ -386,7 +399,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             authMethod: 'IdC',
             provider: 'Enterprise'
           })
-          
+
           setIsLoggingIn(false)
           setIamSsoLoginData(null)
         }
@@ -406,7 +419,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     pollIntervalRef.current = setInterval(async () => {
       try {
         const result = await window.api.pollBuilderIdAuth(region)
-        
+
         if (!result.success) {
           setError(result.error || '授权失败')
           setIsLoggingIn(false)
@@ -423,7 +436,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             clearInterval(pollIntervalRef.current)
             pollIntervalRef.current = null
           }
-          
+
           await handleLoginSuccess({
             accessToken: result.accessToken!,
             refreshToken: result.refreshToken!,
@@ -433,7 +446,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             authMethod: 'IdC',
             provider: 'BuilderId'
           })
-          
+
           setIsLoggingIn(false)
           setBuilderIdLoginData(null)
         }
@@ -472,7 +485,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
     try {
       const result = await window.api.startSocialLogin(socialProvider, usePrivateMode)
-      
+
       if (!result.success) {
         setError(result.error || '启动登录失败')
         setIsLoggingIn(false)
@@ -502,7 +515,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         setClientId(result.data.clientId)
         setClientSecret(result.data.clientSecret)
         setRegion(result.data.region)
-        setAuthMethod(result.data.authMethod as 'IdC' | 'social' || 'IdC')
+        setAuthMethod((result.data.authMethod as 'IdC' | 'social') || 'IdC')
         setProvider(result.data.provider || 'BuilderId')
         setError(null)
       } else {
@@ -523,8 +536,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     // 解析多个 Token（每行一个）
     const tokens = ssoToken
       .split('\n')
-      .map(t => t.trim())
-      .filter(t => t.length > 0)
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0)
 
     if (tokens.length === 0) {
       setError('请输入至少一个 Token')
@@ -535,22 +548,30 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setError(null)
     setBatchImportResult(null)
 
-    const importResult = { total: tokens.length, success: 0, failed: 0, errors: [] as string[], failedIndices: [] as number[] }
+    const importResult = {
+      total: tokens.length,
+      success: 0,
+      failed: 0,
+      errors: [] as string[],
+      failedIndices: [] as number[]
+    }
 
     // 单个 Token 导入函数
     const importSingleToken = async (token: string, index: number): Promise<void> => {
       try {
         const result = await window.api.importFromSsoToken(token, region)
-        
+
         if (result.success && result.data) {
           const { email, userId } = result.data
-          
+
           // 检查账户是否已存在（已存在的也从输入框中移除）
           if (email && userId && isAccountExists(email, userId, 'BuilderId')) {
-            importResult.errors.push(`#${index + 1}: ${email} ${isEn ? 'already exists' : '已存在'}`)
+            importResult.errors.push(
+              `#${index + 1}: ${email} ${isEn ? 'already exists' : '已存在'}`
+            )
             return
           }
-          
+
           // 添加账号
           const now = Date.now()
           addAccount({
@@ -566,7 +587,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               clientId: result.data.clientId,
               clientSecret: result.data.clientSecret,
               region: result.data.region,
-              expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000
+              expiresAt: result.data.expiresIn
+                ? now + result.data.expiresIn * 1000
+                : now + 3600 * 1000
             },
             subscription: {
               type: (result.data.subscriptionType || 'Free') as SubscriptionType,
@@ -579,9 +602,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             usage: {
               current: result.data.usage?.current || 0,
               limit: result.data.usage?.limit || 0,
-              percentUsed: (result.data.usage?.limit || 0) > 0 
-                ? (result.data.usage?.current || 0) / (result.data.usage?.limit || 1) 
-                : 0,
+              percentUsed:
+                (result.data.usage?.limit || 0) > 0
+                  ? (result.data.usage?.current || 0) / (result.data.usage?.limit || 1)
+                  : 0,
               lastUpdated: now,
               baseLimit: result.data.usage?.baseLimit,
               baseCurrent: result.data.usage?.baseCurrent,
@@ -596,7 +620,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             status: 'active',
             lastUsedAt: now
           })
-          
+
           importResult.success++
         } else {
           importResult.failed++
@@ -620,19 +644,19 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         )
         // 批次间添加短暂延迟
         if (i + BATCH_SIZE < tokens.length) {
-          await new Promise(resolve => setTimeout(resolve, 100))
+          await new Promise((resolve) => setTimeout(resolve, 100))
         }
       }
-      
+
       setBatchImportResult(importResult)
-      
+
       // 如果全部成功，关闭弹窗
       if (importResult.failed === 0) {
         resetForm()
         onClose()
       } else {
         // 保留失败的 Token 在输入框中
-        const failedTokens = importResult.failedIndices.map(i => tokens[i])
+        const failedTokens = importResult.failedIndices.map((i) => tokens[i])
         if (failedTokens.length > 0) {
           setSsoToken(failedTokens.join('\n'))
         }
@@ -676,34 +700,44 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     } catch {
       // JSON 解析失败，尝试卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
       // 支持分隔符：----、Tab、连续空格
-      const lines = trimmed.split('\n').filter(line => line.trim() && !line.startsWith('#'))
+      const lines = trimmed.split('\n').filter((line) => line.trim() && !line.startsWith('#'))
       if (lines.length === 0) {
-        setError(isEn ? 'Invalid format' : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）')
+        setError(
+          isEn
+            ? 'Invalid format'
+            : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）'
+        )
         return
       }
 
-      credentials = lines.map(line => {
-        const parts = splitCredentialLine(line)
-        const rawPwd = parts[1]?.trim()
-        const clientId = parts[3]?.trim() || undefined
-        const clientSecret = parts[4]?.trim() || undefined
-        // 第6字段为登录方式(idp)：新卡密直接带；旧卡密无此字段时按 ClientId/Secret 推断——
-        // social(Github/Google) 只有 refreshToken，IdC(BuilderId/Enterprise) 才有 ClientId/Secret。
-        // provider 决定下方 verify 的 authMethod(social→只需 refreshToken / IdC→需 ClientId+Secret)
-        const rawIdp = parts[5]?.trim()
-        const provider = rawIdp || ((!clientId && !clientSecret) ? 'Google' : 'BuilderId')
-        return {
-          _email: parts[0]?.trim() || '',
-          password: (rawPwd && rawPwd !== 'no_password') ? rawPwd : undefined,
-          refreshToken: parts[2]?.trim() || '',
-          clientId,
-          clientSecret,
-          provider
-        }
-      }).filter(item => item.refreshToken) as typeof credentials
+      credentials = lines
+        .map((line) => {
+          const parts = splitCredentialLine(line)
+          const rawPwd = parts[1]?.trim()
+          const clientId = parts[3]?.trim() || undefined
+          const clientSecret = parts[4]?.trim() || undefined
+          // 第6字段为登录方式(idp)：新卡密直接带；旧卡密无此字段时按 ClientId/Secret 推断——
+          // social(Github/Google) 只有 refreshToken，IdC(BuilderId/Enterprise) 才有 ClientId/Secret。
+          // provider 决定下方 verify 的 authMethod(social→只需 refreshToken / IdC→需 ClientId+Secret)
+          const rawIdp = parts[5]?.trim()
+          const provider = rawIdp || (!clientId && !clientSecret ? 'Google' : 'BuilderId')
+          return {
+            _email: parts[0]?.trim() || '',
+            password: rawPwd && rawPwd !== 'no_password' ? rawPwd : undefined,
+            refreshToken: parts[2]?.trim() || '',
+            clientId,
+            clientSecret,
+            provider
+          }
+        })
+        .filter((item) => item.refreshToken) as typeof credentials
 
       if (credentials.length === 0) {
-        setError(isEn ? 'Invalid format' : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）')
+        setError(
+          isEn
+            ? 'Invalid format'
+            : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）'
+        )
         return
       }
       isKamiFormat = true
@@ -718,10 +752,19 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setError(null)
     setOidcBatchImportResult(null)
 
-    const importResult = { total: credentials.length, success: 0, failed: 0, errors: [] as string[], failedIndices: [] as number[] }
+    const importResult = {
+      total: credentials.length,
+      success: 0,
+      failed: 0,
+      errors: [] as string[],
+      failedIndices: [] as number[]
+    }
 
     // 单个凭证导入函数
-    const importSingleCredential = async (cred: typeof credentials[0], index: number): Promise<void> => {
+    const importSingleCredential = async (
+      cred: (typeof credentials)[0],
+      index: number
+    ): Promise<void> => {
       try {
         if (!cred.refreshToken) {
           importResult.failed++
@@ -732,7 +775,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
         // 根据 provider 自动确定 authMethod
         const credProvider = cred.provider || 'BuilderId'
-        const credAuthMethod = cred.authMethod || ((credProvider === 'BuilderId' || credProvider === 'Enterprise') ? 'IdC' : 'social')
+        const credAuthMethod =
+          cred.authMethod ||
+          (credProvider === 'BuilderId' || credProvider === 'Enterprise' ? 'IdC' : 'social')
 
         const result = await window.api.verifyAccountCredentials({
           refreshToken: cred.refreshToken,
@@ -745,25 +790,33 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
         if (result.success && result.data) {
           const { email, userId } = result.data
-          const provider = (cred.provider || 'BuilderId') as 'BuilderId' | 'Enterprise' | 'Github' | 'Google'
-          
+          const provider = (cred.provider || 'BuilderId') as
+            | 'BuilderId'
+            | 'Enterprise'
+            | 'Github'
+            | 'Google'
+
           if (isAccountExists(email, userId, provider)) {
             // 已存在的不记入失败，也从输入框中移除
-            importResult.errors.push(`#${index + 1}: ${email} ${isEn ? 'already exists' : '已存在'}`)
+            importResult.errors.push(
+              `#${index + 1}: ${email} ${isEn ? 'already exists' : '已存在'}`
+            )
             return
           }
-          
+
           // 根据 provider 确定 idp 和 authMethod
           const idpMap: Record<string, 'BuilderId' | 'Enterprise' | 'Github' | 'Google'> = {
-            'BuilderId': 'BuilderId',
-            'Enterprise': 'Enterprise',
-            'Github': 'Github',
-            'Google': 'Google'
+            BuilderId: 'BuilderId',
+            Enterprise: 'Enterprise',
+            Github: 'Github',
+            Google: 'Google'
           }
           const idp = idpMap[provider] || 'BuilderId'
           // GitHub 和 Google 使用 social 认证方式，BuilderId 和 Enterprise 使用 IdC
-          const authMethod = cred.authMethod || ((provider === 'BuilderId' || provider === 'Enterprise') ? 'IdC' : 'social')
-          
+          const authMethod =
+            cred.authMethod ||
+            (provider === 'BuilderId' || provider === 'Enterprise' ? 'IdC' : 'social')
+
           const now = Date.now()
           addAccount({
             email,
@@ -779,7 +832,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               clientId: cred.clientId || '',
               clientSecret: cred.clientSecret || '',
               region: cred.region || 'us-east-1',
-              expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
+              expiresAt: result.data.expiresIn
+                ? now + result.data.expiresIn * 1000
+                : now + 3600 * 1000,
               authMethod,
               provider,
               profileArn: result.data.profileArn
@@ -796,9 +851,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             usage: {
               current: result.data.usage.current,
               limit: result.data.usage.limit,
-              percentUsed: result.data.usage.limit > 0 
-                ? result.data.usage.current / result.data.usage.limit 
-                : 0,
+              percentUsed:
+                result.data.usage.limit > 0
+                  ? result.data.usage.current / result.data.usage.limit
+                  : 0,
               lastUpdated: now,
               baseLimit: result.data.usage.baseLimit,
               baseCurrent: result.data.usage.baseCurrent,
@@ -813,13 +869,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             status: 'active',
             lastUsedAt: now
           })
-          
+
           importResult.success++
         } else {
           importResult.failed++
           importResult.failedIndices.push(index)
           const err = result.error as { message?: string } | string | undefined
-          const errorMsg = typeof err === 'object' ? (err?.message || '验证失败') : (err || '验证失败')
+          const errorMsg = typeof err === 'object' ? err?.message || '验证失败' : err || '验证失败'
           importResult.errors.push(`#${index + 1}: ${errorMsg}`)
         }
       } catch (e) {
@@ -839,23 +895,30 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         )
         // 批次间添加短暂延迟，进一步避免限流
         if (i + BATCH_SIZE < credentials.length) {
-          await new Promise(resolve => setTimeout(resolve, 100))
+          await new Promise((resolve) => setTimeout(resolve, 100))
         }
       }
-      
+
       setOidcBatchImportResult(importResult)
-      
+
       if (importResult.failed === 0) {
         resetForm()
         onClose()
       } else {
         // 保留失败的凭证在输入框中
-        const failedCredentials = importResult.failedIndices.map(i => credentials[i])
+        const failedCredentials = importResult.failedIndices.map((i) => credentials[i])
         if (failedCredentials.length > 0) {
           if (isKamiFormat) {
             // 卡密格式：还原为卡密文本
-            const kamiLines = failedCredentials.map(c => 
-              [(c as Record<string, string>)._email || '', c.password || '', c.refreshToken, c.clientId || '', c.clientSecret || '', c.provider || ''].join('----')
+            const kamiLines = failedCredentials.map((c) =>
+              [
+                (c as Record<string, string>)._email || '',
+                c.password || '',
+                c.refreshToken,
+                c.clientId || '',
+                c.clientSecret || '',
+                c.provider || ''
+              ].join('----')
             )
             setOidcBatchData(kamiLines.join('\n'))
           } else {
@@ -903,13 +966,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       if (result.success && result.data) {
         const { email, userId } = result.data
         const providerName = provider || 'BuilderId'
-        
+
         // 检查账户是否已存在
         if (isAccountExists(email, userId, providerName)) {
           setError(isEn ? 'This account already exists' : '该账号已存在，无需重复添加')
           return
         }
-        
+
         // 直接添加账号
         const now = Date.now()
         addAccount({
@@ -925,7 +988,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             clientId,
             clientSecret,
             region,
-            expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
+            expiresAt: result.data.expiresIn
+              ? now + result.data.expiresIn * 1000
+              : now + 3600 * 1000,
             authMethod,
             provider: (provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google'
           },
@@ -941,9 +1006,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           usage: {
             current: result.data.usage.current,
             limit: result.data.usage.limit,
-            percentUsed: result.data.usage.limit > 0 
-              ? result.data.usage.current / result.data.usage.limit 
-              : 0,
+            percentUsed:
+              result.data.usage.limit > 0 ? result.data.usage.current / result.data.usage.limit : 0,
             lastUpdated: now,
             baseLimit: result.data.usage.baseLimit,
             baseCurrent: result.data.usage.baseCurrent,
@@ -996,67 +1060,90 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   if (!isOpen) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-[var(--overlay)]" onClick={onClose} />
 
-      <Card className="relative w-full max-w-lg max-h-[90vh] overflow-auto z-10">
-        <CardHeader className="pb-4 border-b">
+      <Card
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="AddAccountDialog-title"
+        className="ui-dialog-panel rounded-dialog"
+      >
+        <CardHeader className="ui-dialog-header px-6 pt-5 pb-3 space-y-0">
           <div className="flex flex-row items-center justify-between">
-            <CardTitle className="text-xl font-bold">{isEn ? 'Add Account' : '添加账号'}</CardTitle>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-red-500 hover:text-white transition-colors" onClick={onClose}>
+            <CardTitle id="AddAccountDialog-title" className="text-title font-semibold">
+              {isEn ? 'Add Account' : '添加账号'}
+            </CardTitle>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 rounded-control hover:bg-muted transition-colors"
+              onClick={onClose}
+              title={isEn ? 'Close' : '关闭'}
+            >
               <X className="h-4 w-4" />
             </Button>
           </div>
-          <p className="text-sm text-muted-foreground mt-1">{isEn ? 'Choose a method to add your Kiro account' : '选择一种方式来添加您的 Kiro 账号'}</p>
+          <p className="text-body text-muted-foreground">
+            {isEn ? 'Choose a method to add your Kiro account' : '选择一种方式来添加您的 Kiro 账号'}
+          </p>
         </CardHeader>
 
-        <CardContent className="space-y-6 pt-6">
+        <CardContent className="ui-dialog-body p-0 px-6 pb-5 space-y-4">
           {/* 添加到分组（默认=当前打开的分组，可改）；无分组时不显示 */}
           {groups.size > 0 && (
             <div className="flex items-center gap-3">
-              <Label className="text-sm whitespace-nowrap">{isEn ? 'Add to group' : '添加到分组'}</Label>
+              <Label className="text-body whitespace-nowrap">
+                {isEn ? 'Add to group' : '添加到分组'}
+              </Label>
               <Select
                 className="flex-1"
                 value={selectedGroupId ?? '__default__'}
                 onChange={(v) => setSelectedGroupId(v === '__default__' ? undefined : v)}
                 options={[
                   { value: '__default__', label: isEn ? 'Default (Ungrouped)' : '默认（未分组）' },
-                  ...Array.from(groups.values()).sort((a, b) => a.order - b.order).map(g => ({ value: g.id, label: g.name }))
+                  ...Array.from(groups.values())
+                    .sort((a, b) => a.order - b.order)
+                    .map((g) => ({ value: g.id, label: g.name }))
                 ]}
               />
             </div>
           )}
           {/* 导入模式切换 */}
-          <div className="grid grid-cols-3 gap-1 p-1 bg-muted/50 rounded-xl border">
+          <div
+            className="ui-segmented w-full"
+            role="group"
+            aria-label={isEn ? 'Add account method' : '账号添加方式'}
+          >
             <button
-              className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
-                importMode === 'login' 
-                  ? 'bg-background text-foreground shadow-sm ring-1 ring-black/5' 
-                  : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
-              }`}
-              onClick={() => { setImportMode('login'); setError(null) }}
+              className="flex-1 disabled:opacity-45"
+              aria-pressed={importMode === 'login'}
+              onClick={() => {
+                setImportMode('login')
+                setError(null)
+              }}
               disabled={!!verifiedData || isLoggingIn}
             >
               {isEn ? 'Login' : '在线登录'}
             </button>
             <button
-              className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
-                importMode === 'oidc' 
-                  ? 'bg-background text-foreground shadow-sm ring-1 ring-black/5' 
-                  : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
-              }`}
-              onClick={() => { setImportMode('oidc'); setError(null) }}
+              className="flex-1 disabled:opacity-45"
+              aria-pressed={importMode === 'oidc'}
+              onClick={() => {
+                setImportMode('oidc')
+                setError(null)
+              }}
               disabled={!!verifiedData || isLoggingIn}
             >
               {isEn ? 'OIDC Token' : 'OIDC 凭证'}
             </button>
             <button
-              className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
-                importMode === 'sso' 
-                  ? 'bg-background text-foreground shadow-sm ring-1 ring-black/5' 
-                  : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
-              }`}
-              onClick={() => { setImportMode('sso'); setError(null) }}
+              className="flex-1 disabled:opacity-45"
+              aria-pressed={importMode === 'sso'}
+              onClick={() => {
+                setImportMode('sso')
+                setError(null)
+              }}
               disabled={!!verifiedData || isLoggingIn}
             >
               SSO Token
@@ -1069,43 +1156,47 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               {/* 登录中状态 - Builder ID */}
               {isLoggingIn && builderIdLoginData && (
                 <div className="space-y-4">
-                  <div className="p-4 bg-primary/[0.08] rounded-lg text-center border border-primary/15">
-                    <p className="text-sm text-primary mb-2">
-                      {isEn ? 'Complete login in browser and enter this code:' : '请在浏览器中完成登录，并输入以下代码：'}
+                  <div className="p-4 bg-primary/[0.08] rounded-panel text-center border border-primary/15">
+                    <p className="text-body text-primary mb-2">
+                      {isEn
+                        ? 'Complete login in browser and enter this code:'
+                        : '请在浏览器中完成登录，并输入以下代码：'}
                     </p>
                     <div className="flex items-center justify-center gap-2">
-                      <code className="text-2xl font-bold tracking-widest bg-white dark:bg-gray-800 px-4 py-2 rounded border">
+                      <code className="text-metric font-semibold bg-white dark:bg-gray-800 px-4 py-2 rounded border">
                         {builderIdLoginData.userCode}
                       </code>
-                      <Button 
-                        variant="outline" 
+                      <Button
+                        variant="outline"
                         size="icon"
                         onClick={handleCopyUserCode}
                         title={isEn ? 'Copy code' : '复制代码'}
                       >
-                        {copied ? <Check className="h-4 w-4 text-success" /> : <Copy className="h-4 w-4" />}
+                        {copied ? (
+                          <Check className="h-4 w-4 text-success" />
+                        ) : (
+                          <Copy className="h-4 w-4" />
+                        )}
                       </Button>
                     </div>
-                    <div className="mt-3 flex items-center justify-center gap-2 text-xs text-muted-foreground">
+                    <div className="mt-3 flex items-center justify-center gap-2 text-caption text-muted-foreground">
                       <Loader2 className="h-3 w-3 animate-spin" />
                       {isEn ? 'Waiting for authorization...' : '等待授权中...'}
                     </div>
                   </div>
-                  
+
                   <div className="flex gap-2">
-                    <Button 
-                      variant="outline" 
+                    <Button
+                      variant="outline"
                       className="flex-1"
-                      onClick={() => window.api.openExternal(builderIdLoginData.verificationUri, usePrivateMode)}
+                      onClick={() =>
+                        window.api.openExternal(builderIdLoginData.verificationUri, usePrivateMode)
+                      }
                     >
-                      <ExternalLink className="h-4 w-4 mr-2" />
+                      <ExternalLink className="h-4 w-4 " />
                       {isEn ? 'Open Browser' : '重新打开浏览器'}
                     </Button>
-                    <Button 
-                      variant="destructive" 
-                      className="flex-1"
-                      onClick={handleCancelLogin}
-                    >
+                    <Button variant="destructive" className="flex-1" onClick={handleCancelLogin}>
                       {isEn ? 'Cancel' : '取消登录'}
                     </Button>
                   </div>
@@ -1115,21 +1206,17 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               {/* 登录中状态 - Social Auth */}
               {isLoggingIn && !builderIdLoginData && (
                 <div className="space-y-4">
-                  <div className="p-4 bg-primary/[0.08] rounded-lg text-center border border-primary/15">
+                  <div className="p-4 bg-primary/[0.08] rounded-panel text-center border border-primary/15">
                     <Loader2 className="h-8 w-8 animate-spin mx-auto mb-2 text-primary" />
-                    <p className="text-sm text-primary">
+                    <p className="text-body text-primary">
                       {isEn ? 'Complete login in browser...' : '请在浏览器中完成登录...'}
                     </p>
-                    <p className="text-xs text-muted-foreground mt-1">
+                    <p className="text-caption text-muted-foreground mt-1">
                       {isEn ? 'Will auto return after login' : '登录完成后会自动返回'}
                     </p>
                   </div>
-                  
-                  <Button 
-                    variant="destructive" 
-                    className="w-full"
-                    onClick={handleCancelLogin}
-                  >
+
+                  <Button variant="destructive" className="w-full" onClick={handleCancelLogin}>
                     {isEn ? 'Cancel' : '取消登录'}
                   </Button>
                 </div>
@@ -1137,155 +1224,238 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
               {/* 未登录状态 - 显示登录选项 */}
               {!isLoggingIn && (
-                <div className="space-y-4 py-2">
-                  <div className="text-center mb-6">
-                    <div className="w-12 h-12 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-3">
-                      <Check className="w-6 h-6 text-primary" />
-                    </div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'Choose Login Method' : '选择登录方式'}</h3>
-                    <p className="text-sm text-muted-foreground mt-1">
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <h3 className="text-section font-semibold">
+                      {isEn ? 'Choose Login Method' : '选择登录方式'}
+                    </h3>
+                    <p className="text-body text-muted-foreground mt-1">
                       {isEn ? 'Multiple quick login options' : '支持多种方式快捷登录'}
                     </p>
                   </div>
 
                   {/* 隐私模式选项 */}
-                  <div className="px-2">
+                  <div>
                     <button
                       type="button"
                       onClick={() => setUsePrivateMode(!usePrivateMode)}
-                      className={`w-full flex items-center justify-between px-4 py-3 rounded-xl border transition-all duration-200 ${
-                        usePrivateMode 
-                          ? 'bg-primary/5 border-primary/30 hover:bg-primary/10' 
+                      className={`w-full flex items-center justify-between px-4 py-3 rounded-control border transition-all duration-200 ${
+                        usePrivateMode
+                          ? 'bg-primary/5 border-primary/30 hover:bg-primary/10'
                           : 'bg-muted/30 border-transparent hover:bg-muted/50'
                       }`}
                     >
                       <div className="flex items-center gap-3">
-                        <div className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${
-                          usePrivateMode ? 'bg-primary/20' : 'bg-muted'
-                        }`}>
-                          <EyeOff className={`w-4 h-4 ${usePrivateMode ? 'text-primary' : 'text-muted-foreground'}`} />
+                        <div
+                          className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${
+                            usePrivateMode ? 'bg-primary/20' : 'bg-muted'
+                          }`}
+                        >
+                          <EyeOff
+                            className={`w-4 h-4 ${usePrivateMode ? 'text-primary' : 'text-muted-foreground'}`}
+                          />
                         </div>
-                        <span className={`text-sm font-medium ${usePrivateMode ? 'text-foreground' : 'text-muted-foreground'}`}>
+                        <span
+                          className={`text-body font-medium ${usePrivateMode ? 'text-foreground' : 'text-muted-foreground'}`}
+                        >
                           {isEn ? 'Private/Incognito Mode' : '隐私/无痕模式'}
                         </span>
                       </div>
-                      <div className={`w-10 h-6 rounded-full p-1 transition-colors ${
-                        usePrivateMode ? 'bg-primary' : 'bg-muted-foreground/30'
-                      }`}>
-                        <div className={`w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${
-                          usePrivateMode ? 'translate-x-4' : 'translate-x-0'
-                        }`} />
+                      <div
+                        className={`w-[30px] h-[18px] rounded-full p-[2px] shrink-0 transition-colors ${
+                          usePrivateMode ? 'bg-primary' : 'bg-muted-foreground/30'
+                        }`}
+                      >
+                        <div
+                          className={`w-[14px] h-[14px] rounded-full bg-white transition-transform ${
+                            usePrivateMode ? 'translate-x-3' : 'translate-x-0'
+                          }`}
+                        />
                       </div>
                     </button>
                   </div>
-                  
-                  <div className="space-y-3 px-2">
+
+                  <div className="space-y-3">
                     {/* Google */}
-                    <button 
-                      className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
+                    <button
+                      className="group ui-list-row w-full border border-border bg-card hover:bg-muted transition-colors"
                       onClick={() => {
                         setLoginType('google')
                         handleStartSocialLogin('Google')
                       }}
                     >
-                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full shadow-sm border dark:border-slate-600 p-1.5 group-hover:scale-110 transition-transform">
+                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full border dark:border-slate-600 p-1.5 transition-transform">
                         <svg viewBox="0 0 24 24" className="w-full h-full">
-                          <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-                          <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                          <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-                          <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                          <path
+                            fill="#4285F4"
+                            d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                          />
+                          <path
+                            fill="#34A853"
+                            d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                          />
+                          <path
+                            fill="#FBBC05"
+                            d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                          />
+                          <path
+                            fill="#EA4335"
+                            d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                          />
                         </svg>
                       </div>
                       <div className="flex flex-col items-start">
-                        <span className="text-sm font-semibold text-foreground">{isEn ? 'Google Account' : 'Google 账号'}</span>
-                        <span className="text-xs text-muted-foreground">{isEn ? 'Quick login with Google' : '使用 Google 账号快捷登录'}</span>
+                        <span className="text-strong font-medium text-foreground">
+                          {isEn ? 'Google Account' : 'Google 账号'}
+                        </span>
+                        <span className="text-caption text-muted-foreground">
+                          {isEn ? 'Quick login with Google' : '使用 Google 账号快捷登录'}
+                        </span>
                       </div>
                     </button>
 
                     {/* GitHub */}
-                    <button 
-                      className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
+                    <button
+                      className="group ui-list-row w-full border border-border bg-card hover:bg-muted transition-colors"
                       onClick={() => {
                         setLoginType('github')
                         handleStartSocialLogin('Github')
                       }}
                     >
-                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full shadow-sm border dark:border-slate-600 p-1.5 group-hover:scale-110 transition-transform">
-                        <svg viewBox="0 0 24 24" fill="#24292f" className="w-full h-full dark:fill-white">
-                          <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full border dark:border-slate-600 p-1.5 transition-transform">
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="#24292f"
+                          className="w-full h-full dark:fill-white"
+                        >
+                          <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
                         </svg>
                       </div>
                       <div className="flex flex-col items-start">
-                        <span className="text-sm font-semibold text-foreground">{isEn ? 'GitHub Account' : 'GitHub 账号'}</span>
-                        <span className="text-xs text-muted-foreground">{isEn ? 'Quick login with GitHub' : '使用 GitHub 账号快捷登录'}</span>
+                        <span className="text-strong font-medium text-foreground">
+                          {isEn ? 'GitHub Account' : 'GitHub 账号'}
+                        </span>
+                        <span className="text-caption text-muted-foreground">
+                          {isEn ? 'Quick login with GitHub' : '使用 GitHub 账号快捷登录'}
+                        </span>
                       </div>
                     </button>
 
                     {/* AWS Builder ID */}
-                    <button 
-                      className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
+                    <button
+                      className="group ui-list-row w-full border border-border bg-card hover:bg-muted transition-colors"
                       onClick={() => {
                         setLoginType('builderid')
                         handleStartBuilderIdLogin()
                       }}
                     >
-                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full shadow-sm border dark:border-slate-600 p-1.5 group-hover:scale-110 transition-transform">
+                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full border dark:border-slate-600 p-1.5 transition-transform">
                         <svg viewBox="0 0 24 24" className="w-full h-full">
-                          <text x="0" y="17" fontSize="12" fontWeight="bold" fontFamily="Arial" className="fill-[#232f3e] dark:fill-white">aws</text>
+                          <text
+                            x="0"
+                            y="17"
+                            fontSize="12"
+                            fontWeight="bold"
+                            fontFamily="Arial"
+                            className="fill-[#232f3e] dark:fill-white"
+                          >
+                            aws
+                          </text>
                         </svg>
                       </div>
                       <div className="flex flex-col items-start">
-                        <span className="text-sm font-semibold text-foreground">AWS Builder ID</span>
-                        <span className="text-xs text-muted-foreground">{isEn ? 'Login with AWS Builder ID' : '使用 AWS Builder ID 登录'}</span>
+                        <span className="text-strong font-medium text-foreground">
+                          AWS Builder ID
+                        </span>
+                        <span className="text-caption text-muted-foreground">
+                          {isEn ? 'Login with AWS Builder ID' : '使用 AWS Builder ID 登录'}
+                        </span>
                       </div>
                     </button>
 
                     {/* IAM Identity Center (Organization) */}
-                    <button 
-                      className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
+                    <button
+                      className="group ui-list-row w-full border border-border bg-card hover:bg-muted transition-colors"
                       onClick={() => {
                         setLoginType('iamsso')
                       }}
                     >
-                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full shadow-sm border dark:border-slate-600 p-1.5 group-hover:scale-110 transition-transform">
-                        <svg viewBox="0 0 24 24" className="w-full h-full fill-[#232f3e] dark:fill-white">
-                          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"/>
+                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full border dark:border-slate-600 p-1.5 transition-transform">
+                        <svg
+                          viewBox="0 0 24 24"
+                          className="w-full h-full fill-[#232f3e] dark:fill-white"
+                        >
+                          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z" />
                         </svg>
                       </div>
                       <div className="flex flex-col items-start">
-                        <span className="text-sm font-semibold text-foreground">Enterprise</span>
-                        <span className="text-xs text-muted-foreground">IAM Identity Center SSO</span>
+                        <span className="text-strong font-medium text-foreground">Enterprise</span>
+                        <span className="text-caption text-muted-foreground">
+                          IAM Identity Center SSO
+                        </span>
                       </div>
                     </button>
                   </div>
 
                   {/* IAM SSO 输入框 */}
                   {loginType === 'iamsso' && !iamSsoLoginData && (
-                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-panel border border-slate-200 dark:border-slate-700">
                       <div className="space-y-2">
-                        <Label htmlFor="ssoStartUrl" className="text-sm font-medium">{isEn ? 'SSO Start URL' : 'SSO Start URL'}</Label>
+                        <Label htmlFor="ssoStartUrl" className="text-body font-medium">
+                          {isEn ? 'SSO Start URL' : 'SSO Start URL'}
+                        </Label>
                         <Input
                           id="ssoStartUrl"
                           type="url"
                           placeholder="https://your-org.awsapps.com/start"
                           value={ssoStartUrl}
                           onChange={(e) => setSsoStartUrl(e.target.value)}
-                          className="font-mono text-sm"
+                          className="font-mono text-body"
                         />
-                        <p className="text-xs text-muted-foreground">
-                          {isEn ? 'Get this from your organization admin' : '从您的组织管理员处获取'}
+                        <p className="text-caption text-muted-foreground">
+                          {isEn
+                            ? 'Get this from your organization admin'
+                            : '从您的组织管理员处获取'}
                         </p>
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="ssoRegion" className="text-sm font-medium">{isEn ? 'SSO Region' : 'SSO 区域'}</Label>
+                        <Label htmlFor="ssoRegion" className="text-body font-medium">
+                          {isEn ? 'SSO Region' : 'SSO 区域'}
+                        </Label>
                         <div className="flex gap-2">
                           <select
                             id="ssoRegion"
-                            value={['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1', 'eu-north-1', 'eu-south-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3', 'ap-southeast-1', 'ap-southeast-2', 'ap-south-1', 'ap-east-1', 'ca-central-1', 'sa-east-1', 'me-south-1', 'af-south-1'].includes(region) ? region : 'custom'}
+                            value={
+                              [
+                                'us-east-1',
+                                'us-east-2',
+                                'us-west-1',
+                                'us-west-2',
+                                'eu-west-1',
+                                'eu-west-2',
+                                'eu-west-3',
+                                'eu-central-1',
+                                'eu-north-1',
+                                'eu-south-1',
+                                'ap-northeast-1',
+                                'ap-northeast-2',
+                                'ap-northeast-3',
+                                'ap-southeast-1',
+                                'ap-southeast-2',
+                                'ap-south-1',
+                                'ap-east-1',
+                                'ca-central-1',
+                                'sa-east-1',
+                                'me-south-1',
+                                'af-south-1'
+                              ].includes(region)
+                                ? region
+                                : 'custom'
+                            }
                             onChange={(e) => {
                               if (e.target.value !== 'custom') setRegion(e.target.value)
                             }}
-                            className="flex-1 h-10 px-3 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                            className="flex-1 h-control px-2.5 rounded-control border border-input  bg-card  text-body min-w-0"
                           >
                             <optgroup label="US">
                               <option value="us-east-1">us-east-1 (N. Virginia)</option>
@@ -1317,7 +1487,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                               <option value="af-south-1">af-south-1 (Cape Town)</option>
                             </optgroup>
                             <optgroup label={isEn ? 'Custom' : '自定义'}>
-                              <option value="custom">{isEn ? '-- Custom Input --' : '-- 自定义输入 --'}</option>
+                              <option value="custom">
+                                {isEn ? '-- Custom Input --' : '-- 自定义输入 --'}
+                              </option>
                             </optgroup>
                           </select>
                           <input
@@ -1325,27 +1497,35 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                             value={region}
                             onChange={(e) => setRegion(e.target.value)}
                             placeholder={isEn ? 'e.g., cn-north-1' : '例如: cn-north-1'}
-                            className="w-32 h-10 px-3 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                            className="w-32 h-control px-2.5 rounded-control border border-input  bg-card  text-body min-w-0"
                           />
                         </div>
                       </div>
-                      <Button 
+                      <Button
                         className="w-full"
                         onClick={handleStartIamSsoLogin}
                         disabled={!ssoStartUrl.trim() || isLoggingIn}
                       >
-                        {isLoggingIn ? (isEn ? 'Starting...' : '启动中...') : (isEn ? 'Start Login' : '开始登录')}
+                        {isLoggingIn
+                          ? isEn
+                            ? 'Starting...'
+                            : '启动中...'
+                          : isEn
+                            ? 'Start Login'
+                            : '开始登录'}
                       </Button>
                     </div>
                   )}
 
                   {/* IAM SSO 授权中 */}
                   {loginType === 'iamsso' && iamSsoLoginData && (
-                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-panel border border-slate-200 dark:border-slate-700">
                       <div className="text-center space-y-2">
-                        <p className="text-sm font-medium">{isEn ? 'Enter this code in browser:' : '在浏览器中输入此代码:'}</p>
+                        <p className="text-body font-medium">
+                          {isEn ? 'Enter this code in browser:' : '在浏览器中输入此代码:'}
+                        </p>
                         <div className="flex items-center justify-center gap-2">
-                          <code className="px-4 py-2 bg-primary/10 text-primary font-mono text-2xl font-bold rounded-lg">
+                          <code className="px-4 py-2 bg-primary/10 text-primary font-mono text-metric font-semibold rounded-panel">
                             {iamSsoLoginData.userCode}
                           </code>
                           <Button
@@ -1357,19 +1537,19 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                               setTimeout(() => setCopied(false), 2000)
                             }}
                           >
-                            {copied ? <Check className="w-4 h-4 text-success" /> : <Copy className="w-4 h-4" />}
+                            {copied ? (
+                              <Check className="w-4 h-4 text-success" />
+                            ) : (
+                              <Copy className="w-4 h-4" />
+                            )}
                           </Button>
                         </div>
                       </div>
-                      <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
+                      <div className="flex items-center justify-center gap-2 text-body text-muted-foreground">
                         <Loader2 className="w-4 h-4 animate-spin" />
                         <span>{isEn ? 'Waiting for authorization...' : '等待授权中...'}</span>
                       </div>
-                      <Button 
-                        variant="destructive" 
-                        className="w-full"
-                        onClick={handleCancelLogin}
-                      >
+                      <Button variant="destructive" className="w-full" onClick={handleCancelLogin}>
                         {isEn ? 'Cancel' : '取消登录'}
                       </Button>
                     </div>
@@ -1382,47 +1562,107 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           {/* SSO Token 导入模式 */}
           {importMode === 'sso' && !verifiedData && (
             <div className="space-y-5">
-              <div className="p-4 bg-primary/[0.04] rounded-xl border border-primary/15">
+              <div className="p-4 bg-primary/[0.04] rounded-panel border border-primary/15">
                 <div className="flex items-start gap-3">
-                   <div className="p-2 bg-primary/10 rounded-lg text-primary">
-                      <Info className="w-4 h-4" />
-                   </div>
-                   <div className="flex-1">
-                      <p className="text-sm font-semibold text-primary mb-1.5">{isEn ? 'How to get Token?' : '如何获取 Token?'}</p>
-                      <ol className="text-xs text-primary/90 list-decimal list-inside space-y-1.5">
-                        <li>{isEn ? 'Visit and login:' : '在浏览器中访问并登录:'} <a href="https://view.awsapps.com/start/#/device?user_code=PQCF-FCCN/start/#/device?user_code=PQCF-FCCN" target="_blank" className="underline hover:text-primary/80 font-medium">view.awsapps.com/start/#/device?user_code=PQCF-FCCN</a></li>
-                        <li>{isEn ? 'Press F12 → Application → Cookies' : '按 F12 打开开发者工具 → Application → Cookies'}</li>
-                        <li>{isEn ? 'Find and copy' : '找到并复制'} <code className="px-1 py-0.5 bg-primary/15 rounded font-mono text-[10px]">x-amz-sso_authn</code> {isEn ? 'value' : '的值'}</li>
-                      </ol>
-                   </div>
+                  <div className="p-2 bg-primary/10 rounded-panel text-primary">
+                    <Info className="w-4 h-4" />
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-body font-semibold text-primary mb-1.5">
+                      {isEn ? 'How to get Token?' : '如何获取 Token?'}
+                    </p>
+                    <ol className="text-caption text-primary/90 list-decimal list-inside space-y-1.5">
+                      <li>
+                        {isEn ? 'Visit and login:' : '在浏览器中访问并登录:'}{' '}
+                        <a
+                          href="https://view.awsapps.com/start/#/device?user_code=PQCF-FCCN/start/#/device?user_code=PQCF-FCCN"
+                          target="_blank"
+                          className="underline hover:text-primary/80 font-medium"
+                        >
+                          view.awsapps.com/start/#/device?user_code=PQCF-FCCN
+                        </a>
+                      </li>
+                      <li>
+                        {isEn
+                          ? 'Press F12 → Application → Cookies'
+                          : '按 F12 打开开发者工具 → Application → Cookies'}
+                      </li>
+                      <li>
+                        {isEn ? 'Find and copy' : '找到并复制'}{' '}
+                        <code className="px-1 py-0.5 bg-primary/15 rounded font-mono text-caption">
+                          x-amz-sso_authn
+                        </code>{' '}
+                        {isEn ? 'value' : '的值'}
+                      </li>
+                    </ol>
+                  </div>
                 </div>
               </div>
-              
+
               <div className="space-y-4">
                 <div className="space-y-2">
-                  <label className="text-sm font-medium flex items-center gap-1">
+                  <label className="text-body font-medium flex items-center gap-1">
                     x-amz-sso_authn <span className="text-destructive">*</span>
-                    <span className="text-xs text-muted-foreground font-normal ml-2">{isEn ? 'Supports batch import, one per line' : '支持批量导入，每行一个 Token'}</span>
+                    <span className="text-caption text-muted-foreground font-normal ml-2">
+                      {isEn
+                        ? 'Supports batch import, one per line'
+                        : '支持批量导入，每行一个 Token'}
+                    </span>
                   </label>
                   <textarea
-                    className="w-full min-h-[120px] px-3 py-2.5 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono"
-                    placeholder={isEn ? 'Paste Token content, one per line&#10;eyJlbmMiOiJBMjU2...&#10;eyJlbmMiOiJBMjU2...' : '粘贴 Token 内容，每行一个&#10;eyJlbmMiOiJBMjU2...&#10;eyJlbmMiOiJBMjU2...'}
+                    className="w-full min-h-[120px] px-2.5 py-1.5 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono min-w-0"
+                    placeholder={
+                      isEn
+                        ? 'Paste Token content, one per line&#10;eyJlbmMiOiJBMjU2...&#10;eyJlbmMiOiJBMjU2...'
+                        : '粘贴 Token 内容，每行一个&#10;eyJlbmMiOiJBMjU2...&#10;eyJlbmMiOiJBMjU2...'
+                    }
                     value={ssoToken}
-                    onChange={(e) => { setSsoToken(e.target.value); setBatchImportResult(null) }}
+                    onChange={(e) => {
+                      setSsoToken(e.target.value)
+                      setBatchImportResult(null)
+                    }}
                   />
                   {ssoToken.trim() && (
-                    <p className="text-xs text-muted-foreground">
-                      {isEn ? `Entered ${ssoToken.split('\n').filter(t => t.trim()).length} tokens` : `已输入 ${ssoToken.split('\n').filter(t => t.trim()).length} 个 Token`}
+                    <p className="text-caption text-muted-foreground">
+                      {isEn
+                        ? `Entered ${ssoToken.split('\n').filter((t) => t.trim()).length} tokens`
+                        : `已输入 ${ssoToken.split('\n').filter((t) => t.trim()).length} 个 Token`}
                     </p>
                   )}
                 </div>
 
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">AWS Region</label>
+                  <label className="text-body font-medium">AWS Region</label>
                   <div className="flex gap-2">
                     <select
-                      className="flex-1 h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                      value={['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1', 'eu-north-1', 'eu-south-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3', 'ap-southeast-1', 'ap-southeast-2', 'ap-south-1', 'ap-east-1', 'ca-central-1', 'sa-east-1', 'me-south-1', 'af-south-1'].includes(region) ? region : 'custom'}
+                      className="flex-1 h-control px-2.5 py-1 text-body rounded-control border border-input bg-card ring-offset-background focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 min-w-0"
+                      value={
+                        [
+                          'us-east-1',
+                          'us-east-2',
+                          'us-west-1',
+                          'us-west-2',
+                          'eu-west-1',
+                          'eu-west-2',
+                          'eu-west-3',
+                          'eu-central-1',
+                          'eu-north-1',
+                          'eu-south-1',
+                          'ap-northeast-1',
+                          'ap-northeast-2',
+                          'ap-northeast-3',
+                          'ap-southeast-1',
+                          'ap-southeast-2',
+                          'ap-south-1',
+                          'ap-east-1',
+                          'ca-central-1',
+                          'sa-east-1',
+                          'me-south-1',
+                          'af-south-1'
+                        ].includes(region)
+                          ? region
+                          : 'custom'
+                      }
                       onChange={(e) => {
                         if (e.target.value !== 'custom') setRegion(e.target.value)
                       }}
@@ -1465,7 +1705,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       value={region}
                       onChange={(e) => setRegion(e.target.value)}
                       placeholder={isEn ? 'e.g., cn-north-1' : '例如: cn-north-1'}
-                      className="w-28 h-10 px-2 text-sm rounded-xl border border-input bg-background/50"
+                      className="w-28 h-control px-2 text-body rounded-control border border-input bg-card min-w-0"
                     />
                   </div>
                 </div>
@@ -1473,12 +1713,18 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
               {/* 批量导入结果 */}
               {batchImportResult && (
-                <div className={`p-3 rounded-lg text-sm ${batchImportResult.failed > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}>
-                  <p className={`font-medium ${batchImportResult.failed > 0 ? 'text-warning' : 'text-success'}`}>
-                    {isEn ? `Result: ${batchImportResult.success}/${batchImportResult.total} succeeded` : `导入结果: 成功 ${batchImportResult.success}/${batchImportResult.total}`}
+                <div
+                  className={`p-3 rounded-panel text-body ${batchImportResult.failed > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}
+                >
+                  <p
+                    className={`font-medium ${batchImportResult.failed > 0 ? 'text-warning' : 'text-success'}`}
+                  >
+                    {isEn
+                      ? `Result: ${batchImportResult.success}/${batchImportResult.total} succeeded`
+                      : `导入结果: 成功 ${batchImportResult.success}/${batchImportResult.total}`}
                   </p>
                   {batchImportResult.errors.length > 0 && (
-                    <ul className="mt-2 text-xs text-warning/90 space-y-0.5 max-h-20 overflow-y-auto">
+                    <ul className="mt-2 text-caption text-warning/90 space-y-0.5 max-h-20 overflow-y-auto">
                       {batchImportResult.errors.map((err, i) => (
                         <li key={i}>{err}</li>
                       ))}
@@ -1487,21 +1733,29 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                 </div>
               )}
 
-              <Button 
-                type="button" 
-                className="w-full h-11 text-sm font-medium rounded-xl shadow-sm"
+              <Button
+                type="button"
+                className="w-full h-control text-body font-medium rounded-control "
                 onClick={handleSsoImport}
                 disabled={isVerifying || !ssoToken.trim()}
               >
                 {isVerifying ? (
                   <>
-                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                    {isEn ? `Importing ${ssoToken.split('\n').filter(t => t.trim()).length} accounts...` : `正在并发导入 ${ssoToken.split('\n').filter(t => t.trim()).length} 个账号...`}
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {isEn
+                      ? `Importing ${ssoToken.split('\n').filter((t) => t.trim()).length} accounts...`
+                      : `正在并发导入 ${ssoToken.split('\n').filter((t) => t.trim()).length} 个账号...`}
                   </>
+                ) : ssoToken.split('\n').filter((t) => t.trim()).length > 1 ? (
+                  isEn ? (
+                    `Batch import ${ssoToken.split('\n').filter((t) => t.trim()).length} accounts`
+                  ) : (
+                    `批量导入 ${ssoToken.split('\n').filter((t) => t.trim()).length} 个账号`
+                  )
+                ) : isEn ? (
+                  'Import & Verify'
                 ) : (
-                  ssoToken.split('\n').filter(t => t.trim()).length > 1 
-                    ? (isEn ? `Batch import ${ssoToken.split('\n').filter(t => t.trim()).length} accounts` : `批量导入 ${ssoToken.split('\n').filter(t => t.trim()).length} 个账号`)
-                    : (isEn ? 'Import & Verify' : '导入并验证')
+                  '导入并验证'
                 )}
               </Button>
             </div>
@@ -1511,32 +1765,48 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           {importMode === 'oidc' && !verifiedData && (
             <div className="space-y-5">
               <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold">{isEn ? 'Enter OIDC Token' : '输入 OIDC 凭证'}</h3>
+                <h3 className="text-body font-semibold">
+                  {isEn ? 'Enter OIDC Token' : '输入 OIDC 凭证'}
+                </h3>
                 <div className="flex items-center gap-2">
                   {/* 单个/批量 切换 */}
-                  <div className="flex bg-muted/50 rounded-lg p-0.5">
+                  <div
+                    className="ui-segmented ui-segmented-sm"
+                    role="group"
+                    aria-label={isEn ? 'OIDC import mode' : 'OIDC 导入模式'}
+                  >
                     <button
-                      className={`px-2.5 py-1 text-xs rounded-md transition-all ${oidcImportMode === 'single' ? 'bg-background shadow-sm font-medium' : 'text-muted-foreground hover:text-foreground'}`}
-                      onClick={() => { setOidcImportMode('single'); setOidcBatchImportResult(null) }}
+                      type="button"
+                      aria-pressed={oidcImportMode === 'single'}
+                      className="transition-colors"
+                      onClick={() => {
+                        setOidcImportMode('single')
+                        setOidcBatchImportResult(null)
+                      }}
                     >
                       {isEn ? 'Single' : '单个'}
                     </button>
                     <button
-                      className={`px-2.5 py-1 text-xs rounded-md transition-all ${oidcImportMode === 'batch' ? 'bg-background shadow-sm font-medium' : 'text-muted-foreground hover:text-foreground'}`}
-                      onClick={() => { setOidcImportMode('batch'); setOidcBatchImportResult(null) }}
+                      type="button"
+                      aria-pressed={oidcImportMode === 'batch'}
+                      className="transition-colors"
+                      onClick={() => {
+                        setOidcImportMode('batch')
+                        setOidcBatchImportResult(null)
+                      }}
                     >
                       {isEn ? 'Batch' : '批量'}
                     </button>
                   </div>
                   {oidcImportMode === 'single' && (
-                    <Button 
-                      type="button" 
-                      variant="outline" 
+                    <Button
+                      type="button"
+                      variant="outline"
                       size="sm"
-                      className="h-7 rounded-lg text-xs"
+                      className="h-7 rounded-control text-body"
                       onClick={handleImportFromLocal}
                     >
-                      <Download className="h-3 w-3 mr-1" />
+                      <Download className="h-3 w-3 " />
                       {isEn ? 'Import' : '本地导入'}
                     </Button>
                   )}
@@ -1549,11 +1819,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   <div className="space-y-4">
                     {/* 登录类型选择 */}
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">{isEn ? 'Login Type' : '登录类型'}</label>
+                      <label className="text-body font-medium">
+                        {isEn ? 'Login Type' : '登录类型'}
+                      </label>
                       <div className="flex gap-2">
                         <button
                           type="button"
-                          className={`flex-1 h-9 px-3 text-sm rounded-lg border transition-all ${authMethod === 'IdC' && provider === 'BuilderId' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background border-input hover:bg-muted'}`}
+                          className={`flex-1 h-control px-2.5 text-body rounded-control border transition-colors ${authMethod === 'IdC' && provider === 'BuilderId' ? 'bg-muted text-foreground border-border-strong' : 'bg-background border-input hover:bg-muted'}`}
                           onClick={() => {
                             setAuthMethod('IdC')
                             setProvider('BuilderId')
@@ -1563,7 +1835,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                         </button>
                         <button
                           type="button"
-                          className={`flex-1 h-9 px-3 text-sm rounded-lg border transition-all ${authMethod === 'IdC' && provider === 'Enterprise' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background border-input hover:bg-muted'}`}
+                          className={`flex-1 h-control px-2.5 text-body rounded-control border transition-colors ${authMethod === 'IdC' && provider === 'Enterprise' ? 'bg-muted text-foreground border-border-strong' : 'bg-background border-input hover:bg-muted'}`}
                           onClick={() => {
                             setAuthMethod('IdC')
                             setProvider('Enterprise')
@@ -1573,7 +1845,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                         </button>
                         <button
                           type="button"
-                          className={`flex-1 h-9 px-3 text-sm rounded-lg border transition-all ${authMethod === 'social' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background border-input hover:bg-muted'}`}
+                          className={`flex-1 h-control px-2.5 text-body rounded-control border transition-colors ${authMethod === 'social' ? 'bg-muted text-foreground border-border-strong' : 'bg-background border-input hover:bg-muted'}`}
                           onClick={() => {
                             setAuthMethod('social')
                             setProvider('Google')
@@ -1587,37 +1859,39 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                           <div className="flex gap-2">
                             <button
                               type="button"
-                              className={`flex-1 h-8 px-3 text-xs rounded-lg border transition-all ${provider === 'Google' ? 'bg-primary/20 text-primary border-primary/50' : 'bg-background border-input hover:bg-muted'}`}
+                              className={`flex-1 h-control px-2.5 text-body rounded-control border transition-colors ${provider === 'Google' ? 'bg-muted text-foreground border-border-strong' : 'bg-background border-input hover:bg-muted'}`}
                               onClick={() => setProvider('Google')}
                             >
                               Google
                             </button>
                             <button
                               type="button"
-                              className={`flex-1 h-8 px-3 text-xs rounded-lg border transition-all ${provider === 'Github' ? 'bg-primary/20 text-primary border-primary/50' : 'bg-background border-input hover:bg-muted'}`}
+                              className={`flex-1 h-control px-2.5 text-body rounded-control border transition-colors ${provider === 'Github' ? 'bg-muted text-foreground border-border-strong' : 'bg-background border-input hover:bg-muted'}`}
                               onClick={() => setProvider('Github')}
                             >
                               GitHub
                             </button>
                           </div>
-                          <p className="text-xs text-muted-foreground">
-                            {isEn ? 'Social login does not require Client ID and Secret' : '社交登录不需要 Client ID 和 Client Secret'}
+                          <p className="text-caption text-muted-foreground">
+                            {isEn
+                              ? 'Social login does not require Client ID and Secret'
+                              : '社交登录不需要 Client ID 和 Client Secret'}
                           </p>
                         </div>
                       )}
                       {authMethod === 'IdC' && provider === 'Enterprise' && (
-                        <p className="text-xs text-muted-foreground">
+                        <p className="text-caption text-muted-foreground">
                           Enterprise (IAM Identity Center SSO)
                         </p>
                       )}
                     </div>
 
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">
+                      <label className="text-body font-medium">
                         Refresh Token <span className="text-destructive">*</span>
                       </label>
                       <textarea
-                        className="w-full min-h-[80px] px-3 py-2.5 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono"
+                        className="w-full min-h-[80px] px-2.5 py-1.5 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono min-w-0"
                         placeholder={isEn ? 'Paste Refresh Token...' : '粘贴 Refresh Token...'}
                         value={refreshToken}
                         onChange={(e) => setRefreshToken(e.target.value)}
@@ -1629,12 +1903,12 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       <>
                         <div className="grid grid-cols-2 gap-4">
                           <div className="space-y-2">
-                            <label className="text-sm font-medium">
+                            <label className="text-body font-medium">
                               Client ID <span className="text-destructive">*</span>
                             </label>
                             <input
                               type="text"
-                              className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                              className="w-full h-control px-2.5 py-1 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 font-mono min-w-0"
                               placeholder="Client ID"
                               value={clientId}
                               onChange={(e) => setClientId(e.target.value)}
@@ -1642,12 +1916,12 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                           </div>
 
                           <div className="space-y-2">
-                            <label className="text-sm font-medium">
+                            <label className="text-body font-medium">
                               Client Secret <span className="text-destructive">*</span>
                             </label>
                             <input
                               type="password"
-                              className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                              className="w-full h-control px-2.5 py-1 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 font-mono min-w-0"
                               placeholder="Client Secret"
                               value={clientSecret}
                               onChange={(e) => setClientSecret(e.target.value)}
@@ -1656,11 +1930,37 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                         </div>
 
                         <div className="space-y-2">
-                          <label className="text-sm font-medium">AWS Region</label>
+                          <label className="text-body font-medium">AWS Region</label>
                           <div className="flex gap-2">
                             <select
-                              className="flex-1 h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                              value={['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1', 'eu-north-1', 'eu-south-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3', 'ap-southeast-1', 'ap-southeast-2', 'ap-south-1', 'ap-east-1', 'ca-central-1', 'sa-east-1', 'me-south-1', 'af-south-1'].includes(region) ? region : 'custom'}
+                              className="flex-1 h-control px-2.5 py-1 text-body rounded-control border border-input bg-card ring-offset-background focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 min-w-0"
+                              value={
+                                [
+                                  'us-east-1',
+                                  'us-east-2',
+                                  'us-west-1',
+                                  'us-west-2',
+                                  'eu-west-1',
+                                  'eu-west-2',
+                                  'eu-west-3',
+                                  'eu-central-1',
+                                  'eu-north-1',
+                                  'eu-south-1',
+                                  'ap-northeast-1',
+                                  'ap-northeast-2',
+                                  'ap-northeast-3',
+                                  'ap-southeast-1',
+                                  'ap-southeast-2',
+                                  'ap-south-1',
+                                  'ap-east-1',
+                                  'ca-central-1',
+                                  'sa-east-1',
+                                  'me-south-1',
+                                  'af-south-1'
+                                ].includes(region)
+                                  ? region
+                                  : 'custom'
+                              }
                               onChange={(e) => {
                                 if (e.target.value !== 'custom') setRegion(e.target.value)
                               }}
@@ -1695,7 +1995,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                                 <option value="af-south-1">af-south-1 (Cape Town)</option>
                               </optgroup>
                               <optgroup label={isEn ? 'Custom' : '自定义'}>
-                                <option value="custom">{isEn ? '-- Custom --' : '-- 自定义 --'}</option>
+                                <option value="custom">
+                                  {isEn ? '-- Custom --' : '-- 自定义 --'}
+                                </option>
                               </optgroup>
                             </select>
                             <input
@@ -1703,7 +2005,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                               value={region}
                               onChange={(e) => setRegion(e.target.value)}
                               placeholder={isEn ? 'e.g., cn-north-1' : '例如: cn-north-1'}
-                              className="w-28 h-10 px-2 text-sm rounded-xl border border-input bg-background/50"
+                              className="w-28 h-control px-2 text-body rounded-control border border-input bg-card min-w-0"
                             />
                           </div>
                         </div>
@@ -1716,21 +2018,31 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               {/* 批量导入模式 */}
               {oidcImportMode === 'batch' && (
                 <>
-                  <div className="p-3 bg-primary/[0.04] rounded-xl border border-primary/15">
-                    <p className="text-xs text-primary">
-                      {isEn ? 'Supports JSON array or Card Key format. JSON required:' : '支持 JSON 数组或卡密格式。JSON 必填:'} <code className="px-1 bg-primary/15 rounded">refreshToken</code>.
-                      {isEn ? 'Card Key format:' : '卡密格式：'} <code className="px-1 bg-primary/15 rounded">{isEn ? 'email----pwd----token----id----secret' : '邮箱----密码----Token----ID----Secret'}</code>
+                  <div className="p-3 bg-primary/[0.04] rounded-panel border border-primary/15">
+                    <p className="text-caption text-primary">
+                      {isEn
+                        ? 'Supports JSON array or Card Key format. JSON required:'
+                        : '支持 JSON 数组或卡密格式。JSON 必填:'}{' '}
+                      <code className="px-1 bg-primary/15 rounded">refreshToken</code>.
+                      {isEn ? 'Card Key format:' : '卡密格式：'}{' '}
+                      <code className="px-1 bg-primary/15 rounded">
+                        {isEn
+                          ? 'email----pwd----token----id----secret'
+                          : '邮箱----密码----Token----ID----Secret'}
+                      </code>
                     </p>
                   </div>
 
                   <div className="space-y-2">
-                    <label className="text-sm font-medium flex items-center gap-2">
-                      {isEn ? 'Credentials Data' : '凭证数据'} <span className="text-destructive">*</span>
+                    <label className="text-body font-medium flex items-center gap-2">
+                      {isEn ? 'Credentials Data' : '凭证数据'}{' '}
+                      <span className="text-destructive">*</span>
                     </label>
                     <textarea
-                      className="w-full min-h-[180px] px-3 py-2.5 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono text-xs"
-                      placeholder={isEn 
-                        ? `JSON format:
+                      className="w-full min-h-[180px] px-2.5 py-1.5 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono  min-w-0"
+                      placeholder={
+                        isEn
+                          ? `JSON format:
 [
   {
     "refreshToken": "xxx",
@@ -1756,7 +2068,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
 Or Card Key format (one per line):
 email----password----refreshToken----clientId----clientSecret`
-                        : `JSON 格式：
+                          : `JSON 格式：
 [
   {
     "refreshToken": "xxx",
@@ -1781,35 +2093,71 @@ email----password----refreshToken----clientId----clientSecret`
 ]
 
 或卡密格式（每行一个）：
-邮箱----密码----RefreshToken----ClientId----ClientSecret`}
-                      value={oidcBatchData}
-                      onChange={(e) => { setOidcBatchData(e.target.value); setOidcBatchImportResult(null) }}
-                    />
-                    {oidcBatchData.trim() && (() => {
-                      const val = oidcBatchData.trim()
-                      try {
-                        const parsed = JSON.parse(val)
-                        const count = Array.isArray(parsed) ? parsed.length : 1
-                        return <p className="text-xs text-muted-foreground">{isEn ? `Entered ${count} credentials (JSON)` : `已输入 ${count} 个凭证 (JSON)`}</p>
-                      } catch {
-                        // 尝试卡密格式计数
-                        const kamiLines = val.split('\n').filter(l => l.trim() && !l.startsWith('#'))
-                        if (kamiLines.length > 0 && kamiLines.some(l => l.includes('----') || l.includes('\t') || /\s{2,}/.test(l))) {
-                          return <p className="text-xs text-muted-foreground">{isEn ? `Entered ${kamiLines.length} credentials (Card Key)` : `已输入 ${kamiLines.length} 个凭证 (卡密格式)`}</p>
-                        }
-                        return <p className="text-xs text-destructive">{isEn ? 'Invalid format (JSON or Card Key)' : '格式错误（支持 JSON 或卡密格式）'}</p>
+邮箱----密码----RefreshToken----ClientId----ClientSecret`
                       }
-                    })()}
+                      value={oidcBatchData}
+                      onChange={(e) => {
+                        setOidcBatchData(e.target.value)
+                        setOidcBatchImportResult(null)
+                      }}
+                    />
+                    {oidcBatchData.trim() &&
+                      (() => {
+                        const val = oidcBatchData.trim()
+                        try {
+                          const parsed = JSON.parse(val)
+                          const count = Array.isArray(parsed) ? parsed.length : 1
+                          return (
+                            <p className="text-caption text-muted-foreground">
+                              {isEn
+                                ? `Entered ${count} credentials (JSON)`
+                                : `已输入 ${count} 个凭证 (JSON)`}
+                            </p>
+                          )
+                        } catch {
+                          // 尝试卡密格式计数
+                          const kamiLines = val
+                            .split('\n')
+                            .filter((l) => l.trim() && !l.startsWith('#'))
+                          if (
+                            kamiLines.length > 0 &&
+                            kamiLines.some(
+                              (l) => l.includes('----') || l.includes('\t') || /\s{2,}/.test(l)
+                            )
+                          ) {
+                            return (
+                              <p className="text-caption text-muted-foreground">
+                                {isEn
+                                  ? `Entered ${kamiLines.length} credentials (Card Key)`
+                                  : `已输入 ${kamiLines.length} 个凭证 (卡密格式)`}
+                              </p>
+                            )
+                          }
+                          return (
+                            <p className="text-caption text-destructive">
+                              {isEn
+                                ? 'Invalid format (JSON or Card Key)'
+                                : '格式错误（支持 JSON 或卡密格式）'}
+                            </p>
+                          )
+                        }
+                      })()}
                   </div>
 
                   {/* 批量导入结果 */}
                   {oidcBatchImportResult && (
-                    <div className={`p-3 rounded-lg text-sm ${oidcBatchImportResult.failed > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}>
-                      <p className={`font-medium ${oidcBatchImportResult.failed > 0 ? 'text-warning' : 'text-success'}`}>
-                        {isEn ? `Result: ${oidcBatchImportResult.success}/${oidcBatchImportResult.total} succeeded` : `导入结果: 成功 ${oidcBatchImportResult.success}/${oidcBatchImportResult.total}`}
+                    <div
+                      className={`p-3 rounded-panel text-body ${oidcBatchImportResult.failed > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}
+                    >
+                      <p
+                        className={`font-medium ${oidcBatchImportResult.failed > 0 ? 'text-warning' : 'text-success'}`}
+                      >
+                        {isEn
+                          ? `Result: ${oidcBatchImportResult.success}/${oidcBatchImportResult.total} succeeded`
+                          : `导入结果: 成功 ${oidcBatchImportResult.success}/${oidcBatchImportResult.total}`}
                       </p>
                       {oidcBatchImportResult.errors.length > 0 && (
-                        <ul className="mt-2 text-xs text-warning/90 space-y-0.5 max-h-20 overflow-y-auto">
+                        <ul className="mt-2 text-caption text-warning/90 space-y-0.5 max-h-20 overflow-y-auto">
                           {oidcBatchImportResult.errors.map((err, i) => (
                             <li key={i}>{err}</li>
                           ))}
@@ -1824,54 +2172,62 @@ email----password----refreshToken----clientId----clientSecret`
 
           {/* 错误信息 */}
           {error && (
-            <div className="p-3 bg-destructive/10 text-destructive rounded-xl text-sm flex items-center gap-2 animate-in fade-in slide-in-from-top-2">
+            <div className="p-3 bg-destructive/10 text-destructive rounded-panel text-body flex items-center gap-2 animate-in fade-in slide-in-">
               <div className="w-1.5 h-1.5 rounded-full bg-destructive shrink-0" />
               {error}
             </div>
           )}
-
-          {/* 提交按钮 - 只在 OIDC 模式显示 */}
-          {importMode === 'oidc' && (
-            <div className="flex justify-end gap-3 pt-4 border-t">
-              <Button type="button" variant="outline" onClick={onClose} className="rounded-xl h-10 px-6">
-                {isEn ? 'Cancel' : '取消'}
-              </Button>
-              {oidcImportMode === 'single' ? (
-                <Button 
-                  onClick={handleOidcAdd} 
-                  disabled={isSubmitting || !refreshToken || (authMethod !== 'social' && (!clientId || !clientSecret))}
-                  className="rounded-xl h-10 px-6"
-                >
-                  {isSubmitting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                  {isEn ? 'Add Account' : '确认添加'}
-                </Button>
-              ) : (
-                <Button 
-                  onClick={handleOidcBatchAdd} 
-                  disabled={isSubmitting || !oidcBatchData.trim()}
-                  className="rounded-xl h-10 px-6"
-                >
-                  {isSubmitting ? (
-                    <>
-                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      {isEn ? 'Importing...' : '正在并发导入...'}
-                    </>
-                  ) : (
-                    (() => {
-                      try {
-                        const parsed = JSON.parse(oidcBatchData.trim())
-                        const count = Array.isArray(parsed) ? parsed.length : 1
-                        return isEn ? `Batch import ${count} accounts` : `批量导入 ${count} 个账号`
-                      } catch {
-                        return isEn ? 'Batch Import' : '批量导入'
-                      }
-                    })()
-                  )}
-                </Button>
-              )}
-            </div>
-          )}
         </CardContent>
+        {/* 提交按钮 - 只在 OIDC 模式显示 */}
+        {importMode === 'oidc' && (
+          <div className="ui-dialog-footer">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={onClose}
+              className="rounded-control h-control px-3.5"
+            >
+              {isEn ? 'Cancel' : '取消'}
+            </Button>
+            {oidcImportMode === 'single' ? (
+              <Button
+                onClick={handleOidcAdd}
+                disabled={
+                  isSubmitting ||
+                  !refreshToken ||
+                  (authMethod !== 'social' && (!clientId || !clientSecret))
+                }
+                className="rounded-control h-control px-3.5"
+              >
+                {isSubmitting && <Loader2 className="h-4 w-4 animate-spin" />}
+                {isEn ? 'Add Account' : '确认添加'}
+              </Button>
+            ) : (
+              <Button
+                onClick={handleOidcBatchAdd}
+                disabled={isSubmitting || !oidcBatchData.trim()}
+                className="rounded-control h-control px-3.5"
+              >
+                {isSubmitting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {isEn ? 'Importing...' : '正在并发导入...'}
+                  </>
+                ) : (
+                  (() => {
+                    try {
+                      const parsed = JSON.parse(oidcBatchData.trim())
+                      const count = Array.isArray(parsed) ? parsed.length : 1
+                      return isEn ? `Batch import ${count} accounts` : `批量导入 ${count} 个账号`
+                    } catch {
+                      return isEn ? 'Batch Import' : '批量导入'
+                    }
+                  })()
+                )}
+              </Button>
+            )}
+          </div>
+        )}
       </Card>
     </div>
   )

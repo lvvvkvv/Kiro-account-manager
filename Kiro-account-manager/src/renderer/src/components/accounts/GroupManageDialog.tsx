@@ -11,7 +11,8 @@ interface GroupManageDialogProps {
 }
 
 export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): React.ReactNode {
-  const { groups, accounts, addGroup, updateGroup, removeGroup, moveAccountsToGroup } = useAccountsStore()
+  const { groups, accounts, addGroup, updateGroup, removeGroup, moveAccountsToGroup } =
+    useAccountsStore()
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
@@ -32,12 +33,12 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
 
   // 获取分组内的账号数量
   const getGroupAccountCount = (groupId: string): number => {
-    return Array.from(accounts.values()).filter(acc => acc.groupId === groupId).length
+    return Array.from(accounts.values()).filter((acc) => acc.groupId === groupId).length
   }
 
   // 获取未分组的账号数量
   const getUngroupedCount = (): number => {
-    return Array.from(accounts.values()).filter(acc => !acc.groupId).length
+    return Array.from(accounts.values()).filter((acc) => !acc.groupId).length
   }
 
   // 创建分组
@@ -76,9 +77,10 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
   // 删除分组
   const handleDelete = (id: string, name: string) => {
     const count = getGroupAccountCount(id)
-    const msg = count > 0
-      ? `确定要删除分组「${name}」吗？\n该分组包含 ${count} 个账号，删除后这些账号将变为未分组状态。`
-      : `确定要删除分组「${name}」吗？`
+    const msg =
+      count > 0
+        ? `确定要删除分组「${name}」吗？\n该分组包含 ${count} 个账号，删除后这些账号将变为未分组状态。`
+        : `确定要删除分组「${name}」吗？`
     if (confirm(msg)) {
       removeGroup(id)
     }
@@ -91,12 +93,12 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
 
   // 获取可分配的账号列表
   const getAssignableAccounts = (groupId: string) => {
-    return Array.from(accounts.values()).filter(acc => acc.groupId !== groupId)
+    return Array.from(accounts.values()).filter((acc) => acc.groupId !== groupId)
   }
 
   // 获取分组内的账号列表
   const getGroupAccounts = (groupId: string) => {
-    return Array.from(accounts.values()).filter(acc => acc.groupId === groupId)
+    return Array.from(accounts.values()).filter((acc) => acc.groupId === groupId)
   }
 
   const groupList = Array.from(groups.values()).sort((a, b) => a.order - b.order)
@@ -104,31 +106,46 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
   if (!isOpen) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-[var(--overlay)]" onClick={onClose} />
 
-      <Card className="relative w-full max-w-2xl max-h-[85vh] overflow-hidden z-10 flex flex-col">
-        <CardHeader className="flex flex-row items-center justify-between pb-2 shrink-0">
-          <CardTitle className="flex items-center gap-2">
-            <FolderOpen className="h-5 w-5" />
-            {isEn ? 'Group Management' : '分组管理'}
-          </CardTitle>
-          <Button variant="ghost" size="icon" onClick={onClose} className="rounded-lg hover:bg-red-500 hover:text-white transition-colors">
-            <X className="h-4 w-4" />
-          </Button>
+      <Card
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="GroupManageDialog-title"
+        className="ui-dialog-panel rounded-dialog"
+      >
+        <CardHeader className="ui-dialog-header px-6 pt-5 pb-3 space-y-0">
+          <div className="flex items-center justify-between gap-2">
+            <CardTitle id="GroupManageDialog-title" className="text-title flex items-center gap-2">
+              <FolderOpen className="h-5 w-5" />
+              {isEn ? 'Group Management' : '分组管理'}
+            </CardTitle>
+            <Button
+              variant="ghost"
+              size="icon"
+              title={isEn ? 'Close' : '关闭'}
+              onClick={onClose}
+              className="rounded-control hover:bg-muted transition-colors"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
         </CardHeader>
 
-        <CardContent className="flex-1 overflow-auto space-y-4">
+        <CardContent className="ui-dialog-body p-0 px-6 pb-5 space-y-4">
           {/* 统计信息 */}
-          <div className="flex gap-4 text-sm text-muted-foreground">
+          <div className="flex gap-4 text-body text-muted-foreground">
             <span>{isEn ? `${groupList.length} groups` : `共 ${groupList.length} 个分组`}</span>
             <span>•</span>
-            <span>{isEn ? `${getUngroupedCount()} ungrouped` : `${getUngroupedCount()} 个未分组账号`}</span>
+            <span>
+              {isEn ? `${getUngroupedCount()} ungrouped` : `${getUngroupedCount()} 个未分组账号`}
+            </span>
           </div>
 
           {/* 新建分组 */}
           {isCreating ? (
-            <div className="p-4 border rounded-lg space-y-3 bg-muted/30">
+            <div className="p-4 border rounded-panel space-y-3 bg-muted/30">
               <div className="flex items-center gap-2">
                 <input
                   type="color"
@@ -141,7 +158,7 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                   placeholder={isEn ? 'Group name' : '分组名称'}
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
-                  className="flex-1 px-3 py-2 border rounded-lg text-sm"
+                  className="flex-1 px-2.5 py-1 border rounded-control text-body min-w-0 h-control"
                   autoFocus
                 />
               </div>
@@ -150,21 +167,21 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                 placeholder={isEn ? 'Description (optional)' : '分组描述（可选）'}
                 value={newDescription}
                 onChange={(e) => setNewDescription(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg text-sm"
+                className="w-full px-2.5 py-1 border rounded-control text-body min-w-0 h-control"
               />
               <div className="flex justify-end gap-2">
                 <Button variant="outline" size="sm" onClick={() => setIsCreating(false)}>
                   {isEn ? 'Cancel' : '取消'}
                 </Button>
                 <Button size="sm" onClick={handleCreate} disabled={!newName.trim()}>
-                  <Check className="h-4 w-4 mr-1" />
+                  <Check className="h-4 w-4 " />
                   {isEn ? 'Create' : '创建'}
                 </Button>
               </div>
             </div>
           ) : (
             <Button variant="outline" className="w-full" onClick={() => setIsCreating(true)}>
-              <Plus className="h-4 w-4 mr-2" />
+              <Plus className="h-4 w-4 " />
               {isEn ? 'New Group' : '新建分组'}
             </Button>
           )}
@@ -174,7 +191,7 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
             {groupList.map((group) => (
               <div
                 key={group.id}
-                className="p-3 border rounded-lg hover:bg-muted/30 transition-colors"
+                className="p-3 border rounded-panel hover:bg-muted/30 transition-colors"
               >
                 {editingId === group.id ? (
                   // 编辑模式
@@ -190,7 +207,7 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                         type="text"
                         value={editName}
                         onChange={(e) => setEditName(e.target.value)}
-                        className="flex-1 px-3 py-1.5 border rounded text-sm"
+                        className="flex-1 px-2.5 py-1.5 border rounded-control text-body min-w-0 h-control"
                         autoFocus
                       />
                     </div>
@@ -199,7 +216,7 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                       placeholder={isEn ? 'Description' : '分组描述'}
                       value={editDescription}
                       onChange={(e) => setEditDescription(e.target.value)}
-                      className="w-full px-3 py-1.5 border rounded text-sm"
+                      className="w-full px-2.5 py-1.5 border rounded-control text-body min-w-0 h-control"
                     />
                     <div className="flex justify-end gap-2">
                       <Button variant="outline" size="sm" onClick={() => setEditingId(null)}>
@@ -219,18 +236,20 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                         style={{ backgroundColor: group.color || '#3b82f6' }}
                       />
                       <span className="font-medium">{group.name}</span>
-                      <span className="text-sm text-muted-foreground">- 选择要添加的账号</span>
+                      <span className="text-body text-muted-foreground">- 选择要添加的账号</span>
                     </div>
-                    
+
                     {/* 当前分组内的账号 */}
                     {getGroupAccounts(group.id).length > 0 && (
                       <div className="space-y-1">
-                        <p className="text-xs text-muted-foreground">{isEn ? 'Accounts in this group:' : '当前分组内的账号：'}</p>
+                        <p className="text-caption text-muted-foreground">
+                          {isEn ? 'Accounts in this group:' : '当前分组内的账号：'}
+                        </p>
                         <div className="flex flex-wrap gap-1">
-                          {getGroupAccounts(group.id).map(acc => (
+                          {getGroupAccounts(group.id).map((acc) => (
                             <span
                               key={acc.id}
-                              className="inline-flex items-center gap-1 px-2 py-0.5 bg-primary/10 text-primary rounded text-xs"
+                              className="inline-flex items-center gap-1 h-5 px-[7px] bg-primary/10 text-primary rounded-full text-badge"
                             >
                               {acc.email}
                               <button
@@ -249,13 +268,15 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                     {/* 可添加的账号 */}
                     {getAssignableAccounts(group.id).length > 0 && (
                       <div className="space-y-1">
-                        <p className="text-xs text-muted-foreground">{isEn ? 'Click to add to this group:' : '点击添加到此分组：'}</p>
+                        <p className="text-caption text-muted-foreground">
+                          {isEn ? 'Click to add to this group:' : '点击添加到此分组：'}
+                        </p>
                         <div className="flex flex-wrap gap-1 max-h-32 overflow-auto">
-                          {getAssignableAccounts(group.id).map(acc => (
+                          {getAssignableAccounts(group.id).map((acc) => (
                             <button
                               key={acc.id}
                               onClick={() => handleAssignAccounts(group.id, [acc.id])}
-                              className="px-2 py-0.5 bg-muted hover:bg-primary/20 rounded text-xs transition-colors"
+                              className="inline-flex items-center h-5 px-[7px] bg-muted hover:bg-primary/20 rounded-full text-badge transition-colors"
                             >
                               {acc.email}
                             </button>
@@ -280,13 +301,15 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <span className="font-medium truncate">{group.name}</span>
-                        <span className="text-xs text-muted-foreground flex items-center gap-1">
+                        <span className="text-caption text-muted-foreground flex items-center gap-1">
                           <Users className="h-3 w-3" />
                           {getGroupAccountCount(group.id)}
                         </span>
                       </div>
                       {group.description && (
-                        <p className="text-xs text-muted-foreground truncate">{group.description}</p>
+                        <p className="text-caption text-muted-foreground truncate">
+                          {group.description}
+                        </p>
                       )}
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
@@ -327,7 +350,11 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
               <div className="text-center py-8 text-muted-foreground">
                 <FolderOpen className="h-12 w-12 mx-auto mb-2 opacity-50" />
                 <p>{isEn ? 'No groups' : '暂无分组'}</p>
-                <p className="text-sm">{isEn ? 'Click the button above to create your first group' : '点击上方按钮创建第一个分组'}</p>
+                <p className="text-body">
+                  {isEn
+                    ? 'Click the button above to create your first group'
+                    : '点击上方按钮创建第一个分组'}
+                </p>
               </div>
             )}
           </div>

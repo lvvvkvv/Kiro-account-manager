@@ -11,11 +11,7 @@ interface EditAccountDialogProps {
   account: Account | null
 }
 
-export function EditAccountDialog({
-  open,
-  onOpenChange,
-  account
-}: EditAccountDialogProps) {
+export function EditAccountDialog({ open, onOpenChange, account }: EditAccountDialogProps) {
   const { updateAccount } = useAccountsStore()
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -36,7 +32,7 @@ export function EditAccountDialog({
     accessToken: string
     subscriptionType: string
     subscriptionTitle: string
-    usage: { 
+    usage: {
       current: number
       limit: number
       baseLimit?: number
@@ -72,7 +68,7 @@ export function EditAccountDialog({
       setClientSecret(account.credentials.clientSecret || '')
       setRegion(account.credentials.region || 'us-east-1')
       setNickname(account.nickname || '')
-      
+
       // 设置当前账号信息
       setAccountInfo({
         email: account.email,
@@ -188,9 +184,8 @@ export function EditAccountDialog({
       usage: {
         current: accountInfo.usage.current,
         limit: accountInfo.usage.limit,
-        percentUsed: accountInfo.usage.limit > 0 
-          ? accountInfo.usage.current / accountInfo.usage.limit 
-          : 0,
+        percentUsed:
+          accountInfo.usage.limit > 0 ? accountInfo.usage.current / accountInfo.usage.limit : 0,
         lastUpdated: now,
         baseLimit: accountInfo.usage.baseLimit,
         baseCurrent: accountInfo.usage.baseCurrent,
@@ -209,50 +204,83 @@ export function EditAccountDialog({
   if (!open || !account) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-[var(--overlay)]" onClick={() => onOpenChange(false)} />
 
-      <Card className="relative w-full max-w-lg max-h-[90vh] overflow-auto z-10 animate-in zoom-in-95 duration-200">
+      <Card
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="EditAccountDialog-title"
+        className="ui-dialog-panel rounded-dialog"
+      >
         {/* 头部 */}
-        <CardHeader className="pb-4 border-b sticky top-0 bg-background z-20">
+        <CardHeader className="ui-dialog-header px-6 pt-5 pb-3 space-y-0">
           <div className="flex items-center justify-between">
-            <CardTitle className="text-xl font-bold">{isEn ? 'Edit Account' : '编辑账号'}</CardTitle>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-red-500 hover:text-white transition-colors" onClick={() => onOpenChange(false)}>
+            <CardTitle id="EditAccountDialog-title" className="text-title font-semibold">
+              {isEn ? 'Edit Account' : '编辑账号'}
+            </CardTitle>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 rounded-control hover:bg-muted transition-colors"
+              onClick={() => onOpenChange(false)}
+              title={isEn ? 'Close' : '关闭'}
+            >
               <X className="h-4 w-4" />
             </Button>
           </div>
-          <p className="text-sm text-muted-foreground mt-1">{isEn ? 'Modify account settings or update credentials' : '修改账号配置或更新凭证'}</p>
+          <p className="text-body text-muted-foreground">
+            {isEn ? 'Modify account settings or update credentials' : '修改账号配置或更新凭证'}
+          </p>
         </CardHeader>
 
-        <CardContent className="p-6 space-y-6">
+        <CardContent className="ui-dialog-body p-0 px-6 pb-5 space-y-4">
           {/* 当前账号信息 */}
           {accountInfo && (
-            <div className="p-4 bg-primary/5 rounded-xl border border-primary/10 space-y-3">
+            <div className="p-4 bg-primary/5 rounded-panel border border-primary/10 space-y-3">
               <div className="flex items-center justify-between border-b border-primary/10 pb-2">
-                <span className="text-sm font-semibold text-foreground/80">{isEn ? 'Account Status' : '当前账号状态'}</span>
-                <div className="px-2.5 py-0.5 rounded-full bg-success/10 text-success text-xs font-medium flex items-center gap-1.5">
+                <span className="text-body font-semibold text-foreground/80">
+                  {isEn ? 'Account Status' : '当前账号状态'}
+                </span>
+                <div className="h-5 px-[7px] rounded-full bg-success/10 text-success text-badge font-medium flex items-center gap-1.5">
                   <CheckCircle className="h-3.5 w-3.5" />
                   {isEn ? 'Verified' : '已验证'}
                 </div>
               </div>
-              <div className="grid grid-cols-2 gap-4 text-sm">
+              <div className="grid grid-cols-2 gap-4 text-body">
                 <div>
-                  <span className="text-muted-foreground text-xs block mb-1">{isEn ? 'Email' : '邮箱'}</span>
-                  <span className="font-medium font-mono text-xs truncate block" title={accountInfo.email}>{accountInfo.email}</span>
-                </div>
-                <div>
-                  <span className="text-muted-foreground text-xs block mb-1">{isEn ? 'Plan' : '订阅计划'}</span>
-                  <span className="font-medium">{accountInfo.subscriptionTitle}</span>
-                </div>
-                <div>
-                  <span className="text-muted-foreground text-xs block mb-1">{isEn ? 'Usage' : '使用额度'}</span>
-                  <span className="font-medium">
-                    {accountInfo.usage.current.toLocaleString()} / {accountInfo.usage.limit.toLocaleString()}
+                  <span className="text-muted-foreground text-caption block mb-1">
+                    {isEn ? 'Email' : '邮箱'}
+                  </span>
+                  <span
+                    className="font-medium font-mono text-caption truncate block"
+                    title={accountInfo.email}
+                  >
+                    {accountInfo.email}
                   </span>
                 </div>
                 <div>
-                  <span className="text-muted-foreground text-xs block mb-1">{isEn ? 'Days Left' : '剩余天数'}</span>
-                  <span className="font-medium">{accountInfo.daysRemaining ?? '-'} {isEn ? 'd' : '天'}</span>
+                  <span className="text-muted-foreground text-caption block mb-1">
+                    {isEn ? 'Plan' : '订阅计划'}
+                  </span>
+                  <span className="font-medium">{accountInfo.subscriptionTitle}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground text-caption block mb-1">
+                    {isEn ? 'Usage' : '使用额度'}
+                  </span>
+                  <span className="font-medium">
+                    {accountInfo.usage.current.toLocaleString()} /{' '}
+                    {accountInfo.usage.limit.toLocaleString()}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground text-caption block mb-1">
+                    {isEn ? 'Days Left' : '剩余天数'}
+                  </span>
+                  <span className="font-medium">
+                    {accountInfo.daysRemaining ?? '-'} {isEn ? 'd' : '天'}
+                  </span>
                 </div>
               </div>
             </div>
@@ -260,13 +288,13 @@ export function EditAccountDialog({
 
           {/* 别名 */}
           <div className="space-y-2">
-            <label className="text-sm font-medium">{isEn ? 'Nickname' : '账号别名'}</label>
+            <label className="text-body font-medium">{isEn ? 'Nickname' : '账号别名'}</label>
             <input
               type="text"
               value={nickname}
               onChange={(e) => setNickname(e.target.value)}
               placeholder={isEn ? 'Give this account a memorable name' : '给这个账号起个好记的名字'}
-              className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+              className="w-full h-control px-2.5 py-1 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 min-w-0"
             />
           </div>
 
@@ -274,32 +302,40 @@ export function EditAccountDialog({
           <div className="space-y-5 pt-2">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <h3 className="text-sm font-semibold">
-                  {account?.credentials.authMethod === 'social' ? (isEn ? 'Social Login' : '社交登录凭证') : (isEn ? 'OIDC Credentials' : 'OIDC 凭证配置')}
+                <h3 className="text-body font-semibold">
+                  {account?.credentials.authMethod === 'social'
+                    ? isEn
+                      ? 'Social Login'
+                      : '社交登录凭证'
+                    : isEn
+                      ? 'OIDC Credentials'
+                      : 'OIDC 凭证配置'}
                 </h3>
                 {account?.credentials.authMethod === 'social' && (
-                  <span className="px-2 py-0.5 text-xs rounded-full bg-primary/10 text-primary">
+                  <span className="inline-flex h-5 items-center px-[7px] text-badge rounded-full bg-primary/10 text-primary">
                     {account?.credentials.provider || account?.idp}
                   </span>
                 )}
               </div>
               {account?.credentials.authMethod !== 'social' && (
-                <Button 
-                  type="button" 
-                  variant="outline" 
+                <Button
+                  type="button"
+                  variant="outline"
                   size="sm"
-                  className="h-8 rounded-lg text-xs"
+                  className="rounded-control text-body"
                   onClick={handleImportFromLocal}
                 >
-                  <Download className="h-3 w-3 mr-1.5" />
+                  <Download className="h-3 w-3 " />
                   {isEn ? 'Import Local' : '从本地导入'}
                 </Button>
               )}
             </div>
 
             {account?.credentials.authMethod === 'social' && (
-              <p className="text-xs text-muted-foreground">
-                {isEn ? 'Social login only needs Refresh Token' : '社交登录账号只需要 Refresh Token，不需要 Client ID 和 Client Secret'}
+              <p className="text-caption text-muted-foreground">
+                {isEn
+                  ? 'Social login only needs Refresh Token'
+                  : '社交登录账号只需要 Refresh Token，不需要 Client ID 和 Client Secret'}
               </p>
             )}
 
@@ -308,33 +344,37 @@ export function EditAccountDialog({
               {accountInfo?.accessToken && (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <label className="text-sm font-medium">Access Token</label>
+                    <label className="text-body font-medium">Access Token</label>
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
-                      className="h-7 px-2 text-xs"
+                      className="h-7 px-3 text-body"
                       onClick={handleCopyAccessToken}
                     >
-                      {copiedToken ? <Check className="h-3 w-3 mr-1 text-success" /> : <Copy className="h-3 w-3 mr-1" />}
-                      {copiedToken ? (isEn ? 'Copied' : '已复制') : (isEn ? 'Copy' : '复制')}
+                      {copiedToken ? (
+                        <Check className="h-3 w-3 text-success" />
+                      ) : (
+                        <Copy className="h-3 w-3 " />
+                      )}
+                      {copiedToken ? (isEn ? 'Copied' : '已复制') : isEn ? 'Copy' : '复制'}
                     </Button>
                   </div>
-                  <div className="w-full px-3 py-2.5 text-sm rounded-xl border border-input bg-muted/50 font-mono text-muted-foreground truncate">
+                  <div className="w-full px-3 py-2.5 text-body rounded-panel border border-input bg-muted/50 font-mono text-muted-foreground truncate">
                     {accountInfo.accessToken.slice(0, 50)}...
                   </div>
                 </div>
               )}
 
               <div className="space-y-2">
-                <label className="text-sm font-medium">
+                <label className="text-body font-medium">
                   Refresh Token <span className="text-destructive">*</span>
                 </label>
                 <textarea
                   value={refreshToken}
                   onChange={(e) => setRefreshToken(e.target.value)}
                   placeholder="aorAAAAA..."
-                  className="w-full min-h-[80px] px-3 py-2.5 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono"
+                  className="w-full min-h-[80px] px-2.5 py-1.5 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono min-w-0"
                 />
               </div>
 
@@ -342,7 +382,7 @@ export function EditAccountDialog({
                 <>
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">
+                      <label className="text-body font-medium">
                         Client ID <span className="text-destructive">*</span>
                       </label>
                       <input
@@ -350,12 +390,12 @@ export function EditAccountDialog({
                         value={clientId}
                         onChange={(e) => setClientId(e.target.value)}
                         placeholder="Client ID"
-                        className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                        className="w-full h-control px-2.5 py-1 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 font-mono min-w-0"
                       />
                     </div>
 
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">
+                      <label className="text-body font-medium">
                         Client Secret <span className="text-destructive">*</span>
                       </label>
                       <input
@@ -363,17 +403,17 @@ export function EditAccountDialog({
                         value={clientSecret}
                         onChange={(e) => setClientSecret(e.target.value)}
                         placeholder="Client Secret"
-                        className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                        className="w-full h-control px-2.5 py-1 text-body rounded-control border border-input bg-card ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 font-mono min-w-0"
                       />
                     </div>
                   </div>
 
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">AWS Region</label>
+                    <label className="text-body font-medium">AWS Region</label>
                     <select
                       value={region}
                       onChange={(e) => setRegion(e.target.value)}
-                      className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                      className="w-full h-control px-2.5 py-1 text-body rounded-control border border-input bg-card ring-offset-background focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/20 focus-visible:ring-offset-0 min-w-0"
                     >
                       <option value="us-east-1">us-east-1 (N. Virginia)</option>
                       <option value="us-west-2">us-west-2 (Oregon)</option>
@@ -383,17 +423,21 @@ export function EditAccountDialog({
                 </>
               )}
 
-              <Button 
-                type="button" 
+              <Button
+                type="button"
                 variant="secondary"
-                className="w-full h-10 rounded-xl font-medium"
+                className="w-full h-control rounded-control font-medium"
                 onClick={handleVerifyAndRefresh}
-                disabled={isVerifying || !refreshToken || (account?.credentials.authMethod !== 'social' && (!clientId || !clientSecret))}
+                disabled={
+                  isVerifying ||
+                  !refreshToken ||
+                  (account?.credentials.authMethod !== 'social' && (!clientId || !clientSecret))
+                }
               >
                 {isVerifying ? (
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  <Loader2 className="h-4 w-4 animate-spin" />
                 ) : (
-                  <RefreshCw className="h-4 w-4 mr-2" />
+                  <RefreshCw className="h-4 w-4 " />
                 )}
                 {isEn ? 'Verify & Refresh' : '验证并刷新凭证信息'}
               </Button>
@@ -402,7 +446,7 @@ export function EditAccountDialog({
 
           {/* 错误信息 */}
           {error && (
-            <div className="p-3 bg-destructive/10 text-destructive rounded-xl text-sm flex items-center gap-2 animate-in fade-in slide-in-from-top-2">
+            <div className="p-3 bg-destructive/10 text-destructive rounded-panel text-body flex items-center gap-2 animate-in fade-in slide-in-">
               <div className="w-1.5 h-1.5 rounded-full bg-destructive shrink-0" />
               {error}
             </div>
@@ -410,11 +454,19 @@ export function EditAccountDialog({
         </CardContent>
 
         {/* 底部按钮 */}
-        <div className="sticky bottom-0 bg-background/95 backdrop-blur p-4 border-t flex justify-end gap-3 z-20">
-          <Button variant="outline" onClick={() => onOpenChange(false)} className="rounded-xl h-10 px-6">
+        <div className="ui-dialog-footer">
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            className="rounded-control h-control px-3.5"
+          >
             {isEn ? 'Cancel' : '取消'}
           </Button>
-          <Button onClick={handleSave} disabled={!accountInfo} className="rounded-xl h-10 px-6">
+          <Button
+            onClick={handleSave}
+            disabled={!accountInfo}
+            className="rounded-control h-control px-3.5"
+          >
             {isEn ? 'Save Changes' : '保存更改'}
           </Button>
         </div>
@@ -422,5 +474,3 @@ export function EditAccountDialog({
     </div>
   )
 }
-
-

@@ -13,13 +13,13 @@ interface AccountGridProps {
 }
 
 // 卡片高度（包含间距）- 需要足够容纳有多个奖励的 PRO 账号
-const CARD_HEIGHT = 340
+const CARD_HEIGHT = 420
 // 卡片最小宽度（小于该宽度自动减少列数）
 const MIN_CARD_WIDTH = 300
 // 卡片间距
 const GAP = 16
-// 内部 px-1 (4px*2 = 8px) 给 box-shadow 留 buffer
-const PADDING_X = 8
+// 内部 px-1 (4px*2 = 8px) 容器横向内距
+const PADDING_X = 0
 
 export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): React.ReactNode {
   const parentRef = useRef<HTMLDivElement>(null)
@@ -51,14 +51,8 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
     return () => resizeObserver.disconnect()
   }, [])
 
-  const {
-    getFilteredAccounts,
-    tags,
-    groups,
-    selectedIds,
-    toggleSelection,
-    checkAccountStatus
-  } = useAccountsStore()
+  const { getFilteredAccounts, tags, groups, selectedIds, toggleSelection, checkAccountStatus } =
+    useAccountsStore()
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
@@ -73,7 +67,7 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
       await checkAccountStatus(detailAccount.id)
       // 刷新后重新获取账号数据
       const accounts = getFilteredAccounts()
-      const updated = accounts.find(a => a.id === detailAccount.id)
+      const updated = accounts.find((a) => a.id === detailAccount.id)
       if (updated) setDetailAccount(updated)
     } finally {
       setIsRefreshing(false)
@@ -102,14 +96,10 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
   const items = virtualizer.getVirtualItems()
 
   return (
-    <div
-      ref={parentRef}
-      className="h-full overflow-auto"
-      style={{ contain: 'strict' }}
-    >
+    <div ref={parentRef} className="h-full overflow-auto" style={{ contain: 'strict' }}>
       <div
         style={{
-          height: `${virtualizer.getTotalSize() + 8}px`,
+          height: `${virtualizer.getTotalSize()}px`,
           width: '100%',
           position: 'relative'
         }}
@@ -126,25 +116,29 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
                 left: 0,
                 width: '100%',
                 height: `${virtualRow.size}px`,
-                transform: `translateY(${virtualRow.start + 8}px)` // +8px 为标签光环留空间
+                transform: `translateY(${virtualRow.start}px)` // 与虚拟行起点一致
               }}
             >
-              <div className="flex gap-4 items-start px-1">
-                {row.map((item) => 
+              <div className="flex gap-4 items-start">
+                {row.map((item) =>
                   item === 'add' ? (
                     <div
                       key="add-button"
-                      className="flex items-center justify-center border-2 border-dashed border-muted-foreground/20 rounded-xl cursor-pointer hover:border-primary/50 hover:bg-primary/5 transition-colors flex-shrink-0"
+                      className="flex items-center justify-center border border-dashed border-muted-foreground/20 rounded-panel cursor-pointer hover:border-primary/50 hover:bg-primary/5 transition-colors flex-shrink-0"
                       style={{ width: cardWidth, height: CARD_HEIGHT - GAP }}
                       onClick={onAddAccount}
                     >
                       <div className="flex flex-col items-center gap-2 text-muted-foreground">
                         <Plus className="h-8 w-8" />
-                        <span className="text-sm">{isEn ? 'Add Account' : '添加账号'}</span>
+                        <span className="text-body">{isEn ? 'Add Account' : '添加账号'}</span>
                       </div>
                     </div>
                   ) : (
-                    <div key={item.id} className="flex-shrink-0" style={{ width: cardWidth, height: CARD_HEIGHT - GAP }}>
+                    <div
+                      key={item.id}
+                      className="flex-shrink-0"
+                      style={{ width: cardWidth, height: CARD_HEIGHT - GAP }}
+                    >
                       <AccountCard
                         account={item}
                         tags={tags}
@@ -169,7 +163,7 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
           <div className="text-center">
             <p className="text-muted-foreground mb-4">{isEn ? 'No accounts yet' : '暂无账号'}</p>
             <button
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:bg-primary/90"
+              className="inline-flex h-control items-center gap-1.5 px-3.5 rounded-control bg-primary text-primary-foreground hover:bg-primary/90"
               onClick={onAddAccount}
             >
               <Plus className="h-4 w-4" />

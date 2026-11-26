@@ -23,4 +23,4 @@
 
 ## Impact
 
-未来涉及 `Kiro-account-manager/src/renderer/src/components/accounts/`。`ExportDialog` 在本成员统一调整，设置页继续复用；003 不修改代理池页面、订阅页、store、登录 API、凭据结构或文件解析规则。保留清单 A01～A07；本轮仅规划。
+本次涉及 `Kiro-account-manager/src/renderer/src/components/accounts/`。`ExportDialog` 在本成员统一调整，设置页继续复用；003 不修改代理池页面、订阅页、store、登录 API、凭据结构或文件解析规则。保留清单 A01～A07；本次经用户授权实施，结果见 implementation.md。

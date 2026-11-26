@@ -1,0 +1,106 @@
+{
+  "AccountCard.tsx": {
+    "handleClearSuspended": "96e8e786be86330e060aa5b9af6d5b52d762e69c4e0b6e9060ba1246f32e836c",
+    "handleSwitch": "25de7fda8b5478c8a6007d7b30ce5033fe0d8659f4412d77051a31942995aeae",
+    "handleRefresh": "a984e5dc612e727ca66a11054410bf1aa9ec1081363d84915522b130bc325b0a",
+    "handleLogout": "30f2d149362fc7d132e62cfeb7e82c597eb4f4205ae501487c8145840e0fcb34",
+    "handleRefreshToken": "350eaa670523df5a852d2c4d7c1048f3773a08eb2e61b176880b7d1d6e37eb57",
+    "handleDelete": "91b1e58b26d2a91c4902ce8926289fe1189cc6491aa03ba058d6c22db835f784",
+    "handleCopyCredentials": "f9cc01e89953fc224121fb74dadfaecc869a57cc1bbe3a35e313808ab7d4e7ea",
+    "handleSubscriptionClick": "9a9876c35f40560622a93db3e9428a2e43bb6aa00a43ea9f94bce7a2e32eff02",
+    "handleSelectPlan": "53d8ccc62f89c4dc12e726ac56633f9b201634ab667593e44fe9f429ab13629b",
+    "handleManageSubscription": "bb485168a99a65a0226cefcc021dc0338047dc8799edeffed31f57d212ee9245"
+  },
+  "AccountDetailDialog.tsx": {
+    "effect-0": "d14d9cfa90394bcb2bc1a41e5a06f77c2081bd18045a8219cd58013e631bd1c5"
+  },
+  "AccountFilter.tsx": {
+    "toggleArrayFilter": "238ef030479f4bbcaca718787df1acd182e3810f9108759dd5beeee9e26e496f",
+    "setRangeFilter": "0acb900152a7fa95c260a028e31a9dfec40c5ee9df507a67758e9d2c36791f3d"
+  },
+  "AccountGrid.tsx": {
+    "effect-0": "c421a5434479620ca7d266d1d9f15d124ade51d67814df086db12c422a2c3cb2",
+    "handleShowDetail": "e96bb38f77d11795a69092c9faf5a2176bf5cec1d59736e8749bdbd4eae2eacf",
+    "handleRefreshDetail": "152755ddbdb7d9cab5d919230fb8fc52dbfaf2532ff86ee74667b0eba4f95245"
+  },
+  "AccountList.tsx": {
+    "handleShowDetail": "e96bb38f77d11795a69092c9faf5a2176bf5cec1d59736e8749bdbd4eae2eacf",
+    "handleRefreshDetail": "fed2d8c755e2b26ea56769206c1002b6f2bc850310ca3604731918c5fd86254d"
+  },
+  "AccountListRow.tsx": {
+    "handleSwitch": "0f2178497af00e61193262f7734e629041f473e24dbe27959745e503836fac5a",
+    "handleRefresh": "796ae6f1641896d394af191dbcfd5db8cbd5718cc213e4e31fb1c9a7de0b5f05",
+    "handleDelete": "c2c5bb9d6a516dfad3936ef63c2e4fc1552b48cf95039fe7338ba0bbab070a35",
+    "handleLogout": "962121b516b17bad46f19039dbdd4e64c9ff9cec58ceae6350f25ca77d2665f1",
+    "handleClearSuspended": "d92d33c7730c246185cc09fc87d7b9c757653de3bda23ae4a59e01ad07fbc3cd",
+    "handleCopyEmail": "a06dad2e9a33bb8877cfed116c3f62b47df3e5202cb256ff479c92f61b23d9be"
+  },
+  "AccountManager.tsx": {
+    "effect-0": "18da997957b13c14e4ae2a473f3106f3ae9dd27273c13915471e6df44f6230fb",
+    "getExportAccounts": "12c6bb08f2166fa63d1658431b1a8d10f0f292235e373fcb74a104583f276ecb",
+    "handleExport": "a5a0d7847b126615adff42f6337978e2bddc3f77f9ad5ab4155e9fb5d0026c27",
+    "parseCSVLine": "c4a73057411435c4f32910b3bc98b8a28797ceac87b0dd4a687377688215c5f7",
+    "handleImport": "3606448184b094b207f14f5b30e3480eaa3f140f38cfbbc4f0cb8c9679267c8b",
+    "handleManageGroups": "0e76c20aa088d686c2866a4aff01c9258283f396ebd98444244a996d2ff15e02",
+    "handleManageTags": "38cd886b24deecf669b9bfa092f520e5a7a325c3d6da0faf1f975a9a4056f874",
+    "handleEditAccount": "ee2717fbb795ef154bcf3eaecb8a39f612f4796a63b7938cf19abfe3ebdcbcd5"
+  },
+  "AccountToolbar.tsx": {
+    "effect-0": "5afe00beb56bc0632874f5d1e3a17fea230d71853292360364a19985e4249137",
+    "handleClickOutside": "d32d1190ca6207c828513f5f8bf883ce9742f6059d5a44c68e17d2dbe976377a",
+    "handleBindToProxy": "c04d5270d6012859752e2ebed0f83be76a1b5b98e362ca171d0319c313df4b96",
+    "handleUnbindAllSelected": "248d5812394a53469b4f2eb2129a015b06997bb14dc8c4f8388cca74274306ae",
+    "handleMoveToGroup": "2debd829335bd9e2db5f409f72c9e3b17aeea74af78c871d5321c6212f612090",
+    "handleAddTag": "6ccff15e656463a204b1e17c7d96aeacd48a393f446f26e5860b266585700b85",
+    "handleRemoveTag": "8fc707452ba4bea8beee7f3b7eaf5b866ec4c0405fe3a785288220a1d33548b3",
+    "handleToggleTag": "db576096a8bad5208123ada726219c8a3e116fa544cbd2e3667be72cffa0780e",
+    "handleSearch": "b17714466ab24e8babf496798e02706b7bbd758ac9d3563e703ef1916313a30b",
+    "handleBatchRefresh": "20bf511776f4818b50021d3ff1f9f93dde98c0bea8f28330f7bd61f4670e1414",
+    "handleBatchCheck": "aac35ce5858b93c459cfa4274d307b464dc49704eb08d0f8df5108b5c1405501",
+    "handleBatchLiveness": "be74b65f2dbe03f9249b6f8bb2a6da0c2ee2bc7d0c1391b2aae85abd859be4f9",
+    "handleBatchDelete": "c5a5730ded8f75186b95441c1dd96da881829683d5b3596681280cede022898d",
+    "handleToggleSelectAll": "52375c6c61ea1aa1f9b9c7e43dbf937c683a01d8154ddcb78fc7b02e26cbe1f0"
+  },
+  "AddAccountDialog.tsx": {
+    "isAccountExists": "e788ae5a67a4082aeec3856e8efaa63ba19d4c79ee5c89d91a33b03819f9dcdf",
+    "effect-0": "45505db72ae1ef5351e2c85f8762d066e35172679fd1ee3da949f01bc8ff2893",
+    "effect-1": "0800703e103ab0a23ca1636814df0863334fcf8a961aded7843c28b53d2c3848",
+    "effect-2": "668d1d98b587e728df6a7159d85d2b989f6440e9dbc14b2c978560476250871a",
+    "handleLoginSuccess": "e1cedbb3b333d48c6efda32cc7218635a8f59d3a03a962be6d673f6337117e57",
+    "handleStartBuilderIdLogin": "7caf901b45a1605326ffd5f63079abf6bef60806b1dccbff6319762017e51ee6",
+    "handleStartIamSsoLogin": "5318e2d160c9d633d70195847fe2ad7d50b9fae18427c25589fcb4b8e870e0d1",
+    "startIamSsoPolling": "0b70bf31803d4713fb0b68fe6d2ddd25bdce05fa5ca958c12e61c108db866aac",
+    "startPolling": "0411f9cf3e559c83718c9a4dabd6e17560a07d8372abe0e1726458df81697d8e",
+    "handleCancelLogin": "a184de07a2b4713bf132ee37effbcc876062764c736e7e5fd680165421e507f8",
+    "handleStartSocialLogin": "d723e8b3a997c8cff2f7b226c64399cd998a28514a631711a8f5d633796091d4",
+    "handleCopyUserCode": "804c423b1580f1f44af333cf814a66f83d4aa2ba17db5727385d4acc1a55b937",
+    "handleImportFromLocal": "e4cc61ca404c805f11dd53736f75cf793fd71b52b53d9810b5dd7f11c11a73a5",
+    "handleSsoImport": "ef1dbccd23c708e550c820e8485c3f3ddf143d5f8f2797ff8f1d5d84fc60f480",
+    "handleOidcBatchAdd": "f362852f83dae76de1b35076ee943f51af927f1b0828013cbe6822c95ab488a7",
+    "handleOidcAdd": "5188ecc53fadd3b50af2873d96db7cddac24e39a92fc3a6e36ca6b66b11e143a"
+  },
+  "EditAccountDialog.tsx": {
+    "handleCopyAccessToken": "ccd03d0a0d57aab9f52cb6456504ba754d78572ffd5596e9c4e38410335ed4e9",
+    "effect-0": "fac187f81f0fdad94b4ff562ac200bd22950d1c976667a17b7b8cb3e378ee60b",
+    "handleImportFromLocal": "449a95a33b9096dcc6e539b87f618d414d802d5ec764310d6890ac1146c571d9",
+    "handleVerifyAndRefresh": "869f974ca4e67569005d41170339b05a5853d24368b62248a1ba11bf3c7191a0",
+    "handleSave": "ad713cbdba5a2aa4a7e776470c57a6800a1cd5fb24e7bb9b603cc6e937772c4c"
+  },
+  "ExportDialog.tsx": {
+    "generateContent": "174009167ccebeefad5888a576dde709c801504e3dbf50e23eea3e9f5d33eb77",
+    "handleExport": "887cb96096a4fe0a9e6a2495a60398714700693ca92152fcb66542cb7de02efb"
+  },
+  "GroupManageDialog.tsx": {
+    "handleCreate": "f911f26bad00e33f1920685c1dcf6194a951dd68b70ade0916b742ba1a447f7d",
+    "handleStartEdit": "4cfb9284dbe52e2a29e489fb005c8a0b7ebf91e033c84011857078fd45b46557",
+    "handleSaveEdit": "e3d84e4aa7ef90566481ca37e8720987cfe9b42a839b5c95d87bcc3e52856dc3",
+    "handleDelete": "f6a32008384dced52eabd19b5b152db60c1a75bf3f73425c1ff5fae4bcc3adec",
+    "handleAssignAccounts": "514ada3b987c56ec97fec918f041577458ae78aacda6f2fc33b890f1c8edcfa8"
+  },
+  "TagManageDialog.tsx": {
+    "handleCreate": "d5a7a3c7c1bbe11f762dd30323eb3cd33c34e19c0a8c227a6d1171c43376867e",
+    "handleStartEdit": "f21b1175fc21753ef91c7df321ab8bba5fb3fab6bc57bb8f0d4bf5812796130b",
+    "handleSaveEdit": "1d25cf0834a9555c7fe0dfc6ad60b3c4e0694a552752339414c0189d2b8d1a4f",
+    "handleDelete": "2a354807f8b29beeebbd17d0f13ce57b3b95ae4b92c6779b10bf3305eb2777f8"
+  }
+}

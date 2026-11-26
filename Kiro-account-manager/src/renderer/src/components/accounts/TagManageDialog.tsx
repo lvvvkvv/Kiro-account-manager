@@ -25,7 +25,7 @@ const PRESET_COLORS = [
   { name: '浅红', value: '#80ef4444' },
   { name: '浅绿', value: '#8022c55e' },
   { name: '浅蓝', value: '#803b82f6' },
-  { name: '浅紫', value: '#808b5cf6' },
+  { name: '浅紫', value: '#808b5cf6' }
 ]
 
 // 解析 ARGB 颜色
@@ -57,7 +57,8 @@ function toRgba(argbColor: string): string {
 }
 
 export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): React.ReactNode {
-  const { tags, accounts, addTag, updateTag, removeTag, addTagToAccounts, removeTagFromAccounts } = useAccountsStore()
+  const { tags, accounts, addTag, updateTag, removeTag, addTagToAccounts, removeTagFromAccounts } =
+    useAccountsStore()
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
@@ -78,12 +79,12 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
 
   // 获取标签的账号数量
   const getTagAccountCount = (tagId: string): number => {
-    return Array.from(accounts.values()).filter(acc => acc.tags.includes(tagId)).length
+    return Array.from(accounts.values()).filter((acc) => acc.tags.includes(tagId)).length
   }
 
   // 获取未标记的账号数量
   const getUntaggedCount = (): number => {
-    return Array.from(accounts.values()).filter(acc => acc.tags.length === 0).length
+    return Array.from(accounts.values()).filter((acc) => acc.tags.length === 0).length
   }
 
   // 创建标签
@@ -123,9 +124,10 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
   // 删除标签
   const handleDelete = (id: string, name: string) => {
     const count = getTagAccountCount(id)
-    const msg = count > 0
-      ? `确定要删除标签「${name}」吗？\n该标签已应用于 ${count} 个账号，删除后将从这些账号移除。`
-      : `确定要删除标签「${name}」吗？`
+    const msg =
+      count > 0
+        ? `确定要删除标签「${name}」吗？\n该标签已应用于 ${count} 个账号，删除后将从这些账号移除。`
+        : `确定要删除标签「${name}」吗？`
     if (confirm(msg)) {
       removeTag(id)
     }
@@ -133,12 +135,12 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
 
   // 获取带有此标签的账号列表
   const getTaggedAccounts = (tagId: string) => {
-    return Array.from(accounts.values()).filter(acc => acc.tags.includes(tagId))
+    return Array.from(accounts.values()).filter((acc) => acc.tags.includes(tagId))
   }
 
   // 获取可添加此标签的账号列表
   const getUntaggedByTag = (tagId: string) => {
-    return Array.from(accounts.values()).filter(acc => !acc.tags.includes(tagId))
+    return Array.from(accounts.values()).filter((acc) => !acc.tags.includes(tagId))
   }
 
   const tagList = Array.from(tags.values())
@@ -146,33 +148,48 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
   if (!isOpen) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-[var(--overlay)]" onClick={onClose} />
 
-      <Card className="relative w-full max-w-2xl max-h-[85vh] overflow-hidden z-10 flex flex-col">
-        <CardHeader className="flex flex-row items-center justify-between pb-2 shrink-0">
-          <CardTitle className="flex items-center gap-2">
-            <Tag className="h-5 w-5" />
-            {isEn ? 'Tag Management' : '标签管理'}
-          </CardTitle>
-          <Button variant="ghost" size="icon" onClick={onClose} className="rounded-lg hover:bg-red-500 hover:text-white transition-colors">
-            <X className="h-4 w-4" />
-          </Button>
+      <Card
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="TagManageDialog-title"
+        className="ui-dialog-panel rounded-dialog"
+      >
+        <CardHeader className="ui-dialog-header px-6 pt-5 pb-3 space-y-0">
+          <div className="flex items-center justify-between gap-2">
+            <CardTitle id="TagManageDialog-title" className="text-title flex items-center gap-2">
+              <Tag className="h-5 w-5" />
+              {isEn ? 'Tag Management' : '标签管理'}
+            </CardTitle>
+            <Button
+              variant="ghost"
+              size="icon"
+              title={isEn ? 'Close' : '关闭'}
+              onClick={onClose}
+              className="rounded-control hover:bg-muted transition-colors"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
         </CardHeader>
 
-        <CardContent className="flex-1 overflow-auto space-y-4">
+        <CardContent className="ui-dialog-body p-0 px-6 pb-5 space-y-4">
           {/* 统计信息 */}
-          <div className="flex gap-4 text-sm text-muted-foreground">
+          <div className="flex gap-4 text-body text-muted-foreground">
             <span>{isEn ? `${tagList.length} tags` : `共 ${tagList.length} 个标签`}</span>
             <span>•</span>
-            <span>{isEn ? `${getUntaggedCount()} untagged` : `${getUntaggedCount()} 个未标记账号`}</span>
+            <span>
+              {isEn ? `${getUntaggedCount()} untagged` : `${getUntaggedCount()} 个未标记账号`}
+            </span>
           </div>
 
           {/* 新建标签 */}
           {isCreating ? (
-            <div className="p-4 border rounded-lg space-y-3 bg-muted/30">
+            <div className="p-4 border rounded-panel space-y-3 bg-muted/30">
               <div className="flex items-center gap-2">
-                <div 
+                <div
                   className="w-8 h-8 rounded border cursor-pointer flex items-center justify-center"
                   style={{ backgroundColor: toRgba(toArgb(newColor, newAlpha)) }}
                 >
@@ -188,15 +205,17 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                   placeholder={isEn ? 'Tag name' : '标签名称'}
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
-                  className="flex-1 px-3 py-2 border rounded-lg text-sm"
+                  className="flex-1 px-2.5 py-1 border rounded-control text-body min-w-0 h-control"
                   autoFocus
                 />
               </div>
-              
+
               {/* 透明度滑块 */}
               <div className="flex items-center gap-3">
                 <Palette className="h-4 w-4 text-muted-foreground" />
-                <span className="text-sm text-muted-foreground w-16">{isEn ? 'Opacity' : '透明度'}</span>
+                <span className="text-body text-muted-foreground w-16">
+                  {isEn ? 'Opacity' : '透明度'}
+                </span>
                 <input
                   type="range"
                   min="0"
@@ -205,7 +224,9 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                   onChange={(e) => setNewAlpha(parseInt(e.target.value))}
                   className="flex-1"
                 />
-                <span className="text-sm w-12 text-right">{Math.round(newAlpha / 255 * 100)}%</span>
+                <span className="text-body w-12 text-right">
+                  {Math.round((newAlpha / 255) * 100)}%
+                </span>
               </div>
 
               {/* 预设颜色 */}
@@ -213,7 +234,7 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                 {PRESET_COLORS.map((preset) => (
                   <button
                     key={preset.value}
-                    className="w-6 h-6 rounded border hover:scale-110 transition-transform"
+                    className="w-6 h-6 rounded border transition-transform"
                     style={{ backgroundColor: toRgba(preset.value) }}
                     onClick={() => {
                       const { alpha, rgb } = parseArgb(preset.value)
@@ -230,14 +251,14 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                   {isEn ? 'Cancel' : '取消'}
                 </Button>
                 <Button size="sm" onClick={handleCreate} disabled={!newName.trim()}>
-                  <Check className="h-4 w-4 mr-1" />
+                  <Check className="h-4 w-4 " />
                   {isEn ? 'Create' : '创建'}
                 </Button>
               </div>
             </div>
           ) : (
             <Button variant="outline" className="w-full" onClick={() => setIsCreating(true)}>
-              <Plus className="h-4 w-4 mr-2" />
+              <Plus className="h-4 w-4 " />
               {isEn ? 'New Tag' : '新建标签'}
             </Button>
           )}
@@ -247,13 +268,13 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
             {tagList.map((tag) => (
               <div
                 key={tag.id}
-                className="p-3 border rounded-lg hover:bg-muted/30 transition-colors"
+                className="p-3 border rounded-panel hover:bg-muted/30 transition-colors"
               >
                 {editingId === tag.id ? (
                   // 编辑模式
                   <div className="space-y-3">
                     <div className="flex items-center gap-2">
-                      <div 
+                      <div
                         className="w-8 h-8 rounded border cursor-pointer flex items-center justify-center"
                         style={{ backgroundColor: toRgba(toArgb(editColor, editAlpha)) }}
                       >
@@ -268,14 +289,16 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                         type="text"
                         value={editName}
                         onChange={(e) => setEditName(e.target.value)}
-                        className="flex-1 px-3 py-1.5 border rounded text-sm"
+                        className="flex-1 px-2.5 py-1.5 border rounded-control text-body min-w-0 h-control"
                         autoFocus
                       />
                     </div>
-                    
+
                     {/* 透明度滑块 */}
                     <div className="flex items-center gap-3">
-                      <span className="text-sm text-muted-foreground w-16">{isEn ? 'Opacity' : '透明度'}</span>
+                      <span className="text-body text-muted-foreground w-16">
+                        {isEn ? 'Opacity' : '透明度'}
+                      </span>
                       <input
                         type="range"
                         min="0"
@@ -284,7 +307,9 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                         onChange={(e) => setEditAlpha(parseInt(e.target.value))}
                         className="flex-1"
                       />
-                      <span className="text-sm w-12 text-right">{Math.round(editAlpha / 255 * 100)}%</span>
+                      <span className="text-body w-12 text-right">
+                        {Math.round((editAlpha / 255) * 100)}%
+                      </span>
                     </div>
 
                     {/* 预设颜色 */}
@@ -292,7 +317,7 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                       {PRESET_COLORS.map((preset) => (
                         <button
                           key={preset.value}
-                          className="w-6 h-6 rounded border hover:scale-110 transition-transform"
+                          className="w-6 h-6 rounded border transition-transform"
                           style={{ backgroundColor: toRgba(preset.value) }}
                           onClick={() => {
                             const { alpha, rgb } = parseArgb(preset.value)
@@ -318,23 +343,27 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                   <div className="space-y-3">
                     <div className="flex items-center gap-2">
                       <span
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium text-white"
+                        className="inline-flex items-center gap-1 h-5 px-[7px] rounded-full text-badge font-medium text-white"
                         style={{ backgroundColor: toRgba(tag.color) }}
                       >
                         {tag.name}
                       </span>
-                      <span className="text-sm text-muted-foreground">- 选择要添加标签的账号</span>
+                      <span className="text-body text-muted-foreground">
+                        - 选择要添加标签的账号
+                      </span>
                     </div>
-                    
+
                     {/* 已标记的账号 */}
                     {getTaggedAccounts(tag.id).length > 0 && (
                       <div className="space-y-1">
-                        <p className="text-xs text-muted-foreground">{isEn ? 'Tagged accounts:' : '已标记的账号：'}</p>
+                        <p className="text-caption text-muted-foreground">
+                          {isEn ? 'Tagged accounts:' : '已标记的账号：'}
+                        </p>
                         <div className="flex flex-wrap gap-1">
-                          {getTaggedAccounts(tag.id).map(acc => (
+                          {getTaggedAccounts(tag.id).map((acc) => (
                             <span
                               key={acc.id}
-                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs"
+                              className="inline-flex items-center gap-1 h-5 px-[7px] rounded-full text-badge"
                               style={{ backgroundColor: toRgba(tag.color), color: 'white' }}
                             >
                               {acc.email}
@@ -354,13 +383,15 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                     {/* 可添加标签的账号 */}
                     {getUntaggedByTag(tag.id).length > 0 && (
                       <div className="space-y-1">
-                        <p className="text-xs text-muted-foreground">{isEn ? 'Click to add tag:' : '点击添加标签：'}</p>
+                        <p className="text-caption text-muted-foreground">
+                          {isEn ? 'Click to add tag:' : '点击添加标签：'}
+                        </p>
                         <div className="flex flex-wrap gap-1 max-h-32 overflow-auto">
-                          {getUntaggedByTag(tag.id).map(acc => (
+                          {getUntaggedByTag(tag.id).map((acc) => (
                             <button
                               key={acc.id}
                               onClick={() => addTagToAccounts([acc.id], tag.id)}
-                              className="px-2 py-0.5 bg-muted hover:bg-primary/20 rounded text-xs transition-colors"
+                              className="inline-flex items-center h-5 px-[7px] bg-muted hover:bg-primary/20 rounded-full text-badge transition-colors"
                             >
                               {acc.email}
                             </button>
@@ -379,12 +410,12 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                   // 显示模式
                   <div className="flex items-center gap-3">
                     <span
-                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium text-white shrink-0"
+                      className="inline-flex items-center gap-1 h-5 px-[7px] rounded-full text-badge font-medium text-white shrink-0"
                       style={{ backgroundColor: toRgba(tag.color) }}
                     >
                       {tag.name}
                     </span>
-                    <span className="text-xs text-muted-foreground">
+                    <span className="text-caption text-muted-foreground">
                       {getTagAccountCount(tag.id)} 个账号
                     </span>
                     <div className="flex-1" />
@@ -426,7 +457,11 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
               <div className="text-center py-8 text-muted-foreground">
                 <Tag className="h-12 w-12 mx-auto mb-2 opacity-50" />
                 <p>{isEn ? 'No tags' : '暂无标签'}</p>
-                <p className="text-sm">{isEn ? 'Click the button above to create your first tag' : '点击上方按钮创建第一个标签'}</p>
+                <p className="text-body">
+                  {isEn
+                    ? 'Click the button above to create your first tag'
+                    : '点击上方按钮创建第一个标签'}
+                </p>
               </div>
             )}
           </div>

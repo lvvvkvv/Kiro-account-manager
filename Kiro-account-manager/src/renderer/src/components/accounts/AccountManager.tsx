@@ -12,7 +12,8 @@ import { ExportDialog } from './ExportDialog'
 import { Button } from '../ui'
 import type { Account } from '@/types/account'
 import { splitCredentialLine } from '@/lib/utils'
-import { ArrowLeft, Loader2, Users } from 'lucide-react'
+import { PageHeader } from '../layout'
+import { ArrowLeft, Loader2, Users, Plus, Upload, Download } from 'lucide-react'
 
 interface AccountManagerProps {
   onBack?: () => void
@@ -50,7 +51,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   const getExportAccounts = () => {
     const accountList = Array.from(accounts.values())
     if (selectedIds.size > 0) {
-      return accountList.filter(acc => selectedIds.has(acc.id))
+      return accountList.filter((acc) => selectedIds.has(acc.id))
     }
     return accountList
   }
@@ -65,7 +66,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
     const result: string[] = []
     let current = ''
     let inQuotes = false
-    
+
     for (let i = 0; i < line.length; i++) {
       const char = line[i]
       if (char === '"') {
@@ -89,7 +90,10 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   // 导入
   const handleImport = async (): Promise<void> => {
     // 文件导入归入"当前打开的分组"（activeGroupTab 为真实分组时），否则未分组
-    const currentGroupId = (activeGroupTab !== 'all' && activeGroupTab !== 'ungrouped' && groups.has(activeGroupTab)) ? activeGroupTab : undefined
+    const currentGroupId =
+      activeGroupTab !== 'all' && activeGroupTab !== 'ungrouped' && groups.has(activeGroupTab)
+        ? activeGroupTab
+        : undefined
     const groupName = currentGroupId ? (groups.get(currentGroupId)?.name ?? '未分组') : '未分组'
     const fileData = await window.api.importFromFile()
 
@@ -103,7 +107,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
         const data = JSON.parse(content)
         if (data.version && data.accounts) {
           const result = importFromExportData(data)
-          const skippedInfo = result.errors.find(e => e.id === 'skipped')
+          const skippedInfo = result.errors.find((e) => e.id === 'skipped')
           const skippedMsg = skippedInfo ? `，${skippedInfo.error}` : ''
           alert(`导入完成：成功 ${result.success} 个${skippedMsg}`)
         } else {
@@ -111,26 +115,29 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
         }
       } else if (format === 'csv') {
         // CSV 格式：邮箱,昵称,登录方式,RefreshToken,ClientId,ClientSecret,Region
-        const lines = content.split('\n').filter(line => line.trim())
+        const lines = content.split('\n').filter((line) => line.trim())
         if (lines.length < 2) {
           alert('CSV 文件为空或只有标题行')
           return
         }
 
         // 跳过标题行，解析数据行
-        const items = lines.slice(1).map(line => {
-          const cols = parseCSVLine(line)
-          return {
-            email: cols[0] || '',
-            nickname: cols[1] || undefined,
-            idp: cols[2] || 'Google',
-            refreshToken: cols[3] || '',
-            clientId: cols[4] || '',
-            clientSecret: cols[5] || '',
-            region: cols[6] || 'us-east-1',
-            groupId: currentGroupId
-          }
-        }).filter(item => item.email && item.refreshToken)
+        const items = lines
+          .slice(1)
+          .map((line) => {
+            const cols = parseCSVLine(line)
+            return {
+              email: cols[0] || '',
+              nickname: cols[1] || undefined,
+              idp: cols[2] || 'Google',
+              refreshToken: cols[3] || '',
+              clientId: cols[4] || '',
+              clientSecret: cols[5] || '',
+              region: cols[6] || 'us-east-1',
+              groupId: currentGroupId
+            }
+          })
+          .filter((item) => item.email && item.refreshToken)
 
         if (items.length === 0) {
           alert('未找到有效的账号数据（需要邮箱和 RefreshToken）')
@@ -141,61 +148,73 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
         alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个（分组：${groupName}）`)
       } else if (format === 'txt') {
         // TXT 格式：自动识别卡密格式或普通格式
-        const lines = content.split('\n').filter(line => line.trim() && !line.startsWith('#'))
+        const lines = content.split('\n').filter((line) => line.trim() && !line.startsWith('#'))
 
         // 检测是否为卡密格式（包含 ---- 分隔符）
-        const isKamiFormat = lines.some(line => line.includes('----'))
+        const isKamiFormat = lines.some((line) => line.includes('----'))
 
         if (isKamiFormat) {
           // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
           // 自动识别分隔符：----、\t、连续空格
-          const items = lines.map(line => {
-            const parts = splitCredentialLine(line)
-            const rawPwd = parts[1]?.trim()
-            const clientId = parts[3]?.trim() || undefined
-            const clientSecret = parts[4]?.trim() || undefined
-            // 第6字段为登录方式(idp)：新卡密直接带；旧卡密无此字段时按 ClientId/Secret 推断
-            // social(Github/Google) 只有 refreshToken，IdC(BuilderId) 才有 ClientId/Secret
-            const rawIdp = parts[5]?.trim()
-            const idp = rawIdp || ((!clientId && !clientSecret) ? 'Google' : 'BuilderId')
-            return {
-              email: parts[0]?.trim() || '',
-              password: (rawPwd && rawPwd !== 'no_password') ? rawPwd : undefined,
-              refreshToken: parts[2]?.trim() || '',
-              clientId,
-              clientSecret,
-              idp,
-              groupId: currentGroupId
-            }
-          }).filter(item => item.email && item.refreshToken)
+          const items = lines
+            .map((line) => {
+              const parts = splitCredentialLine(line)
+              const rawPwd = parts[1]?.trim()
+              const clientId = parts[3]?.trim() || undefined
+              const clientSecret = parts[4]?.trim() || undefined
+              // 第6字段为登录方式(idp)：新卡密直接带；旧卡密无此字段时按 ClientId/Secret 推断
+              // social(Github/Google) 只有 refreshToken，IdC(BuilderId) 才有 ClientId/Secret
+              const rawIdp = parts[5]?.trim()
+              const idp = rawIdp || (!clientId && !clientSecret ? 'Google' : 'BuilderId')
+              return {
+                email: parts[0]?.trim() || '',
+                password: rawPwd && rawPwd !== 'no_password' ? rawPwd : undefined,
+                refreshToken: parts[2]?.trim() || '',
+                clientId,
+                clientSecret,
+                idp,
+                groupId: currentGroupId
+              }
+            })
+            .filter((item) => item.email && item.refreshToken)
 
           if (items.length === 0) {
-            alert('未找到有效的卡密数据（格式：邮箱----密码----RefreshToken----ClientId----ClientSecret）')
+            alert(
+              '未找到有效的卡密数据（格式：邮箱----密码----RefreshToken----ClientId----ClientSecret）'
+            )
             return
           }
 
           const result = importAccounts(items)
-          alert(`卡密导入完成：成功 ${result.success} 个，失败 ${result.failed} 个（分组：${groupName}）`)
+          alert(
+            `卡密导入完成：成功 ${result.success} 个，失败 ${result.failed} 个（分组：${groupName}）`
+          )
         } else {
           // 普通 TXT 格式：邮箱,RefreshToken 或 邮箱|RefreshToken
-          const items = lines.map(line => {
-            const parts = line.includes('|') ? line.split('|') : line.split(',')
-            return {
-              email: parts[0]?.trim() || '',
-              refreshToken: parts[1]?.trim() || '',
-              nickname: parts[2]?.trim() || undefined,
-              idp: parts[3]?.trim() || 'Google',
-              groupId: currentGroupId
-            }
-          }).filter(item => item.email && item.refreshToken)
+          const items = lines
+            .map((line) => {
+              const parts = line.includes('|') ? line.split('|') : line.split(',')
+              return {
+                email: parts[0]?.trim() || '',
+                refreshToken: parts[1]?.trim() || '',
+                nickname: parts[2]?.trim() || undefined,
+                idp: parts[3]?.trim() || 'Google',
+                groupId: currentGroupId
+              }
+            })
+            .filter((item) => item.email && item.refreshToken)
 
           if (items.length === 0) {
-            alert('未找到有效的账号数据（格式：邮箱,RefreshToken 或 卡密格式：邮箱----密码----Token----ID----Secret）')
+            alert(
+              '未找到有效的账号数据（格式：邮箱,RefreshToken 或 卡密格式：邮箱----密码----Token----ID----Secret）'
+            )
             return
           }
 
           const result = importAccounts(items)
-          alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个（分组：${groupName}）`)
+          alert(
+            `导入完成：成功 ${result.success} 个，失败 ${result.failed} 个（分组：${groupName}）`
+          )
         }
       } else {
         alert(`不支持的文件格式：${format}`)
@@ -234,27 +253,34 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
 
   return (
     <div className="flex flex-col h-full">
-      {/* 顶部工具栏 - 玻璃态（relative z-20 抬升 stacking context，确保下拉菜单浮在卡片之上） */}
-      <header className="relative z-20 flex items-center justify-between gap-4 px-3 py-3 glass-toolbar">
-        <div className="flex items-center gap-4">
-          {onBack && (
-            <Button variant="ghost" size="icon" onClick={onBack}>
-              <ArrowLeft className="h-5 w-5" />
+      <PageHeader
+        icon={<Users />}
+        title={isEn ? 'Accounts' : '账户管理'}
+        actions={
+          <>
+            {onBack && (
+              <Button variant="ghost" size="icon" onClick={onBack} title={isEn ? 'Back' : '返回'}>
+                <ArrowLeft />
+              </Button>
+            )}
+            <Button variant="outline" onClick={handleImport}>
+              <Upload />
+              {isEn ? 'Import' : '导入'}
             </Button>
-          )}
-          <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-primary/10">
-              <Users className="h-5 w-5 text-primary" />
-            </div>
-            <h1 className="text-lg font-semibold text-primary">{isEn ? 'Accounts' : '账户管理'}</h1>
-          </div>
-        </div>
-        
+            <Button variant="outline" onClick={handleExport}>
+              <Download />
+              {isEn ? 'Export' : '导出'}
+            </Button>
+            <Button onClick={() => setShowAddDialog(true)}>
+              <Plus />
+              {isEn ? 'Add' : '添加账号'}
+            </Button>
+          </>
+        }
+      />
+      <div className="relative z-20 shrink-0 px-6 pb-3">
         {/* 工具栏 */}
         <AccountToolbar
-          onAddAccount={() => setShowAddDialog(true)}
-          onImport={handleImport}
-          onExport={handleExport}
           viewMode={viewMode}
           onViewModeChange={setViewMode}
           onManageGroups={handleManageGroups}
@@ -262,10 +288,10 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
           isFilterExpanded={isFilterExpanded}
           onToggleFilter={() => setIsFilterExpanded(!isFilterExpanded)}
         />
-      </header>
+      </div>
 
       {/* 主内容区域 */}
-      <div className="flex-1 overflow-hidden flex flex-col px-3 py-3 gap-3">
+      <div className="flex-1 min-h-0 overflow-hidden flex flex-col px-6 pb-6">
         {/* 账号列表（卡片 或 紧凑列表） */}
         <div className="flex-1 overflow-hidden">
           {viewMode === 'grid' ? (
@@ -283,10 +309,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
       </div>
 
       {/* 添加账号对话框 */}
-      <AddAccountDialog
-        isOpen={showAddDialog}
-        onClose={() => setShowAddDialog(false)}
-      />
+      <AddAccountDialog isOpen={showAddDialog} onClose={() => setShowAddDialog(false)} />
 
       {/* 编辑账号对话框 */}
       <EditAccountDialog
@@ -296,16 +319,10 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
       />
 
       {/* 分组管理对话框 */}
-      <GroupManageDialog
-        isOpen={showGroupDialog}
-        onClose={() => setShowGroupDialog(false)}
-      />
+      <GroupManageDialog isOpen={showGroupDialog} onClose={() => setShowGroupDialog(false)} />
 
       {/* 标签管理对话框 */}
-      <TagManageDialog
-        isOpen={showTagDialog}
-        onClose={() => setShowTagDialog(false)}
-      />
+      <TagManageDialog isOpen={showTagDialog} onClose={() => setShowTagDialog(false)} />
 
       {/* 导出对话框 */}
       <ExportDialog
