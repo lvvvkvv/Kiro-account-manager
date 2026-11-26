@@ -1,3 +1,4 @@
+import type { AppUpdateState } from '../shared/update'
 import { ElectronAPI } from '@electron-toolkit/preload'
 
 interface AccountData {
@@ -502,47 +503,16 @@ interface KiroApi {
     error?: string
   }>
 
-  // ============ 自动更新 API ============
-
-  // 检查更新 (electron-updater)
-  checkForUpdates: () => Promise<{
-    hasUpdate: boolean
-    version?: string
-    releaseDate?: string
-    message?: string
-    error?: string
-  }>
-
-  // 手动检查更新 (GitHub API, 用于 AboutPage)
-  checkForUpdatesManual: () => Promise<{
-    hasUpdate: boolean
-    currentVersion?: string
-    latestVersion?: string
-    releaseNotes?: string
-    releaseName?: string
-    releaseUrl?: string
-    publishedAt?: string
-    assets?: Array<{
-      name: string
-      downloadUrl: string
-      size: number
-    }>
-    error?: string
-  }>
-
-  // 下载更新
-  downloadUpdate: () => Promise<{ success: boolean; error?: string }>
-
-  // 安装更新并重启
-  installUpdate: () => Promise<void>
-
-  // 监听更新事件
-  onUpdateChecking: (callback: () => void) => () => void
-  onUpdateAvailable: (callback: (info: { version: string; releaseDate?: string; releaseNotes?: string }) => void) => () => void
-  onUpdateNotAvailable: (callback: (info: { version: string }) => void) => () => void
-  onUpdateDownloadProgress: (callback: (progress: { percent: number; bytesPerSecond: number; transferred: number; total: number }) => void) => () => void
-  onUpdateDownloaded: (callback: (info: { version: string; releaseDate?: string; releaseNotes?: string }) => void) => () => void
-  onUpdateError: (callback: (error: string) => void) => () => void
+  getUpdateState: () => Promise<AppUpdateState>
+  checkAppUpdate: () => Promise<AppUpdateState>
+  installAppUpdate: () => Promise<void>
+  setAutoUpdateEnabled: (enabled: boolean) => Promise<AppUpdateState>
+  dismissAppUpdate: () => Promise<AppUpdateState>
+  openUpdateDownloadPage: () => Promise<void>
+  updateRendererReady: () => Promise<void>
+  updateQuitReady: (token: string, error?: string) => Promise<void>
+  onUpdatePrepareQuit: (callback: (token: string) => void) => () => void
+  onAppUpdateState: (callback: (state: AppUpdateState) => void) => () => void
 
   // ============ Kiro 设置管理 API ============
 

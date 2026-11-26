@@ -1,3 +1,4 @@
+import type { AppUpdateState } from '../shared/update'
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
@@ -454,83 +455,24 @@ const api = {
     return ipcRenderer.invoke('machine-id:restore-from-file')
   },
 
-  // ============ 自动更新 ============
-  
-  // 检查更新 (electron-updater)
-  checkForUpdates: (): Promise<{
-    hasUpdate: boolean
-    version?: string
-    releaseDate?: string
-    message?: string
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('check-for-updates')
+  // One update state for all entry points.
+  getUpdateState: (): Promise<AppUpdateState> => ipcRenderer.invoke('app-update:get'),
+  checkAppUpdate: (): Promise<AppUpdateState> => ipcRenderer.invoke('app-update:check'),
+  installAppUpdate: (): Promise<void> => ipcRenderer.invoke('app-update:install'),
+  setAutoUpdateEnabled: (enabled: boolean): Promise<AppUpdateState> => ipcRenderer.invoke('app-update:enabled', enabled),
+  dismissAppUpdate: (): Promise<AppUpdateState> => ipcRenderer.invoke('app-update:dismiss'),
+  openUpdateDownloadPage: (): Promise<void> => ipcRenderer.invoke('app-update:download-page'),
+  updateRendererReady: (): Promise<void> => ipcRenderer.invoke('app-update:renderer-ready'),
+  updateQuitReady: (token: string, error?: string): Promise<void> => ipcRenderer.invoke('app-update:quit-ready', token, error),
+  onUpdatePrepareQuit: (callback: (token: string) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, token: string): void => callback(token)
+    ipcRenderer.on('app-update:prepare-quit', handler)
+    return () => ipcRenderer.removeListener('app-update:prepare-quit', handler)
   },
-
-  // 手动检查更新 (GitHub API, 用于 AboutPage)
-  checkForUpdatesManual: (): Promise<{
-    hasUpdate: boolean
-    currentVersion?: string
-    latestVersion?: string
-    releaseNotes?: string
-    releaseName?: string
-    releaseUrl?: string
-    publishedAt?: string
-    assets?: Array<{
-      name: string
-      downloadUrl: string
-      size: number
-    }>
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('check-for-updates-manual')
-  },
-
-  // 下载更新
-  downloadUpdate: (): Promise<{ success: boolean; error?: string }> => {
-    return ipcRenderer.invoke('download-update')
-  },
-
-  // 安装更新并重启
-  installUpdate: (): Promise<void> => {
-    return ipcRenderer.invoke('install-update')
-  },
-
-  // 监听更新事件
-  onUpdateChecking: (callback: () => void): (() => void) => {
-    const handler = (): void => callback()
-    ipcRenderer.on('update-checking', handler)
-    return () => ipcRenderer.removeListener('update-checking', handler)
-  },
-
-  onUpdateAvailable: (callback: (info: { version: string; releaseDate?: string; releaseNotes?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, info: { version: string; releaseDate?: string; releaseNotes?: string }): void => callback(info)
-    ipcRenderer.on('update-available', handler)
-    return () => ipcRenderer.removeListener('update-available', handler)
-  },
-
-  onUpdateNotAvailable: (callback: (info: { version: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, info: { version: string }): void => callback(info)
-    ipcRenderer.on('update-not-available', handler)
-    return () => ipcRenderer.removeListener('update-not-available', handler)
-  },
-
-  onUpdateDownloadProgress: (callback: (progress: { percent: number; bytesPerSecond: number; transferred: number; total: number }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, progress: { percent: number; bytesPerSecond: number; transferred: number; total: number }): void => callback(progress)
-    ipcRenderer.on('update-download-progress', handler)
-    return () => ipcRenderer.removeListener('update-download-progress', handler)
-  },
-
-  onUpdateDownloaded: (callback: (info: { version: string; releaseDate?: string; releaseNotes?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, info: { version: string; releaseDate?: string; releaseNotes?: string }): void => callback(info)
-    ipcRenderer.on('update-downloaded', handler)
-    return () => ipcRenderer.removeListener('update-downloaded', handler)
-  },
-
-  onUpdateError: (callback: (error: string) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, error: string): void => callback(error)
-    ipcRenderer.on('update-error', handler)
-    return () => ipcRenderer.removeListener('update-error', handler)
+  onAppUpdateState: (callback: (state: AppUpdateState) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: AppUpdateState): void => callback(state)
+    ipcRenderer.on('app-update-state', handler)
+    return () => ipcRenderer.removeListener('app-update-state', handler)
   },
 
   // ============ Kiro 设置管理 ============

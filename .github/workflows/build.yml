@@ -32,6 +32,10 @@ jobs:
           else
             TAG_NAME="v$VERSION"
           fi
+          if [ "$TAG_NAME" != "v$VERSION" ]; then
+            echo "Release tag must match package.json version" >&2
+            exit 1
+          fi
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           echo "Version: $VERSION, Tag: $TAG_NAME"
 
@@ -182,11 +186,28 @@ jobs:
         working-directory: ${{ env.WORKING_DIR }}
         run: npm run build
 
+      - name: Test update manifests and state transitions
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm run test:updater
+
+      - name: Test native updater on Intel macOS
+        working-directory: ${{ env.WORKING_DIR }}
+        timeout-minutes: 8
+        run: |
+          npm run test:updater:mac
+          node -e "require('fs').rmSync('dist/native-updater-tests', {recursive: true, force: true})"
+
       - name: Package macOS x64 and arm64
         working-directory: ${{ env.WORKING_DIR }}
         run: npx electron-builder --mac -p never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign macOS update manifests
+        working-directory: ${{ env.WORKING_DIR }}
+        run: node scripts/sign-mac-updates.mjs dist
+        env:
+          KIRO_UPDATE_PRIVATE_KEY: ${{ secrets.KIRO_UPDATE_PRIVATE_KEY }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -197,6 +218,7 @@ jobs:
             ${{ env.WORKING_DIR }}/dist/*.zip
             ${{ env.WORKING_DIR }}/dist/*.yml
             ${{ env.WORKING_DIR }}/dist/*.blockmap
+            ${{ env.WORKING_DIR }}/dist/kiro-update-mac-*.json
           if-no-files-found: ignore
 
   build-linux:
@@ -279,18 +301,16 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R artifacts
 
-      - name: Flatten and deduplicate artifacts
-        run: |
-          mkdir -p release-assets
-          # 将所有子目录中的文件扁平化到一个目录，同名文件自动去重（后者覆盖前者）
-          find artifacts -type f \
-            \( -name "*.exe" -o -name "*.zip" -o -name "*.dmg" \
-               -o -name "*.AppImage" -o -name "*.deb" -o -name "*.snap" \
-               -o -name "*.tar.gz" -o -name "*.yml" -o -name "*.blockmap" \) \
-            ! -name "builder-debug.yml" \
-            -exec cp {} release-assets/ \;
-          echo "=== Release assets (deduplicated) ==="
-          ls -lh release-assets/
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Collect release assets and architecture manifests
+        run: node scripts/collect-release-assets.mjs artifacts release-assets
+
+      - name: Verify signed macOS release archives
+        run: node scripts/verify-mac-updates.mjs release-assets '${{ needs.get-version.outputs.version }}'
 
       - name: Generate download checksums
         working-directory: release-assets
@@ -305,6 +325,7 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: false
+          fail_on_unmatched_files: true
           body: |
             ## 🌟 更新内容 | What's New
 

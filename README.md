@@ -252,18 +252,21 @@ The project is configured with GitHub Actions workflow for auto building all pla
 
 ### Trigger Methods
 
-1. **Push Tag**: Auto build and release when pushing `v*` format tags
-   ```bash
-   git tag v1.1.0
-   git push origin v1.1.0
-   ```
-
-2. **Manual Trigger**: Manually run workflow in GitHub Actions page
+Run **Build & Release** manually from GitHub Actions on the intended branch. The workflow reads `package.json` and creates the matching `v<version>` Release after all builds and update-package checks pass. Pushing a tag alone does not trigger this workflow.
 
 ---
 
 ## 📋 Changelog
 
+
+### v1.7.11 (2026-11-26) — Unified Updates and Recoverable macOS Installation
+
+- Share update state across About, sidebar indicators, background downloads, and the tray; support per-version reminders and user-confirmed installation.
+- Use a standalone native macOS helper with Ed25519 package verification, atomic replacement, startup health checks, and rollback without an Apple Developer ID.
+- Fix installation continuing after cancellation, recovery from early startup hangs, and rapid automatic-download toggle races.
+- Keep manual downloads available; missing or invalid signatures and unsupported installation locations never bypass verification.
+- Preserve architecture-specific Windows update manifests and verify macOS release manifests against their archives before publishing.
+- **Existing macOS users should install this release manually once to enable the new updater. The app remains ad-hoc signed and may require permission on first launch.**
 
 ### v1.7.10 (2026-11-26) — Account Card Layout and Switch Icons
 

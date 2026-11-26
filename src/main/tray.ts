@@ -1,3 +1,4 @@
+import type { AppUpdateState } from '../shared/update'
 // 系统托盘模块
 import { Tray, Menu, nativeImage, app, BrowserWindow, dialog, MenuItemConstructorOptions, NativeImage } from 'electron'
 import { join } from 'path'
@@ -96,6 +97,8 @@ let currentLanguage: 'en' | 'zh' = 'zh'
 
 // 回调函数
 interface TrayCallbacks {
+  getUpdateState: () => AppUpdateState | null
+  onInstallUpdate: () => Promise<void>
   onShowWindow: () => void
   onQuit: () => void
   onRefreshAccount: () => Promise<void>
@@ -273,6 +276,16 @@ function buildTrayMenu(): Menu {
       callbacks?.onShowWindow()
     }
   })
+
+  const update = callbacks?.getUpdateState()
+  if (update?.ready) {
+    menuTemplate.push({
+      label: isEn ? `Restart to update to v${update.ready.version}` : `重启并更新到 v${update.ready.version}`,
+      enabled: !update.installing,
+      click: () => { void callbacks?.onInstallUpdate() }
+    })
+    if (update.routingInUse) menuTemplate.push({ label: isEn ? 'Restart interrupts proxy requests' : '重启将中断反代请求', enabled: false })
+  }
 
   // 退出应用
   menuTemplate.push({

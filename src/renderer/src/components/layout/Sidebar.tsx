@@ -1,3 +1,4 @@
+import { useAppUpdate } from '@/contexts/UpdateContext'
 import {
   Home,
   Users,
@@ -67,6 +68,8 @@ const menuItemsConfig: { id: PageType; labelKey: string; icon: React.ElementType
 
 export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse }: SidebarProps) {
   const { darkMode } = useAccountsStore()
+  const { state: updateState } = useAppUpdate()
+  const hasUpdate = !!(updateState.available || updateState.ready)
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const [tip, setTip] = useState<{ text: string; top: number; left: number } | null>(null)
@@ -151,7 +154,10 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
                   : 'mx-2 h-nav-row w-[184px] text-left'
               )}
             >
-              <Icon className={cn('shrink-0', collapsed ? 'size-5' : 'size-[18px]')} />
+              <span className="relative shrink-0">
+                <Icon className={cn('shrink-0', collapsed ? 'size-5' : 'size-[18px]')} />
+                {item.id === 'about' && hasUpdate && <span aria-label={isEn ? 'Update available' : '有可用更新'} className="absolute -right-1 -top-1 size-2 rounded-full bg-red-500" />}
+              </span>
               {!collapsed && <span className="min-w-0 truncate">{label}</span>}
             </button>
           )

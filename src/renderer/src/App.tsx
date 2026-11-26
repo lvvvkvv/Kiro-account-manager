@@ -5,7 +5,7 @@ import { AccountManager } from './components/accounts'
 import { Sidebar, TitleBar, type PageType } from './components/layout'
 import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, RegisterPage, SubscriptionPage, LogsPage } from './components/pages'
 import { useWebhookStore } from './store/webhooks'
-import { UpdateDialog } from './components/UpdateDialog'
+import { AutoUpdatePrompt } from './components/updates/AutoUpdatePrompt'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { useAccountsStore, isBannedAccountError } from './store/accounts'
 
@@ -88,10 +88,20 @@ function App(): React.JSX.Element {
     }, TRAY_UPDATE_DEBOUNCE_MS)
   }, [])
 
+  useEffect(() => window.api.onUpdatePrepareQuit(async token => {
+    try {
+      await useAccountsStore.getState().flushSaveImmediately()
+      await window.api.updateQuitReady(token)
+    } catch (error) {
+      await window.api.updateQuitReady(token, String(error))
+    }
+  }), [])
+
   // 应用启动时加载数据并启动自动刷新
   useEffect(() => {
     loadFromStorage().then(() => {
       startAutoTokenRefresh()
+      requestAnimationFrame(() => { void window.api.updateRendererReady().catch(console.error) })
     })
     // 同步主动续期开关（持久化在 main 进程的 electron-store）
     useAccountsStore.getState().loadProactiveRenewalEnabled()
@@ -366,7 +376,7 @@ function App(): React.JSX.Element {
           collapsed={sidebarCollapsed}
           onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
         />
-        <main className="flex-1 min-w-0 overflow-hidden bg-background">
+        <main className="relative flex-1 min-w-0 overflow-hidden bg-background">
           <AnimatePresence mode="wait">
             <motion.div
               key={currentPage}
@@ -379,9 +389,9 @@ function App(): React.JSX.Element {
               {renderPage()}
             </motion.div>
           </AnimatePresence>
+          <AutoUpdatePrompt />
         </main>
       </div>
-      <UpdateDialog />
       <CloseConfirmDialog />
     </div>
   )
