@@ -67,6 +67,32 @@ func bundleInfo(_ app: URL) throws -> [String: Any] {
     return info
 }
 func bundleVersion(_ app: URL) throws -> String { try bundleInfo(app)["CFBundleShortVersionString"] as? String ?? "" }
+func containsArchitecture(_ binary: URL, _ expected: UInt32) throws -> Bool {
+    // Parse Mach-O headers directly: /usr/bin/lipo is a developer-tool shim on clean Macs.
+    let handle = try FileHandle(forReadingFrom: binary)
+    defer { try? handle.close() }
+    let bytes = [UInt8](try handle.read(upToCount: 8192) ?? Data())
+    func word(_ offset: Int, little: Bool = false) throws -> UInt32 {
+        guard offset >= 0, offset + 4 <= bytes.count else { throw Failure("Truncated Mach-O header") }
+        let positions = little ? [3, 2, 1, 0] : [0, 1, 2, 3]
+        return positions.reduce(UInt32(0)) { ($0 << 8) | UInt32(bytes[offset + $1]) }
+    }
+    let magic = try word(0)
+    switch magic {
+    case 0xfeedface, 0xfeedfacf: return try word(4) == expected
+    case 0xcefaedfe, 0xcffaedfe: return try word(4, little: true) == expected
+    case 0xcafebabe, 0xcafebabf, 0xbebafeca, 0xbfbafeca:
+        let little = magic == 0xbebafeca || magic == 0xbfbafeca
+        let count = Int(try word(4, little: little))
+        let stride = magic == 0xcafebabf || magic == 0xbfbafeca ? 32 : 20
+        guard count > 0, count <= 128, 8 + count * stride <= bytes.count else { throw Failure("Invalid universal Mach-O header") }
+        for index in 0..<count {
+            if try word(8 + index * stride, little: little) == expected { return true }
+        }
+        return false
+    default: throw Failure("Invalid Mach-O executable")
+    }
+}
 func swap(_ left: URL, _ right: URL) throws {
     guard renamex_np(left.path, right.path, UInt32(RENAME_SWAP)) == 0 else {
         throw Failure("Atomic application swap failed: \(String(cString: strerror(errno)))")
@@ -136,8 +162,10 @@ do {
         }
         let info = try bundleInfo(url)
         guard let name = info["CFBundleExecutable"] as? String, !name.contains("/") else { throw Failure("Invalid bundle executable") }
-        let architecture = tx.arch == "x64" ? "x86_64" : "arm64"
-        try run("/usr/bin/lipo", ["-verify_arch", architecture, url.appendingPathComponent("Contents/MacOS/\(name)").path])
+        let architecture: UInt32 = tx.arch == "x64" ? 0x01000007 : 0x0100000c
+        guard try containsArchitecture(url.appendingPathComponent("Contents/MacOS/\(name)"), architecture) else {
+            throw Failure("Executable architecture mismatch")
+        }
     }
     func stopLaunched() throws {
         guard let instance = try? read(Health.self, instanceURL), instance.token == tx.launchToken, alive(instance.pid) else { return }

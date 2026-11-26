@@ -94,6 +94,7 @@ for (const scenario of [
   'success',
   'invalid-signature',
   'invalid-digest',
+  'invalid-architecture',
   'before-swap',
   'after-swap',
   'crash-after-swap',
@@ -105,6 +106,12 @@ for (const scenario of [
   const caseRoot = path.join(root, scenario)
   fs.mkdirSync(caseRoot)
   const id = crypto.randomUUID()
+  const caseArch =
+    scenario === 'invalid-architecture'
+      ? process.arch === 'arm64'
+        ? 'x64'
+        : 'arm64'
+      : process.arch
   const transaction = path.join(caseRoot, id)
   fs.mkdirSync(transaction, { mode: 0o700 })
   const appPath = path.join(caseRoot, name)
@@ -121,6 +128,8 @@ for (const scenario of [
   const payload = Buffer.from(
     JSON.stringify({
       ...manifest,
+      arch: caseArch,
+      file: `kiro-account-manager-0.0.2-${caseArch}-mac.zip`,
       ...(scenario === 'invalid-digest' ? { sha256: '0'.repeat(64) } : {})
     })
   )
@@ -142,13 +151,20 @@ for (const scenario of [
       appPath,
       currentVersion: '0.0.1',
       version: '0.0.2',
-      arch: process.arch,
+      arch: caseArch,
       parentPid: first.pid,
       phase: 'created',
       fault: scenario
     })
     if (scenario.startsWith('invalid-')) {
-      assert.throws(() => run(helper, ['prepare', jobPath]))
+      assert.throws(
+        () => run(helper, ['prepare', jobPath]),
+        scenario === 'invalid-signature'
+          ? /Update signature rejected/
+          : scenario === 'invalid-architecture'
+            ? /architecture mismatch/
+            : /Archive digest mismatch/
+      )
       assert.equal(read(jobPath).phase, 'failed')
       process.kill(first.pid, 0)
       assert.equal(

@@ -97,7 +97,10 @@ export class MacUpdateBackend {
     const active = await this.activeDirectory()
     if (active) {
       const tx = await json<MacTransaction>(join(active, 'transaction.json'))
-      if (['rolled-back', 'recovery-failed', 'failed', 'cancelled'].includes(tx.phase)) {
+      if (tx.appPath !== this.appPath) {
+        recovery =
+          '另一个安装位置留有更新记录，请从原安装位置恢复。 / An update belongs to another installation; recover from its original location.'
+      } else if (['rolled-back', 'recovery-failed', 'failed', 'cancelled'].includes(tx.phase)) {
         recovery = tx.error || '上次更新未完成 / Previous update did not complete'
       } else if (tx.phase !== 'committed' && tx.phase !== 'created') {
         let running = false
