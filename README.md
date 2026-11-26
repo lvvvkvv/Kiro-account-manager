@@ -265,6 +265,12 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.9 (2026-11-26) — Update Check Fix
+
+- Fix the About page update check querying the upstream repository instead of this repository, which incorrectly reported no updates.
+- Align manual update checks with the automatic updater's release source: `lvvvkvv/Kiro-account-manager`.
+- If an older version's manual update check reports no updates, download and install v1.7.9 from this repository's Releases page to receive this fix.
+
 ### v1.7.8 (2026-11-26) — Responsive Account List
 
 - Make the account list adapt to the available width without horizontal scrolling.
