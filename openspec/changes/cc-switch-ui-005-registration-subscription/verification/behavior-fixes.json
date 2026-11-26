@@ -1,0 +1,9 @@
+[
+  {
+    "file": "pages/RegisterPage.tsx",
+    "key": "jsx:onChange#16",
+    "before": "219862e1906b79e1234df6d89a0980a2c1319c0bcc747e68ed7d858870229446",
+    "after": "bd3e8cafc43d64dad787766ab3a0d17738bb1bc0f6cd85b330d6948a68869f11",
+    "reason": "异步模板导入结束后以稳定的 event.target 清空文件选择；修复改前 currentTarget 已清空的异常，不改文件解析/ID 去重/字段格式"
+  }
+]
