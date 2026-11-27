@@ -259,6 +259,13 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 ## 📋 Changelog
 
 
+### v1.7.17 (2026-11-27) — Show Next Token Refresh Time
+
+- Display the next randomized refresh time in account cards, list rows and details using the background scheduler's shared 10–30 minute algorithm.
+- Show month/day and time in cards and lists, full dates with seconds in details, and scheduling/concurrency information on hover.
+- Explain disabled auto refresh, suspended accounts, missing credentials, unknown expiry, active refreshes and pending refreshes with explicit states.
+- Update the displayed schedule when background token renewal completes, including already-open detail dialogs, with Chinese/English and light/dark theme support.
+
 ### v1.7.16 (2026-11-27) — Randomized Token Refresh Scheduling
 
 - Spread account refreshes across a randomized 10–30 minute window before token expiry. Each token keeps the same deadline across processes and restarts, with a new schedule after renewal.

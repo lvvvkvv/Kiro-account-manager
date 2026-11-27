@@ -1,0 +1,69 @@
+.token-refresh-schedule {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.token-refresh-schedule-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  color: var(--color-muted-foreground);
+}
+
+.token-refresh-schedule-label > svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  stroke-width: 1.5;
+}
+
+.token-refresh-schedule-value {
+  min-width: 0;
+  text-align: right;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+  color: var(--color-foreground);
+}
+
+.token-refresh-schedule-pending {
+  display: block;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.token-refresh-schedule[data-state='disabled'] .token-refresh-schedule-value,
+.token-refresh-schedule[data-state='paused'] .token-refresh-schedule-value,
+.token-refresh-schedule[data-state='unavailable'] .token-refresh-schedule-value,
+.token-refresh-schedule[data-state='unknown'] .token-refresh-schedule-value {
+  color: var(--color-muted-foreground);
+}
+
+.token-refresh-schedule[data-state='pending'] .token-refresh-schedule-value {
+  color: var(--color-warning-text);
+}
+
+.token-refresh-schedule[data-state='refreshing'] .token-refresh-schedule-value {
+  color: var(--color-primary);
+}
+
+.account-card-validity > .token-refresh-schedule {
+  grid-column: 1 / -1;
+  flex-direction: row;
+  gap: 10px;
+  border-left: 0;
+  border-top: 1px solid var(--color-border);
+  padding-left: 0;
+  padding-top: 10px;
+}
+
+.token-refresh-schedule--detail {
+  padding-block: 4px;
+  border-bottom: 1px solid var(--color-border);
+}

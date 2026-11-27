@@ -1,3 +1,4 @@
+import { TokenRefreshSchedule } from './TokenRefreshSchedule'
 import { createPortal } from 'react-dom'
 import { useState, useEffect } from 'react'
 import {
@@ -484,6 +485,7 @@ export function AccountDetailDialog({
                     {credentials.expiresAt ? formatDateTime(credentials.expiresAt) : '-'}
                   </span>
                 </div>
+                <TokenRefreshSchedule account={account} isEn={isEn} variant="detail" />
                 <div className="flex justify-between items-center py-1 border-b border-primary/10 last:border-0">
                   <span className="text-muted-foreground text-caption">
                     {isEn ? 'Plan Type' : '订阅类型'}

@@ -1,3 +1,4 @@
+import { TokenRefreshSchedule } from './TokenRefreshSchedule'
 import { memo, useState, useMemo, useCallback } from 'react'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -657,6 +658,7 @@ function AccountListRowComponent({
             </span>
             <span className="account-list-expiry-value">{tokenText}</span>
           </div>
+          <TokenRefreshSchedule account={account} isEn={isEn} variant="list" />
         </section>
       </div>
 

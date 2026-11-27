@@ -1,3 +1,4 @@
+import { TokenRefreshSchedule } from './TokenRefreshSchedule'
 import { memo, useState, useMemo, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { Button } from '../ui'
@@ -889,6 +890,7 @@ export const AccountCard = memo(function AccountCard({
           </span>
           <strong className="account-card-expiry-value">{tokenText}</strong>
         </div>
+        <TokenRefreshSchedule account={account} isEn={isEn} variant="card" />
       </div>
 
       {(accountGroup || accountTags.length > 0 || boundProxy) && (
