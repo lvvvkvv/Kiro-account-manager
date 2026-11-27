@@ -922,7 +922,7 @@ export function AccountToolbar({
             <Button
               variant={isFilterExpanded ? 'outline' : 'ghost'}
               size="icon"
-              className="h-8 w-8 relative"
+              className={cn('h-8 w-8 relative border', !isFilterExpanded && 'border-transparent')}
               onClick={onToggleFilter}
               title={isEn ? 'Toggle advanced filter' : '展开/收起高级筛选'}
               aria-expanded={isFilterExpanded}
@@ -930,7 +930,7 @@ export function AccountToolbar({
               <Filter className="h-4 w-4" />
               {hasActiveAccountFilters(filter) && (
                 <span
-                  className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-yellow-500"
+                  className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-yellow-500"
                   aria-hidden="true"
                 />
               )}

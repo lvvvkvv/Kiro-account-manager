@@ -268,6 +268,11 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 ## 📋 Changelog
 
 
+### v1.7.20 (2026-11-27) — Stable Filter Indicator Position
+
+- Move the active-filter yellow dot closer to the filter button's top-right corner.
+- Keep the button border width consistent when opening and closing the filter popover so the yellow dot stays in the same position.
+
 ### v1.7.19 (2026-11-27) — Account Filter Interaction Improvements
 
 - Close the advanced account filter popover when clicking outside it, while keeping it open during interactions inside.
