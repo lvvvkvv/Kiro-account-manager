@@ -2,7 +2,24 @@
  * 账号视图共享工具 — AccountCard / AccountListRow 复用
  * 保证两种视图（卡片 / 列表）视觉系统一致
  */
-import type { Account } from '@/types/account'
+import type { Account, AccountFilter } from '@/types/account'
+
+// 高级筛选面板与工具栏共用，搜索关键词由独立搜索框展示。
+export function hasActiveAccountFilters(filter: AccountFilter): boolean {
+  return Boolean(
+    filter.subscriptionTypes?.length ||
+    filter.statuses?.length ||
+    filter.idps?.length ||
+    filter.groupIds?.length ||
+    filter.tagIds?.length ||
+    filter.emailDomains?.length ||
+    filter.usageMin !== undefined ||
+    filter.usageMax !== undefined ||
+    filter.daysRemainingMin !== undefined ||
+    filter.daysRemainingMax !== undefined ||
+    filter.bannedOnly
+  )
+}
 
 // ============ 颜色解析 ============
 

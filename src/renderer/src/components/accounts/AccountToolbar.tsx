@@ -4,7 +4,7 @@ import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { AccountFilterPanel } from './AccountFilter'
 import { AccountPopover } from './AccountPopover'
-import { toRgba } from './_helpers'
+import { hasActiveAccountFilters, toRgba } from './_helpers'
 import { cn } from '@/lib/utils'
 import { Network as NetworkIcon, Link2 as Link2Icon, Unlink as UnlinkIcon } from 'lucide-react'
 import {
@@ -88,6 +88,19 @@ export function AccountToolbar({
   const groupMenuRef = useRef<HTMLDivElement>(null)
   const tagMenuRef = useRef<HTMLDivElement>(null)
   const proxyMenuRef = useRef<HTMLDivElement>(null)
+  const filterMenuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!isFilterExpanded) return
+
+    const handleClickOutside = (e: MouseEvent): void => {
+      if (filterMenuRef.current && !filterMenuRef.current.contains(e.target as Node)) {
+        onToggleFilter()
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [isFilterExpanded, onToggleFilter])
 
   // 点击外部关闭菜单
   useEffect(() => {
@@ -905,15 +918,22 @@ export function AccountToolbar({
             {privacyMode ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
           </Button>
           {/* 筛选按钮与气泡 */}
-          <div className="relative">
+          <div className="relative" ref={filterMenuRef}>
             <Button
               variant={isFilterExpanded ? 'outline' : 'ghost'}
               size="icon"
-              className="h-8 w-8"
+              className="h-8 w-8 relative"
               onClick={onToggleFilter}
               title={isEn ? 'Toggle advanced filter' : '展开/收起高级筛选'}
+              aria-expanded={isFilterExpanded}
             >
               <Filter className="h-4 w-4" />
+              {hasActiveAccountFilters(filter) && (
+                <span
+                  className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-yellow-500"
+                  aria-hidden="true"
+                />
+              )}
             </Button>
             {/* 筛选气泡面板 */}
             {isFilterExpanded && (

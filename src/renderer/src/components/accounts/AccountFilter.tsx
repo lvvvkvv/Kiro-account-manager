@@ -9,6 +9,7 @@ import type {
   IdpType
 } from '@/types/account'
 import { cn } from '@/lib/utils'
+import { hasActiveAccountFilters } from './_helpers'
 
 const SubscriptionOptions: {
   value: SubscriptionType
@@ -116,19 +117,7 @@ export function AccountFilterPanel(): React.ReactNode {
     return top
   }, [domainCounts, showAllDomains, filter.emailDomains])
 
-  const hasActiveFilters = Boolean(
-    filter.subscriptionTypes?.length ||
-    filter.statuses?.length ||
-    filter.idps?.length ||
-    filter.groupIds?.length ||
-    filter.tagIds?.length ||
-    filter.emailDomains?.length ||
-    filter.usageMin !== undefined ||
-    filter.usageMax !== undefined ||
-    filter.daysRemainingMin !== undefined ||
-    filter.daysRemainingMax !== undefined ||
-    filter.bannedOnly
-  )
+  const hasActiveFilters = hasActiveAccountFilters(filter)
 
   const toggleArrayFilter = <T extends string>(key: keyof FilterType, value: T): void => {
     const current = (filter[key] as T[] | undefined) ?? []

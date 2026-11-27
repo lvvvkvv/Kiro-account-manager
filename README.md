@@ -268,6 +268,11 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 ## 📋 Changelog
 
 
+### v1.7.19 (2026-11-27) — Account Filter Interaction Improvements
+
+- Close the advanced account filter popover when clicking outside it, while keeping it open during interactions inside.
+- Show a yellow dot on the filter icon while advanced filters are active, and remove it when those filters are cleared.
+
 ### v1.7.18 (2026-11-27) — Local-Key Encrypted Backups
 
 - Encrypt automatic backups with a persistent random local key and AES-256-GCM, avoiding macOS Keychain prompts during normal updates and backup operations.
