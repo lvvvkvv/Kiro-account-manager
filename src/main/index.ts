@@ -1,3 +1,5 @@
+import { isTokenRefreshDue, tokenRefreshAt, tokenRefreshConcurrency } from '../shared/tokenRefresh'
+import { TokenRefreshCoordinator } from './tokenRefreshCoordinator'
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, autoUpdater as nativeAutoUpdater } from 'electron'
 import { AppUpdateService } from './updater/service'
 import * as machineIdModule from './machineId'
@@ -713,6 +715,10 @@ async function refreshSocialToken(
   }
 }
 
+// 所有刷新入口共享并发上限；相同 refreshToken 的并发调用复用一次网络请求。
+let refreshConcurrency = 100
+const tokenRefreshCoordinator = new TokenRefreshCoordinator<OidcRefreshResult>(() => refreshConcurrency)
+
 // 通用 Token 刷新 - 根据 authMethod 选择刷新方式
 async function refreshTokenByMethod(
   token: string,
@@ -722,12 +728,9 @@ async function refreshTokenByMethod(
   authMethod?: string,
   proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
 ): Promise<OidcRefreshResult> {
-  // 如果是社交登录，使用 Kiro Auth Service 刷新
-  if (authMethod === 'social') {
-    return refreshSocialToken(token, proxyUrl)
-  }
-  // 否则使用 OIDC 刷新 (IdC/BuilderId)
-  return refreshOidcToken(token, clientId, clientSecret, region, proxyUrl)
+  return tokenRefreshCoordinator.run(token, () => authMethod === 'social'
+    ? refreshSocialToken(token, proxyUrl)
+    : refreshOidcToken(token, clientId, clientSecret, region, proxyUrl))
 }
 
 function generateInvocationId(): string {
@@ -1415,6 +1418,9 @@ async function initStore(): Promise<void> {
     console.error('[Store] Account data migration failed:', error)
   }
 
+  const accountSettings = storeInstance.get('accountData') as { autoRefreshConcurrency?: number } | undefined
+  refreshConcurrency = tokenRefreshConcurrency(accountSettings?.autoRefreshConcurrency)
+
   // 加载主动续期开关状态（默认关闭）
   try {
     proactiveRenewalEnabled = !!storeInstance.get('proactiveRenewalEnabled', false)
@@ -1582,14 +1588,14 @@ function clearProactiveRenewal(reason?: string): void {
 }
 
 /**
- * 在 token 剩余 (PROACTIVE_RENEWAL_LEAD_MS) 时触发续期。
+ * 在 token 过期前 10～30 分钟的固定随机时间触发续期，与账号池调度一致。
  * 调用者负责传入准确的 expiresAt（来自 OIDC 真实 expiresIn），不读 store 避免不一致。
  */
 function scheduleProactiveRenewal(accountId: string, expiresAtMs: number): void {
   clearProactiveRenewal()
   if (!proactiveRenewalEnabled) return
-  const msUntilRenewal = expiresAtMs - Date.now() - PROACTIVE_RENEWAL_LEAD_MS
-  // 若已经在窗口内（包括已过期），立刻续期
+  const msUntilRenewal = tokenRefreshAt(accountId, expiresAtMs) - Date.now()
+  // 若已错过随机时间（包括已过期），立刻续期
   const delay = Math.max(msUntilRenewal, 0)
   console.log(
     `[ProactiveRenewal] Scheduled in ${Math.round(delay / 1000)}s for account ${accountId} ` +
@@ -1707,7 +1713,7 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
 
   console.log(
     `[ProactiveRenewal] Renewed OK for ${account.email || accountId}. ` +
-      `Next renewal in ${expiresIn - PROACTIVE_RENEWAL_LEAD_MS / 1000}s`
+      `Next renewal in ${Math.max(0, Math.round((tokenRefreshAt(accountId, newExpiresAt) - Date.now()) / 1000))}s`
   )
 
   // 4. 调度下一次
@@ -1821,14 +1827,11 @@ let lastWrittenTokenSignature: string | null = null
 let lastSyncedFromIdeSignature: string | null = null
 
 // ============ 主动续期（Proactive Token Renewal） ============
-// 思路：在 Kiro IDE 内部 refresh loop 触发之前（token 剩 10 分钟时）抢先 refresh，
-//   让 IDE 永远拿到剩余时间充足的 token，IDE 自己永远不需要调 OIDC → 彻底消除 race。
+// 在过期前 10～30 分钟随机续期并同步磁盘，降低与 IDE 自身刷新发生竞争的机会。
 // 仅对"当前 IDE 激活账号"（lastSwitchedAccountId）维护一个 timer，开销小。
 // 默认关闭，需用户在 Settings 中显式打开。
 let proactiveRenewalEnabled = false
 let proactiveRenewalTimer: NodeJS.Timeout | null = null
-// 在 token 剩余多久时触发主动续期。15 分钟 > Kiro IDE 的 10 分钟阈值，确保抢先。
-const PROACTIVE_RENEWAL_LEAD_MS = 15 * 60 * 1000
 
 // ============ 账号池 token 主动刷新（主进程调度，不依赖窗口存活）============
 //
@@ -1875,17 +1878,13 @@ function isBannedAccountErrorMain(error?: string): boolean {
     || /\b423\b/.test(e)
 }
 
-/** 刷新提前量：≥ 2× 检查间隔且不少于 10 分钟，确保 token 不会在两次 tick 之间过期。 */
-function mainTokenRefreshLeadMs(intervalMin: number): number {
-  return Math.max(intervalMin * 2 * 60 * 1000, 10 * 60 * 1000)
-}
-
 /** 读取 store 里的账号，刷新即将过期的池内 token（仅刷 token，信息同步仍由渲染进程负责）。 */
-async function runMainPoolTokenRefreshTick(): Promise<void> {
-  if (!backgroundBatchRefreshImpl) return
+async function runMainPoolTokenRefreshTick(): Promise<number> {
+  let nextRefreshAt = Date.now() + 60_000
+  if (!backgroundBatchRefreshImpl) return 60_000
   try {
     if (!store) { await initStore() }
-    if (!store) return
+    if (!store) return 60_000
     const data = store.get('accountData') as {
       accounts?: Record<string, {
         id?: string
@@ -1907,15 +1906,12 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
         }
       }>
       autoRefreshEnabled?: boolean
-      autoRefreshInterval?: number
       autoRefreshConcurrency?: number
     } | undefined
-    if (!data?.accounts) return
-    if (data.autoRefreshEnabled === false) return
+    if (!data?.accounts) return 60_000
+    if (data.autoRefreshEnabled === false) return 60_000
 
-    const intervalMin = Math.max(1, data.autoRefreshInterval ?? 5)
-    const leadMs = mainTokenRefreshLeadMs(intervalMin)
-    const concurrency = Math.max(1, Math.min(500, data.autoRefreshConcurrency ?? 100))
+    const concurrency = tokenRefreshConcurrency(data.autoRefreshConcurrency)
     const now = Date.now()
 
     const toRefresh: BackgroundRefreshAccount[] = []
@@ -1925,7 +1921,11 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
       if (isBannedAccountErrorMain(acc.lastError)) continue
       const expiresAt = creds.expiresAt
       // 只刷"即将过期/已过期"的；没有 expiresAt 的跳过（无从判断）
-      if (!expiresAt || expiresAt - now > leadMs) continue
+      if (!expiresAt || !Number.isFinite(expiresAt)) continue
+      if (!isTokenRefreshDue(id, expiresAt, now)) {
+        nextRefreshAt = Math.min(nextRefreshAt, tokenRefreshAt(id, expiresAt))
+        continue
+      }
       toRefresh.push({
         id,
         idp: acc.idp,
@@ -1945,28 +1945,36 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
       })
     }
 
-    if (toRefresh.length === 0) return
-    console.log(`[MainPoolRefresh] ${toRefresh.length} token(s) expiring within ${Math.round(leadMs / 60000)}min, refreshing...`)
-    // syncInfo=false：仅刷 token；用量/订阅等信息同步由渲染进程定时器负责，避免主进程跑重活
-    await backgroundBatchRefreshImpl(toRefresh, concurrency, false)
+    if (toRefresh.length > 0) {
+      console.log(`[MainPoolRefresh] ${toRefresh.length} token(s) reached their randomized refresh deadlines`)
+      // syncInfo=false：仅刷 token；信息同步仍由渲染进程定时器负责。
+      await backgroundBatchRefreshImpl(toRefresh, concurrency, false)
+    }
   } catch (err) {
     console.warn('[MainPoolRefresh] tick failed:', err instanceof Error ? err.message : err)
   }
+  return Math.max(1000, nextRefreshAt - Date.now())
 }
 
-/** 启动主进程池 token 刷新调度器（不依赖窗口可见/存活）。 */
+/** 最迟每分钟重读账号；临近随机时间时精确唤醒，不受用户的信息检查间隔影响。 */
+let mainPoolRefreshGeneration = 0
 function startMainPoolTokenRefresh(): void {
   stopMainPoolTokenRefresh()
-  // 启动后稍等片刻先跑一次（让 store 与账号池就绪），之后每分钟检查一次；
-  // 实际是否需要刷新由 runMainPoolTokenRefreshTick 内按 expiresAt + 提前量判定。
-  setTimeout(() => { void runMainPoolTokenRefreshTick() }, 15_000)
-  mainPoolRefreshTimer = setInterval(() => { void runMainPoolTokenRefreshTick() }, 60_000)
-  console.log('[MainPoolRefresh] Scheduler started (main process, checks every 60s)')
+  const generation = mainPoolRefreshGeneration
+  const tick = async (): Promise<void> => {
+    const delay = await runMainPoolTokenRefreshTick()
+    if (generation === mainPoolRefreshGeneration) {
+      mainPoolRefreshTimer = setTimeout(() => { void tick() }, delay)
+    }
+  }
+  mainPoolRefreshTimer = setTimeout(() => { void tick() }, 15_000)
+  console.log('[MainPoolRefresh] Randomized 10–30min scheduler started')
 }
 
 function stopMainPoolTokenRefresh(): void {
+  mainPoolRefreshGeneration++
   if (mainPoolRefreshTimer) {
-    clearInterval(mainPoolRefreshTimer)
+    clearTimeout(mainPoolRefreshTimer)
     mainPoolRefreshTimer = null
   }
 }
@@ -2829,6 +2837,7 @@ app.whenReady().then(async () => {
     try {
       await initStore()
       store!.set('accountData', data)
+      refreshConcurrency = tokenRefreshConcurrency(data?.autoRefreshConcurrency)
       
       // 保存最后的数据（用于崩溃恢复）
       lastSavedData = data
@@ -2976,9 +2985,7 @@ app.whenReady().then(async () => {
   })
 
   // ============ 主动续期开关 IPC ============
-  // 启用后，账号管理器会在 IDE 当前激活账号的 token 剩 PROACTIVE_RENEWAL_LEAD_MS（默认 15 分钟）时
-  // 抢先 refresh + 写磁盘，IDE 永远拿到剩余 ≥ 45 分钟的 token，IDE 内部 refresh loop 不会触发，
-  // 彻底消除 IDE 与账号管理器同时 refresh 撞车的可能。
+  // 启用后，IDE 当前激活账号也使用过期前 10～30 分钟的固定随机时间续期并写入磁盘。
   ipcMain.handle('set-proactive-renewal-enabled', async (_event, enabled: boolean) => {
     try {
       await initStore()
@@ -3020,8 +3027,7 @@ app.whenReady().then(async () => {
       await initStore()
       return {
         success: true,
-        enabled: !!store?.get('proactiveRenewalEnabled', false),
-        leadTimeMinutes: PROACTIVE_RENEWAL_LEAD_MS / 60000
+        enabled: !!store?.get('proactiveRenewalEnabled', false)
       }
     } catch (error) {
       return {
@@ -3485,6 +3491,7 @@ app.whenReady().then(async () => {
 
   // IPC: 后台批量刷新账号（在主进程执行，不阻塞 UI）
   const backgroundBatchRefresh = async (accounts: BackgroundRefreshAccount[], concurrency: number = 10, syncInfo: boolean = true): Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }> => {
+    concurrency = tokenRefreshConcurrency(concurrency)
     console.log(`[BackgroundRefresh] Starting batch refresh for ${accounts.length} accounts, concurrency: ${concurrency}, syncInfo: ${syncInfo}`)
     
     let completed = 0

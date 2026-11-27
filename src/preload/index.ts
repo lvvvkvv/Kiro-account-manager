@@ -162,7 +162,7 @@ const api = {
   setProactiveRenewalEnabled: (enabled: boolean): Promise<{ success: boolean; enabled?: boolean; error?: string }> => {
     return ipcRenderer.invoke('set-proactive-renewal-enabled', enabled)
   },
-  getProactiveRenewalEnabled: (): Promise<{ success: boolean; enabled: boolean; leadTimeMinutes?: number; error?: string }> => {
+  getProactiveRenewalEnabled: (): Promise<{ success: boolean; enabled: boolean; error?: string }> => {
     return ipcRenderer.invoke('get-proactive-renewal-enabled')
   },
 

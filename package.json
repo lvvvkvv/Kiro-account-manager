@@ -1,6 +1,6 @@
 {
   "name": "kiro-account-manager",
-  "version": "1.7.15",
+  "version": "1.7.16",
   "description": "Kiro Account Manager - Manage your Kiro accounts, usage and subscriptions",
   "main": "./out/main/index.js",
   "author": "Kiro",
@@ -23,7 +23,8 @@
     "test:e2e": "node test/e2e-fullsuite/run.mjs",
     "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only",
     "test:updater": "node --test test/updater/manifest.test.mjs test/updater/service.test.mjs test/updater/mac.test.mjs",
-    "test:updater:mac": "node test/updater/native.mjs"
+    "test:updater:mac": "node test/updater/native.mjs",
+    "test:token-refresh": "node --test test/token-refresh.test.mjs"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",

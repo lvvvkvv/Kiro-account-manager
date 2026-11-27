@@ -186,6 +186,10 @@ jobs:
         working-directory: ${{ env.WORKING_DIR }}
         run: npm run build
 
+      - name: Test randomized token refresh scheduling
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm run test:token-refresh
+
       - name: Test update manifests and state transitions
         working-directory: ${{ env.WORKING_DIR }}
         run: npm run test:updater

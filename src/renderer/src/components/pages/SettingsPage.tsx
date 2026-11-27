@@ -37,7 +37,6 @@ export function SettingsPage() {
     autoRefreshConcurrency,
     autoRefreshSyncInfo,
     proactiveRenewalEnabled,
-    proactiveRenewalLeadMinutes,
     setProactiveRenewalEnabled,
     setAutoRefresh,
     setAutoRefreshConcurrency,
@@ -503,8 +502,8 @@ export function SettingsPage() {
                 </p>
                 <p className="text-caption text-muted-foreground">
                   {isEn
-                    ? `Renew IDE's active token ~${proactiveRenewalLeadMinutes} min before expiry, so Kiro IDE never refreshes by itself (eliminates all race conditions).`
-                    : `在 IDE 激活账号的 token 剩 ~${proactiveRenewalLeadMinutes} 分钟时抢先 refresh，让 Kiro IDE 永远不自己 refresh（彻底消除竞争条件）。`}
+                    ? "Renew the IDE active token at a randomized time 10–30 minutes before expiry and sync it to disk."
+                    : '在 IDE 激活账号的 Token 过期前 10～30 分钟随机续期，并同步写入磁盘。'}
                 </p>
               </div>
               <Button
@@ -527,8 +526,8 @@ export function SettingsPage() {
               <div className="text-caption text-muted-foreground bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 rounded-panel p-3 space-y-1">
                 <p>
                   {isEn
-                    ? `• On: a single in-process timer renews token ${proactiveRenewalLeadMinutes} min before expiry; Kiro IDE keeps seeing fresh tokens (≥${60 - proactiveRenewalLeadMinutes} min remaining) and never invokes OIDC by itself.`
-                    : `• 启用后：账号管理器主进程会在 token 剩 ${proactiveRenewalLeadMinutes} 分钟时自动续期，Kiro IDE 始终看到剩余 ≥ ${60 - proactiveRenewalLeadMinutes} 分钟的 token，永远不会自己调 OIDC。`}
+                    ? '• On: the main process renews the active token 10–30 minutes before expiry. The scheduled time stays fixed until the token changes.'
+                    : '• 启用后：主进程在 Token 过期前 10～30 分钟随机续期；同一 Token 的调度时间固定，更新后重新安排。'}
                 </p>
                 <p>
                   {isEn
@@ -549,8 +548,8 @@ export function SettingsPage() {
                   <p>
                     •{' '}
                     {isEn
-                      ? 'Auto refresh tokens to keep login'
-                      : 'Token 即将过期时自动刷新，保持登录状态'}
+                      ? 'Refresh each token at a randomized time 10–30 minutes before expiry'
+                      : '每个 Token 在过期前 10～30 分钟随机刷新，调度时间固定至 Token 更新'}
                   </p>
                   <p>
                     •{' '}
@@ -569,7 +568,7 @@ export function SettingsPage() {
                   <div className="min-w-0 flex-1 basis-[220px]">
                     <p className="font-medium">{isEn ? 'Check Interval' : '检查间隔'}</p>
                     <p className="text-caption text-muted-foreground">
-                      {isEn ? 'How often to check account status' : '每隔多久检查一次账户状态'}
+                      {isEn ? 'Account info check interval; token deadlines are scheduled independently' : '账户信息检查间隔；Token 按独立随机时间调度'}
                     </p>
                   </div>
                   <select
@@ -593,8 +592,8 @@ export function SettingsPage() {
                     <p className="font-medium">{isEn ? 'Concurrency' : '刷新并发数'}</p>
                     <p className="text-caption text-muted-foreground">
                       {isEn
-                        ? 'Number of accounts to refresh simultaneously'
-                        : '同时刷新的账号数量，过大可能卡顿'}
+                        ? 'Maximum simultaneous token refreshes across all refresh tasks'
+                        : '所有刷新任务共享的 Token 刷新并发上限'}
                     </p>
                   </div>
                   <input

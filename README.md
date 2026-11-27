@@ -259,6 +259,13 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 ## 📋 Changelog
 
 
+### v1.7.16 (2026-11-27) — Randomized Token Refresh Scheduling
+
+- Spread account refreshes across a randomized 10–30 minute window before token expiry. Each token keeps the same deadline across processes and restarts, with a new schedule after renewal.
+- Schedule tokens independently of the account info check interval, and immediately catch up on missed deadlines or expired tokens.
+- Share a concurrency limit across background, manual, proactive IDE and proxy refreshes; coalesce in-flight requests using the same refresh credential.
+- Update Chinese and English settings descriptions and add coverage for deadline distribution, scheduling boundaries, concurrency and retry cleanup.
+
 ### v1.7.15 (2026-11-27) — Responsive Account Cards
 
 - Redesign account cards with separate identity, status, credit usage, validity and action sections.

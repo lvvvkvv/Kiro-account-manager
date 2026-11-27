@@ -217,9 +217,7 @@ interface KiroApi {
 
   /**
    * 开启/关闭"主动续期"功能。
-   * 开启后账号管理器会在 IDE 当前激活账号 token 剩 ~15 分钟时抢先 refresh + 写磁盘，
-   * 让 IDE 永远拿到剩余时间充足的 token，IDE 内部的 refresh loop 不会被触发，
-   * 彻底消除 IDE 与账号管理器同时 refresh 撞车的可能。
+   * 开启后在 IDE 当前激活账号 Token 过期前 10～30 分钟随机续期并写入磁盘。
    */
   setProactiveRenewalEnabled: (enabled: boolean) => Promise<{
     success: boolean
@@ -227,11 +225,10 @@ interface KiroApi {
     error?: string
   }>
 
-  /** 读取主动续期开关当前状态 + 提前续期的分钟数 */
+  /** 读取主动续期开关当前状态 */
   getProactiveRenewalEnabled: () => Promise<{
     success: boolean
     enabled: boolean
-    leadTimeMinutes?: number
     error?: string
   }>
 

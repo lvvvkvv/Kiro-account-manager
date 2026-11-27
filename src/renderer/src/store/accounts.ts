@@ -1,3 +1,4 @@
+import { isTokenRefreshDue, tokenRefreshConcurrency } from '../../../shared/tokenRefresh'
 import { resolveLanguage, type Language } from '../lib/language'
 import { resolveThemeMode, type ThemeMode } from '../lib/theme'
 import { create } from 'zustand'
@@ -41,14 +42,6 @@ function generateRandomMachineId(): string {
 
 // 自动 Token 刷新定时器
 let tokenRefreshTimer: ReturnType<typeof setInterval> | null = null
-// 刷新提前量必须 ≥ 2× 检查间隔，否则账号会在两次 tick 之间过期：
-// 某次 tick 时剩余刚好略超阈值会被跳过，下一次 tick（间隔分钟后）时早已过期。
-// 再叠加 IPC + OIDC 网络刷新本身的耗时，余量不足就会出现"过期才刷"。
-const TOKEN_REFRESH_MIN_LEAD_MS = 10 * 60 * 1000
-function tokenRefreshLeadMs(intervalMin: number): number {
-  return Math.max(intervalMin * 2 * 60 * 1000, TOKEN_REFRESH_MIN_LEAD_MS)
-}
-
 // 持久化防抖：合并连续 mutation 为单次写盘，避免后台刷新风暴时 IPC + IO 风暴
 const SAVE_DEBOUNCE_MS = 500
 /** 防抖最大延迟：连续 mutation 时也最迟在此时间内落盘一次，防止风暴下数据长时间不入磁盘 */
@@ -278,7 +271,6 @@ interface AccountsState {
 
   // 主动续期开关（持久化在 main 进程的 electron-store；这里只是镜像，不写 saveToStorage）
   proactiveRenewalEnabled: boolean
-  proactiveRenewalLeadMinutes: number
 
   // 隐私模式
   privacyMode: boolean
@@ -564,7 +556,6 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   autoRefreshSyncInfo: true,
   statusCheckInterval: 60,
   proactiveRenewalEnabled: false,
-  proactiveRenewalLeadMinutes: 15,
   privacyMode: false,
   usagePrecision: false,
   proxyEnabled: false,
@@ -1710,7 +1701,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           activeAccountId,
           autoRefreshEnabled: data.autoRefreshEnabled ?? true,
           autoRefreshInterval: data.autoRefreshInterval ?? 5,
-          autoRefreshConcurrency: data.autoRefreshConcurrency ?? 100,
+          autoRefreshConcurrency: tokenRefreshConcurrency(data.autoRefreshConcurrency),
           autoRefreshSyncInfo: data.autoRefreshSyncInfo ?? true,
           statusCheckInterval: data.statusCheckInterval ?? 60,
           privacyMode: data.privacyMode ?? false,
@@ -1908,7 +1899,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   },
 
   setAutoRefreshConcurrency: (concurrency) => {
-    set({ autoRefreshConcurrency: Math.max(1, Math.min(500, concurrency)) })
+    set({ autoRefreshConcurrency: tokenRefreshConcurrency(concurrency) })
     get().saveToStorage()
   },
 
@@ -1934,8 +1925,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const result = await window.api.getProactiveRenewalEnabled()
       if (result.success) {
         set({
-          proactiveRenewalEnabled: !!result.enabled,
-          proactiveRenewalLeadMinutes: result.leadTimeMinutes ?? 15
+          proactiveRenewalEnabled: !!result.enabled
         })
       }
     } catch (e) {
@@ -2188,9 +2178,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   // ==================== 自动 Token 刷新 ====================
 
   checkAndRefreshExpiringTokens: async () => {
-    const { accounts, refreshAccountToken, checkAccountStatus, autoSwitchEnabled, autoRefreshConcurrency, autoRefreshSyncInfo, autoRefreshInterval } = get()
+    const { accounts, refreshAccountToken, checkAccountStatus, autoSwitchEnabled, autoRefreshConcurrency, autoRefreshSyncInfo } = get()
     const now = Date.now()
-    const refreshLeadMs = tokenRefreshLeadMs(autoRefreshInterval)
 
     console.log(`[AutoRefresh] Checking ${accounts.size} accounts... (syncInfo: ${autoRefreshSyncInfo}, autoSwitch: ${autoSwitchEnabled})`)
 
@@ -2205,8 +2194,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       }
 
       const expiresAt = account.credentials.expiresAt
-      const timeUntilExpiry = expiresAt ? expiresAt - now : Infinity
-      const needsTokenRefresh = expiresAt && timeUntilExpiry <= refreshLeadMs
+      const needsTokenRefresh = isTokenRefreshDue(id, expiresAt, now)
 
       accountsToProcess.push({ id, email: account.email, needsTokenRefresh: !!needsTokenRefresh })
     }
@@ -2257,9 +2245,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   // 仅刷新失效的 Token（不刷新账户信息）
   refreshExpiredTokensOnly: async () => {
-    const { accounts, refreshAccountToken, autoRefreshConcurrency, autoRefreshInterval } = get()
+    const { accounts, refreshAccountToken, autoRefreshConcurrency } = get()
     const now = Date.now()
-    const refreshLeadMs = tokenRefreshLeadMs(autoRefreshInterval)
 
     // 筛选需要刷新 Token 的账号
     const expiredAccounts: Array<{ id: string; email: string }> = []
@@ -2271,10 +2258,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       }
 
       const expiresAt = account.credentials.expiresAt
-      const timeUntilExpiry = expiresAt ? expiresAt - now : Infinity
-      
-      // Token 已过期或即将过期
-      if (expiresAt && timeUntilExpiry <= refreshLeadMs) {
+      // 使用与主进程一致的随机刷新时间，重复检查不会推迟刷新。
+      if (isTokenRefreshDue(id, expiresAt, now)) {
         expiredAccounts.push({ id, email: account.email })
       }
     }
@@ -2344,9 +2329,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   // 触发后台刷新（在主进程执行，不阻塞 UI）
   triggerBackgroundRefresh: async () => {
-    const { accounts, autoRefreshConcurrency, autoRefreshSyncInfo, autoSwitchEnabled, autoRefreshInterval } = get()
+    const { accounts, autoRefreshConcurrency, autoRefreshSyncInfo, autoSwitchEnabled } = get()
     const now = Date.now()
-    const refreshLeadMs = tokenRefreshLeadMs(autoRefreshInterval)
 
     // 筛选需要处理的账号
     const accountsToRefresh: Array<{
@@ -2375,8 +2359,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       }
 
       const expiresAt = account.credentials.expiresAt
-      const timeUntilExpiry = expiresAt ? expiresAt - now : Infinity
-      const needsTokenRefresh = expiresAt && timeUntilExpiry <= refreshLeadMs
+      const needsTokenRefresh = isTokenRefreshDue(id, expiresAt, now)
       
       // Token 即将过期需要刷新，或开启了同步检测/自动换号需要检查账户信息
       if (needsTokenRefresh || autoRefreshSyncInfo || autoSwitchEnabled) {
