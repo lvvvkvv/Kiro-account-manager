@@ -165,6 +165,15 @@ xattr -cr /Applications/Kiro\ Account\ Manager.app
 - **Export**: Settings → Data Management → Export, supports JSON, TXT, CSV, Clipboard formats
 - **Import**: Settings → Data Management → Import, restore account data from JSON file
 
+### Local Automatic Backups
+
+Automatic backups use AES-256-GCM with a random key in the app's user data directory. App updates reuse this key, so normal backup operations no longer request macOS Keychain access. Existing primary account data remains compatible. One final Keychain authorization may be needed only when primary data is missing and an old encrypted backup must be recovered.
+
+- Keep `kiro-accounts.backup.local.enc` and `kiro-accounts.backup.key` together when copying or backing up user data.
+- The default macOS directory is `~/Library/Application Support/kiro-account-manager/`. Keys and new backup files use owner-only permissions (`0600`); Windows relies on the user directory's access controls.
+- Old `.backup.enc` files are retained. Legacy plaintext `.backup.json` files are removed only after the new backup is written and verified. Missing keys or failed authentication never trigger key regeneration, overwrite the original backup, or fall back to plaintext writes.
+- Programs running as the same user can read both files. This provides less application isolation than Keychain storage. A lost key makes its backup unreadable; do not delete the key separately.
+
 ---
 
 ## 🛠️ Tech Stack
@@ -258,6 +267,14 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 
 ## 📋 Changelog
 
+
+### v1.7.18 (2026-11-27) — Local-Key Encrypted Backups
+
+- Encrypt automatic backups with a persistent random local key and AES-256-GCM, avoiding macOS Keychain prompts during normal updates and backup operations.
+- Preserve existing primary account data. Create new backups directly from intact primary data; access Keychain only to recover an old encrypted backup when primary data is missing, retaining the original encrypted backup.
+- Keep keys and new backups in the user data directory across updates. Missing keys, failed authentication and interrupted writes preserve original files without regenerating keys, overwriting existing backups or falling back to plaintext writes.
+- Local keys provide less application isolation than Keychain storage. Keep `.backup.key` and `.backup.local.enc` together when copying or backing up user data.
+- Add migration, account retention, concurrent write and failure recovery tests to all platform release builds.
 
 ### v1.7.17 (2026-11-27) — Show Next Token Refresh Time
 

@@ -87,6 +87,10 @@ jobs:
         working-directory: ${{ env.WORKING_DIR }}
         run: npm ci
 
+      - name: Test local-key backup encryption and migration
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm run test:secure-backup
+
       - name: Build
         working-directory: ${{ env.WORKING_DIR }}
         run: npm run build
@@ -133,6 +137,10 @@ jobs:
       - name: Install dependencies
         working-directory: ${{ env.WORKING_DIR }}
         run: npm ci
+
+      - name: Test local-key backup encryption and migration
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm run test:secure-backup
 
       - name: Build
         working-directory: ${{ env.WORKING_DIR }}
@@ -181,6 +189,10 @@ jobs:
       - name: Install dependencies
         working-directory: ${{ env.WORKING_DIR }}
         run: npm ci
+
+      - name: Test local-key backup encryption and migration
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm run test:secure-backup
 
       - name: Build
         working-directory: ${{ env.WORKING_DIR }}
@@ -257,6 +269,10 @@ jobs:
       - name: Install dependencies
         working-directory: ${{ env.WORKING_DIR }}
         run: npm ci
+
+      - name: Test local-key backup encryption and migration
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm run test:secure-backup
 
       - name: Build
         working-directory: ${{ env.WORKING_DIR }}

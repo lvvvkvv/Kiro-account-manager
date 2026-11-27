@@ -1376,9 +1376,20 @@ let store: {
 
 // 最后保存的数据（用于崩溃恢复）
 let lastSavedData: unknown = null
+let storeInitialization: Promise<void> | null = null
 
 async function initStore(): Promise<void> {
-  if (store) return
+  // 多个启动任务共用恢复过程；恢复失败后禁止后续保存覆盖原数据，也不重复请求钥匙串。
+  if (!storeInitialization) {
+    storeInitialization = initializeStore().catch((error) => {
+      dialog.showErrorBox('账号数据加载失败', '为防止覆盖现有账号和备份，已暂停数据写入。请保留用户数据目录，恢复原数据或密钥文件后重启应用；如正在迁移旧备份，请允许钥匙串访问。')
+      throw error
+    })
+  }
+  await storeInitialization
+}
+
+async function initializeStore(): Promise<void> {
   const Store = (await import('electron-store')).default
   const path = await import('path')
   
@@ -1387,28 +1398,19 @@ async function initStore(): Promise<void> {
     encryptionKey: 'kiro-account-manager-secret-key'
   })
   
-  store = storeInstance as unknown as typeof store
-  
-  // 尝试从备份恢复数据（如果主数据损坏）。备份优先读加密 .enc，兼容旧明文 .json
-  try {
-    const mainData = storeInstance.get('accountData')
-
-    if (!mainData) {
-      try {
-        const { readSecureBackup } = await import('./secureBackup')
-        const backupData = await readSecureBackup(path.dirname(storeInstance.path)) as { accounts?: unknown } | null
-        if (backupData && backupData.accounts) {
-          console.log('[Store] Restoring data from backup...')
-          storeInstance.set('accountData', backupData)
-          console.log('[Store] Data restored from backup successfully')
-        }
-      } catch {
-        // 备份也不存在，忽略
-      }
-    }
-  } catch (error) {
-    console.error('[Store] Error checking backup:', error)
+  // 主数据保持原格式和密钥。正常升级直接从它创建本地备份，不访问钥匙串。
+  const { initializeAccountBackup } = await import('./secureBackup')
+  const backupDir = path.dirname(storeInstance.path)
+  const mainData = storeInstance.get('accountData')
+  const backupData = await initializeAccountBackup(backupDir, mainData)
+  if (mainData == null && backupData !== null) {
+    console.log('[Store] Restoring data from backup...')
+    storeInstance.set('accountData', backupData)
+    console.log('[Store] Data restored from backup successfully')
   }
+
+  // 只有主数据或备份成功读取后才发布 store，防止恢复期间被空数据覆盖。
+  store = storeInstance as unknown as typeof store
 
   // 一次性迁移：清理 BuilderId 占位符 profileArn 等脏数据
   // 详见 migrateAccountDataIfNeeded 注释
@@ -1794,9 +1796,9 @@ async function writeBackupNow(): Promise<void> {
   lastBackupTime = Date.now()
   try {
     const path = await import('path')
-    const { writeSecureBackup, isSecureBackupAvailable } = await import('./secureBackup')
+    const { writeSecureBackup } = await import('./secureBackup')
     await writeSecureBackup(path.dirname(store.path), data)
-    console.log(`[Backup] Data backup created (${isSecureBackupAvailable() ? 'encrypted' : 'plaintext-fallback'})`)
+    console.log('[Backup] Data backup created (local-key encrypted)')
   } catch (error) {
     console.error('[Backup] Failed to create backup:', error)
   }
