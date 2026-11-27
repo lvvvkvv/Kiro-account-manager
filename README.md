@@ -259,6 +259,14 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 ## 📋 Changelog
 
 
+### v1.7.15 (2026-11-27) — Responsive Account Cards
+
+- Redesign account cards with separate identity, status, credit usage, validity and action sections.
+- Adapt the grid to the available container width, measure row heights dynamically, and keep card actions aligned as details expand.
+- Show base, trial and bonus quota details on demand; keep reset dates, groups, tags and proxy availability visible and accessible.
+- Handle current, refreshing, expired, suspended, error and unknown accounts, exhausted and over-limit usage, and missing credentials with explicit states.
+- Consolidate secondary actions into an accessible menu and add dedicated loading and empty states, with light/dark themes, privacy masking and large-account-list virtualization preserved.
+
 ### v1.7.14 (2026-11-27) — Account List Redesign
 
 - Rebuild the account list with clear account/status, credit usage, validity and action sections; automatically switch to cards in narrower windows.

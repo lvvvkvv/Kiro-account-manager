@@ -51,7 +51,7 @@ export function AccountListMoreMenu({ label, actions }: AccountListMoreMenuProps
       if (!menu.contains(event.target as Node)) dismiss()
     }
     // 侧栏展开也会改变容器宽度，此时关闭原位置的浮层。
-    const list = trigger.closest('.account-list-shell')
+    const list = trigger.closest('.account-list-shell, .account-grid-shell')
     const initialWidth = list?.clientWidth
     const observer = new ResizeObserver(() => {
       if (list?.clientWidth !== initialWidth) dismiss()

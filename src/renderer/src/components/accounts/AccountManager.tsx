@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { AccountToolbar, type AccountViewMode } from './AccountToolbar'
-import { AccountGrid } from './AccountGrid'
+import { AccountGrid, AccountGridSkeleton } from './AccountGrid'
 import { AccountList, AccountListSkeleton } from './AccountList'
 import { AddAccountDialog } from './AddAccountDialog'
 import { EditAccountDialog } from './EditAccountDialog'
@@ -245,7 +245,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
       <div className="flex flex-col h-full">
         <PageHeader icon={<Users />} title={isEn ? 'Accounts' : '账户管理'} />
         <div className="flex-1 min-h-0 px-6 pb-6">
-          <AccountListSkeleton />
+          {viewMode === 'grid' ? <AccountGridSkeleton /> : <AccountListSkeleton />}
         </div>
       </div>
     )

@@ -1,0 +1,644 @@
+.account-grid-shell {
+  height: 100%;
+  min-width: 0;
+  max-width: 1800px;
+  margin-inline: auto;
+  color: var(--color-foreground);
+}
+
+.account-grid {
+  position: relative;
+  height: 100%;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  padding: 2px;
+}
+
+.account-grid-row {
+  display: grid;
+  gap: 16px;
+  align-items: stretch;
+  padding-bottom: 16px;
+}
+
+.account-card {
+  container: account-card / inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-card);
+  transition:
+    border-color 150ms,
+    box-shadow 150ms;
+}
+
+.account-card:hover {
+  border-color: var(--color-border-strong);
+}
+.account-card.is-current {
+  border-top-color: var(--action-bg);
+  box-shadow: inset 0 2px var(--action-bg);
+}
+.account-card.is-selected {
+  outline: 2px solid var(--action-ring);
+  outline-offset: -2px;
+}
+.account-card [data-tone='success'] {
+  --card-tone: var(--color-success-text);
+  --card-tone-soft: var(--color-success-soft);
+}
+.account-card [data-tone='warning'] {
+  --card-tone: var(--color-warning-text);
+  --card-tone-soft: var(--color-warning-soft);
+}
+.account-card [data-tone='danger'] {
+  --card-tone: var(--color-danger-text);
+  --card-tone-soft: var(--color-danger-soft);
+}
+.account-card [data-tone='info'] {
+  --card-tone: var(--color-chart-1);
+  --card-tone-soft: color-mix(in srgb, var(--color-chart-1) 10%, var(--color-card));
+}
+.account-card [data-tone='neutral'] {
+  --card-tone: var(--color-muted-foreground);
+  --card-tone-soft: var(--color-muted);
+}
+.account-card [data-tone='default'] {
+  --card-tone: var(--color-foreground);
+}
+
+.account-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.account-card-avatar {
+  position: relative;
+  flex: 0 0 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: 11px;
+  background: var(--color-sidebar);
+  color: var(--color-text-secondary);
+}
+.account-card-avatar > svg {
+  width: 18px;
+  height: 18px;
+  stroke-width: 1.5;
+}
+.account-card-avatar > i {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 10px;
+  height: 10px;
+  background: var(--color-success);
+  border: 2px solid var(--color-card);
+  border-radius: 50%;
+}
+.account-card-identity {
+  flex: 1;
+  min-width: 0;
+}
+.account-card-name-line,
+.account-card-email-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.account-card-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 22px;
+  text-align: left;
+}
+.account-card-name:hover {
+  color: var(--action-text);
+}
+.account-card-current {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--action-text);
+}
+.account-card-email-line {
+  color: var(--color-muted-foreground);
+  font-size: 12px;
+  line-height: 20px;
+}
+.account-card-email-line > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-card-copy {
+  flex: 0 0 20px;
+  display: grid;
+  place-items: center;
+  height: 20px;
+  border-radius: 4px;
+  color: var(--color-muted-foreground);
+  opacity: 0;
+}
+.account-card:hover .account-card-copy,
+.account-card:focus-within .account-card-copy {
+  opacity: 1;
+}
+.account-card-copy:hover {
+  background: var(--color-muted);
+  color: var(--color-foreground);
+}
+.account-card-copy svg {
+  width: 12px;
+  height: 12px;
+}
+.account-card-header input {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--action-bg);
+  cursor: pointer;
+  margin: 0;
+}
+
+.account-card-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 20px;
+}
+.account-card-status {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px;
+  color: var(--card-tone);
+  background: var(--card-tone-soft);
+  border-radius: 5px;
+  font-weight: 500;
+}
+.account-card-status svg {
+  width: 12px;
+  height: 12px;
+}
+.account-card-provider {
+  flex-shrink: 0;
+  color: var(--color-text-secondary);
+}
+.account-card-plan {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 4px;
+  color: var(--color-muted-foreground);
+  margin-left: auto;
+}
+.account-card-plan > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-card-plan svg {
+  flex: 0 0 12px;
+  width: 12px;
+  height: 12px;
+}
+.account-card-plan:not(:disabled):hover {
+  color: var(--action-text);
+}
+.account-card-plan:disabled {
+  cursor: default;
+}
+
+.account-card-usage {
+  --progress-color: var(--color-chart-1);
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-card) 55%, var(--color-sidebar));
+}
+.account-card-usage[data-tone='warning'],
+.account-card-usage[data-tone='danger'] {
+  --progress-color: var(--card-tone);
+}
+.account-card-usage-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--color-muted-foreground);
+}
+.account-card-percentage {
+  font-variant-numeric: tabular-nums;
+  color: var(--card-tone);
+  font-weight: 500;
+}
+.account-card-usage-numbers {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.account-card-usage-numbers strong {
+  font-size: 22px;
+  line-height: 30px;
+  font-weight: 600;
+  letter-spacing: -0.6px;
+}
+.account-card-usage-numbers > span {
+  font-size: 12px;
+  color: var(--color-muted-foreground);
+}
+.account-card-progress {
+  height: 5px;
+  margin-top: 9px;
+  border-radius: 5px;
+  background: var(--color-border);
+  overflow: hidden;
+}
+.account-card-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--progress-color);
+  border-radius: inherit;
+}
+.account-card-progress.is-unknown {
+  background: transparent;
+  border: 1px dashed var(--color-border-strong);
+}
+.account-card-usage-hint {
+  font-size: 11px;
+  line-height: 18px;
+  margin-top: 6px;
+  color: var(--color-muted-foreground);
+  overflow-wrap: anywhere;
+}
+.account-card-usage[data-tone='warning'] .account-card-usage-hint,
+.account-card-usage[data-tone='danger'] .account-card-usage-hint {
+  color: var(--card-tone);
+}
+.account-card-usage-meta {
+  min-height: 18px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 10px;
+  line-height: 18px;
+  color: var(--color-muted-foreground);
+  flex-wrap: wrap;
+}
+.account-card-usage-meta button {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  color: var(--color-text-secondary);
+}
+.account-card-usage-meta button:hover {
+  color: var(--action-text);
+}
+.account-card-usage-meta svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 150ms;
+}
+.account-card-usage-meta svg.is-open {
+  transform: rotate(180deg);
+}
+.account-card-quotas {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+.account-card-quota {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  align-items: baseline;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.account-card-quota > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text-secondary);
+}
+.account-card-quota strong {
+  font-weight: 500;
+}
+.account-card-quota small {
+  grid-column: 1 / -1;
+  color: var(--color-muted-foreground);
+  font-size: 10px;
+}
+
+.account-card-validity {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.account-card-validity > div {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.account-card-validity > div + div {
+  border-left: 1px solid var(--color-border);
+  padding-left: 16px;
+}
+.account-card-validity span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--color-muted-foreground);
+  font-size: 10px;
+}
+.account-card-validity svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
+.account-card-expiry-value {
+  font-size: 12px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--card-tone);
+  font-variant-numeric: tabular-nums;
+}
+.account-card-metadata {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.account-card-tag,
+.account-card-proxy,
+.account-card-tag-toggle {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-width: 0;
+  gap: 5px;
+  border-radius: 5px;
+  padding: 2px 6px;
+  font-size: 10px;
+  line-height: 17px;
+  color: var(--color-text-secondary);
+  background: var(--color-muted);
+}
+.account-card-tag > span,
+.account-card-proxy > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-card-tag svg,
+.account-card-proxy svg {
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+}
+.account-card-tag i {
+  width: 5px;
+  height: 5px;
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+.account-card-proxy {
+  color: var(--card-tone);
+  background: var(--card-tone-soft);
+}
+.account-card-tag-toggle:hover,
+.account-card-proxy:hover {
+  box-shadow: inset 0 0 0 1px var(--color-border-strong);
+}
+.account-card-notice {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px;
+  background: var(--card-tone-soft);
+  color: var(--card-tone);
+  border-radius: 7px;
+  text-align: left;
+}
+.account-card-notice > span {
+  flex: 1;
+  font-size: 11px;
+  line-height: 18px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+}
+.account-card-notice > svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+.account-card-notice:hover {
+  filter: brightness(0.98);
+}
+
+.account-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 13px;
+  margin-top: auto;
+  border-top: 1px solid var(--color-border);
+}
+.account-card-actions .account-card-primary {
+  height: 30px;
+  padding: 0 10px;
+  gap: 6px;
+  border-color: color-mix(in srgb, var(--action-bg) 25%, var(--color-border));
+  background: var(--action-soft);
+  color: var(--action-text);
+  font-size: 12px;
+  box-shadow: none;
+}
+.account-card-actions .account-card-primary:disabled {
+  opacity: 1;
+  border-color: var(--color-border);
+  background: var(--color-muted);
+  color: var(--color-muted-foreground);
+}
+.account-card-actions .account-card-primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--action-soft) 85%, var(--action-bg));
+}
+.account-card-secondary {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.account-card-actions .account-card-refresh,
+.account-card-actions .account-list-more-trigger {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--color-muted-foreground);
+}
+.account-card-actions svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.7;
+}
+.account-card button:focus-visible,
+.account-card input:focus-visible {
+  outline: 2px solid var(--action-ring);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.account-grid-add {
+  display: flex;
+  width: 100%;
+  height: 46px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: var(--color-muted-foreground);
+  border: 1px dashed var(--color-border-strong);
+  border-radius: 10px;
+  font-size: 12px;
+}
+.account-grid-add svg {
+  width: 15px;
+  height: 15px;
+}
+.account-grid-add:hover {
+  color: var(--action-text);
+  border-color: color-mix(in srgb, var(--action-bg) 25%, var(--color-border));
+  background: var(--action-soft);
+}
+.account-grid-empty {
+  height: 100%;
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+  padding: 24px;
+}
+.account-grid-empty > svg {
+  width: 32px;
+  height: 32px;
+  color: var(--color-muted-foreground);
+  stroke-width: 1.4;
+  margin-bottom: 4px;
+}
+.account-grid-empty h3 {
+  font-size: 16px;
+  font-weight: 600;
+}
+.account-grid-empty p {
+  font-size: 12px;
+  color: var(--color-muted-foreground);
+  max-width: 340px;
+  line-height: 22px;
+}
+.account-grid-loading {
+  overflow: auto;
+  padding: 2px;
+}
+.account-grid-loading > p {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 0;
+  color: var(--color-muted-foreground);
+  font-size: 12px;
+}
+.account-grid-loading-rows {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 304px), 1fr));
+  gap: 16px;
+}
+.account-card-skeleton {
+  height: 330px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  padding: 18px;
+}
+.account-card-skeleton span {
+  display: block;
+  height: 20px;
+  background: var(--color-muted);
+  border-radius: 5px;
+}
+.account-card-skeleton span:first-child {
+  width: 70%;
+  height: 38px;
+}
+.account-card-skeleton span:nth-child(2) {
+  height: 120px;
+}
+.account-card-skeleton span:last-child {
+  margin-top: auto;
+}
+
+@container account-card (max-width: 290px) {
+  .account-card-current {
+    display: none;
+  }
+  .account-card-usage {
+    padding: 12px;
+  }
+  .account-card-validity {
+    gap: 8px;
+  }
+  .account-card-validity > div + div {
+    padding-left: 10px;
+  }
+  .account-card-usage-numbers strong {
+    font-size: 20px;
+  }
+  .account-card-quota {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (hover: none) {
+  .account-card-copy {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .account-card,
+  .account-card-usage-meta svg {
+    transition: none;
+  }
+}
