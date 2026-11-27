@@ -273,6 +273,7 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 - Encrypt automatic backups with a persistent random local key and AES-256-GCM, avoiding macOS Keychain prompts during normal updates and backup operations.
 - Preserve existing primary account data. Create new backups directly from intact primary data; access Keychain only to recover an old encrypted backup when primary data is missing, retaining the original encrypted backup.
 - Keep keys and new backups in the user data directory across updates. Missing keys, failed authentication and interrupted writes preserve original files without regenerating keys, overwriting existing backups or falling back to plaintext writes.
+- Retry atomic replacement a bounded number of times when Windows temporarily locks a backup file, preserving the previous backup if retries fail.
 - Local keys provide less application isolation than Keychain storage. Keep `.backup.key` and `.backup.local.enc` together when copying or backing up user data.
 - Add migration, account retention, concurrent write and failure recovery tests to all platform release builds.
 

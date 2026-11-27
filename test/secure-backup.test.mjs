@@ -35,7 +35,11 @@ beforeEach(() =>
     denied: false,
     calls: 0,
     decrypts: 0,
-    failRename: false
+    failRename: false,
+    platform: process.platform,
+    renameFailures: 0,
+    renameAttempts: 0,
+    renameErrorCode: 'EPERM'
   })
 )
 
@@ -45,6 +49,7 @@ const { outputFiles } = await build({
   platform: 'node',
   format: 'esm',
   write: false,
+  define: { 'process.platform': 'globalThis.__secureBackupTest.platform' },
   plugins: [
     {
       name: 'isolated-keychain-and-disk-faults',
@@ -80,7 +85,13 @@ const { outputFiles } = await build({
           export * from 'node:fs/promises';
           import { rename as realRename } from 'node:fs/promises';
           export async function rename(from, to) {
-            if (globalThis.__secureBackupTest.failRename) throw Object.assign(Error('disk failure'), {code:'EIO'});
+            const c = globalThis.__secureBackupTest;
+            c.renameAttempts++;
+            if (c.failRename) throw Object.assign(Error('disk failure'), {code:'EIO'});
+            if (c.renameFailures > 0) {
+              c.renameFailures--;
+              throw Object.assign(Error('file in use'), {code:c.renameErrorCode});
+            }
             return realRename(from, to);
           }
         `
@@ -333,4 +344,52 @@ test('backup disk failure still allows intact primary accounts to load', async (
   assert.equal(control.calls, 0)
   await absent(path.join(dir, LOCAL))
   await absent(path.join(dir, PLAIN))
+})
+
+for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+  test(`Windows retries transient ${code} without deleting the old backup or changing its key`, async (t) => {
+    const dir = await directory(t)
+    await backup.writeSecureBackup(dir, sample)
+    const key = await fs.readFile(path.join(dir, KEY))
+    control.platform = 'win32'
+    control.renameErrorCode = code
+    control.renameFailures = 2
+    control.renameAttempts = 0
+    const updated = { ...sample, revision: 2 }
+    await backup.writeSecureBackup(dir, updated)
+    assert.equal(control.renameAttempts, 3)
+    assert.deepEqual(await backup.readSecureBackup(dir), updated)
+    assert.deepEqual(await fs.readFile(path.join(dir, KEY)), key)
+  })
+}
+
+test('Windows retry exhaustion retains the previous backup and cleans up the temporary file', async (t) => {
+  const dir = await directory(t)
+  await backup.writeSecureBackup(dir, sample)
+  const original = await fs.readFile(path.join(dir, LOCAL))
+  const key = await fs.readFile(path.join(dir, KEY))
+  control.platform = 'win32'
+  control.renameFailures = 100
+  control.renameAttempts = 0
+  await assert.rejects(backup.writeSecureBackup(dir, { accounts: {} }), { code: 'EPERM' })
+  assert.equal(control.renameAttempts, 10)
+  assert.deepEqual(await fs.readFile(path.join(dir, LOCAL)), original)
+  assert.deepEqual(await fs.readFile(path.join(dir, KEY)), key)
+  assert.equal(
+    (await fs.readdir(dir)).some((file) => file.endsWith('.tmp')),
+    false
+  )
+})
+
+test('permission errors on other platforms fail immediately and retain the previous backup', async (t) => {
+  const dir = await directory(t)
+  await backup.writeSecureBackup(dir, sample)
+  const original = await fs.readFile(path.join(dir, LOCAL))
+  control.platform = 'darwin'
+  control.renameErrorCode = 'EACCES'
+  control.renameFailures = 1
+  control.renameAttempts = 0
+  await assert.rejects(backup.writeSecureBackup(dir, { accounts: {} }), { code: 'EACCES' })
+  assert.equal(control.renameAttempts, 1)
+  assert.deepEqual(await fs.readFile(path.join(dir, LOCAL)), original)
 })

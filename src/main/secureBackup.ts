@@ -3,6 +3,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const LOCAL_NAME = 'kiro-accounts.backup.local.enc'
 const KEY_NAME = 'kiro-accounts.backup.key'
@@ -40,6 +41,26 @@ async function serialized<T>(dir: string, operation: () => Promise<T>): Promise<
   }
 }
 
+async function replaceBackupFile(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fs.rename(from, to)
+      return
+    } catch (error) {
+      // Windows 可能在其他读取者或扫描程序持有文件时暂时拒绝替换，不能先删除原备份。
+      const code = (error as NodeJS.ErrnoException).code
+      if (
+        process.platform !== 'win32' ||
+        attempt >= 9 ||
+        !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '')
+      ) {
+        throw error
+      }
+      await delay(25 * (attempt + 1))
+    }
+  }
+}
+
 // 写入并同步临时文件后才发布。密钥使用硬链接发布，绝不覆盖已存在的密钥。
 async function atomicWrite(file: string, data: Buffer, replace = true): Promise<void> {
   const temporary = `${file}.${randomBytes(8).toString('hex')}.tmp`
@@ -51,7 +72,7 @@ async function atomicWrite(file: string, data: Buffer, replace = true): Promise<
     } finally {
       await handle.close()
     }
-    if (replace) await fs.rename(temporary, file)
+    if (replace) await replaceBackupFile(temporary, file)
     else await fs.link(temporary, file)
   } finally {
     await fs.unlink(temporary).catch(() => {})
