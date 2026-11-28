@@ -1,31 +1,19 @@
 import crypto from 'crypto'
+import { newUUID } from './http-utils'
 
 function b64url(data: Buffer): string {
   return data.toString('base64url')
 }
 
 function jwkToPublicKey(jwk: Record<string, string>): crypto.KeyObject {
-  const n = Buffer.from(jwk.n, 'base64url')
-  const e = Buffer.from(jwk.e, 'base64url')
   return crypto.createPublicKey({
     key: {
       kty: 'RSA',
-      n: n.toString('base64url'),
-      e: e.toString('base64url')
+      n: jwk.n,
+      e: jwk.e
     },
     format: 'jwk'
   })
-}
-
-function genUUID(): string {
-  const b = crypto.randomBytes(16)
-  return [
-    b.subarray(0, 4).toString('hex'),
-    b.subarray(4, 6).toString('hex'),
-    b.subarray(6, 8).toString('hex'),
-    b.subarray(8, 10).toString('hex'),
-    b.subarray(10, 16).toString('hex')
-  ].join('-')
 }
 
 /** JWE 加密密码 (RSA-OAEP-256 + A256GCM) */
@@ -67,7 +55,7 @@ export function encryptPassword(
     iss: `${region}.${issuer}`,
     iat: now,
     nbf: now,
-    jti: genUUID(),
+    jti: newUUID(),
     exp: now + 300,
     aud: `${region}.${audience}`,
     password

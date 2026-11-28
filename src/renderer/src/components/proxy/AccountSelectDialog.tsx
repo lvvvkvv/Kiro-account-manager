@@ -1,3 +1,4 @@
+import { VirtualRows } from '../ui/VirtualRows'
 import { useState, useMemo } from 'react'
 import { X, Search, Check, User, CreditCard, Zap, Mail, AlertCircle, Ban } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Badge } from '../ui'
@@ -19,12 +20,12 @@ export function AccountSelectDialog({
   selectedAccountId,
   onSelect,
   isEn
-}: AccountSelectDialogProps) {
+}: AccountSelectDialogProps): React.ReactNode {
   const [searchQuery, setSearchQuery] = useState('')
 
   const accountList = useMemo(() => {
-    return Array.from(accounts.values())
-  }, [accounts])
+    return open ? Array.from(accounts.values()) : []
+  }, [accounts, open])
 
   const filteredAccounts = useMemo(() => {
     if (!searchQuery.trim()) return accountList
@@ -37,7 +38,7 @@ export function AccountSelectDialog({
     )
   }, [accountList, searchQuery])
 
-  const handleSelect = (accountId: string | undefined) => {
+  const handleSelect = (accountId: string | undefined): void => {
     onSelect(accountId)
     onOpenChange(false)
   }
@@ -213,94 +214,99 @@ export function AccountSelectDialog({
                   : '暂无可用账号'}
             </div>
           ) : (
-            filteredAccounts.map((acc) => {
-              const isSelected = selectedAccountId === acc.id
-              const usagePercent = getUsagePercent(acc)
-              const usageText = getUsageText(acc)
-              const statusInfo = getStatusInfo(acc)
-              const isBanned = isBannedAccount(acc)
-              const hasError = acc.status === 'error' || acc.status === 'expired' || isBanned
+            <VirtualRows
+              items={filteredAccounts}
+              estimateSize={152}
+              maxHeight="50vh"
+              renderRow={(acc) => {
+                const isSelected = selectedAccountId === acc.id
+                const usagePercent = getUsagePercent(acc)
+                const usageText = getUsageText(acc)
+                const statusInfo = getStatusInfo(acc)
+                const isBanned = isBannedAccount(acc)
+                const hasError = acc.status === 'error' || acc.status === 'expired' || isBanned
 
-              return (
-                <div
-                  key={acc.id}
-                  className={`ui-list-row block cursor-pointer transition-colors hover:bg-muted ${
-                    isSelected ? 'bg-muted border-border-strong' : ''
-                  }  ${hasError ? 'opacity-60' : ''}`}
-                  onClick={() => handleSelect(acc.id)}
-                >
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="flex items-start gap-3 flex-1 min-w-0">
-                      <div
-                        className={`w-8 h-8 rounded-[8px] flex items-center justify-center flex-shrink-0 ${
-                          hasError ? 'bg-destructive/10' : 'bg-primary/10'
-                        }`}
-                      >
-                        {hasError ? (
-                          <AlertCircle className="h-5 w-5 text-destructive" />
-                        ) : (
-                          <User className="h-5 w-5 text-primary" />
-                        )}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        {/* 邮箱 */}
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Mail className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-                          <span className="ui-list-title min-w-0 truncate">
-                            {acc.email || acc.id.substring(0, 12) + '...'}
-                          </span>
-                          {/* 状态标签 */}
-                          {statusInfo && (
-                            <Badge className={` ${statusInfo.color}`}>
-                              {statusInfo.icon}
-                              <span className="">{statusInfo.text}</span>
-                            </Badge>
+                return (
+                  <div
+                    key={acc.id}
+                    className={`ui-list-row block cursor-pointer transition-colors hover:bg-muted ${
+                      isSelected ? 'bg-muted border-border-strong' : ''
+                    }  ${hasError ? 'opacity-60' : ''}`}
+                    onClick={() => handleSelect(acc.id)}
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex items-start gap-3 flex-1 min-w-0">
+                        <div
+                          className={`w-8 h-8 rounded-[8px] flex items-center justify-center flex-shrink-0 ${
+                            hasError ? 'bg-destructive/10' : 'bg-primary/10'
+                          }`}
+                        >
+                          {hasError ? (
+                            <AlertCircle className="h-5 w-5 text-destructive" />
+                          ) : (
+                            <User className="h-5 w-5 text-primary" />
                           )}
                         </div>
-
-                        {/* 错误信息 */}
-                        {acc.lastError && (
-                          <div className="text-caption text-destructive mt-1 truncate">
-                            {acc.lastError}
+                        <div className="flex-1 min-w-0">
+                          {/* 邮箱 */}
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Mail className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                            <span className="ui-list-title min-w-0 truncate">
+                              {acc.email || acc.id.substring(0, 12) + '...'}
+                            </span>
+                            {/* 状态标签 */}
+                            {statusInfo && (
+                              <Badge className={` ${statusInfo.color}`}>
+                                {statusInfo.icon}
+                                <span className="">{statusInfo.text}</span>
+                              </Badge>
+                            )}
                           </div>
-                        )}
 
-                        {/* 订阅类型和使用量 */}
-                        <div className="flex flex-wrap items-center gap-2 mt-2">
-                          <Badge className={` ${getSubscriptionColor(acc.subscription?.title)}`}>
-                            <CreditCard className="h-3 w-3" />
-                            {acc.subscription?.title || 'Unknown'}
-                          </Badge>
-                          <span className="text-caption text-muted-foreground">
-                            {isEn ? 'Usage' : '使用量'}: {usageText}
-                          </span>
-                        </div>
+                          {/* 错误信息 */}
+                          {acc.lastError && (
+                            <div className="text-caption text-destructive mt-1 truncate">
+                              {acc.lastError}
+                            </div>
+                          )}
 
-                        {/* 使用量进度条 */}
-                        <div className="mt-2 w-full bg-muted rounded-full h-1.5 overflow-hidden">
-                          <div
-                            className={`h-full transition-all ${
-                              usagePercent > 80
-                                ? 'bg-destructive'
-                                : usagePercent > 50
-                                  ? 'bg-warning'
-                                  : 'bg-success'
-                            }`}
-                            style={{ width: `${usagePercent}%` }}
-                          />
-                        </div>
+                          {/* 订阅类型和使用量 */}
+                          <div className="flex flex-wrap items-center gap-2 mt-2">
+                            <Badge className={` ${getSubscriptionColor(acc.subscription?.title)}`}>
+                              <CreditCard className="h-3 w-3" />
+                              {acc.subscription?.title || 'Unknown'}
+                            </Badge>
+                            <span className="text-caption text-muted-foreground">
+                              {isEn ? 'Usage' : '使用量'}: {usageText}
+                            </span>
+                          </div>
 
-                        {/* ID */}
-                        <div className="text-caption text-muted-foreground mt-1.5 font-mono">
-                          ID: {acc.id.substring(0, 20)}...
+                          {/* 使用量进度条 */}
+                          <div className="mt-2 w-full bg-muted rounded-full h-1.5 overflow-hidden">
+                            <div
+                              className={`h-full transition-all ${
+                                usagePercent > 80
+                                  ? 'bg-destructive'
+                                  : usagePercent > 50
+                                    ? 'bg-warning'
+                                    : 'bg-success'
+                              }`}
+                              style={{ width: `${usagePercent}%` }}
+                            />
+                          </div>
+
+                          {/* ID */}
+                          <div className="text-caption text-muted-foreground mt-1.5 font-mono">
+                            ID: {acc.id.substring(0, 20)}...
+                          </div>
                         </div>
                       </div>
+                      {isSelected && <Check className="h-4 w-4 text-primary flex-shrink-0 mt-2" />}
                     </div>
-                    {isSelected && <Check className="h-4 w-4 text-primary flex-shrink-0 mt-2" />}
                   </div>
-                </div>
-              )
-            })
+                )
+              }}
+            />
           )}
         </CardContent>
       </Card>

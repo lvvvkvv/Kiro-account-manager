@@ -12,14 +12,7 @@ import { create } from 'zustand'
  *   useTaskStore.getState().completeTask(id, { successCount: 95, failedCount: 5 })
  */
 
-export type TaskKind =
-  | 'register-batch'      // 批量注册
-  | 'subscription-batch'  // 批量订阅获取链接
-  | 'overage-batch'       // 批量开启超额
-  | 'proxy-validation'    // 代理池验活
-  | 'token-refresh'       // Token 批量刷新
-  | 'account-check'       // 账号状态批量检查
-  | 'other'
+export type TaskKind = 'register-batch' | 'subscription-batch'
 
 export type TaskStatus = 'running' | 'paused' | 'success' | 'failed' | 'cancelled'
 
@@ -62,46 +55,54 @@ interface TasksState {
 }
 
 interface TasksActions {
-  /** 创建任务并返回 id；若 fixedId 提供则用该 id，便于调用方持有引用 */
-  createTask: (input: Omit<TaskEntry, 'id' | 'createdAt' | 'updatedAt' | 'status' | 'progress' | 'done' | 'successCount' | 'failedCount'> & {
-    fixedId?: string
-    status?: TaskStatus
-    progress?: number
-    done?: number
-    successCount?: number
-    failedCount?: number
-  }) => string
+  /** 创建任务并返回 id */
+  createTask: (
+    input: Omit<
+      TaskEntry,
+      | 'id'
+      | 'createdAt'
+      | 'updatedAt'
+      | 'status'
+      | 'progress'
+      | 'done'
+      | 'successCount'
+      | 'failedCount'
+    > & {
+      status?: TaskStatus
+      progress?: number
+      done?: number
+      successCount?: number
+      failedCount?: number
+    }
+  ) => string
   updateTask: (id: string, updates: Partial<TaskEntry>) => void
-  completeTask: (id: string, summary?: { successCount?: number; failedCount?: number; error?: string }) => void
+  completeTask: (
+    id: string,
+    summary?: { successCount?: number; failedCount?: number; error?: string }
+  ) => void
   failTask: (id: string, error: string) => void
   cancelTask: (id: string) => void
   removeTask: (id: string) => void
   clearFinished: () => void
-  clearAll: () => void
-  /** 返回当前进行中任务数（running + paused） */
-  getActiveCount: () => number
 }
 
 type TasksStore = TasksState & TasksActions
 
 // C7: 持久化键
 const STORAGE_KEY = 'kiro-task-history'
-const MAX_PERSISTED = 200  // 最多持久化最近 200 条已完成任务
+const MAX_PERSISTED = 200 // 最多持久化最近 200 条已完成任务
 
 /** 持久化任务（仅完成的任务，运行中任务不存） */
 function persistTasks(tasks: Map<string, TaskEntry>): void {
   try {
     const finished = Array.from(tasks.values())
       .filter((t) => t.status !== 'running' && t.status !== 'paused')
-      .sort((a, b) => (b.updatedAt - a.updatedAt))
+      .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, MAX_PERSISTED)
-      // 不持久化回调（函数无法序列化）
-      .map(({ onCancel, onPause, onResume, ...rest }) => {
-        void onCancel; void onPause; void onResume
-        return rest
-      })
     localStorage.setItem(STORAGE_KEY, JSON.stringify(finished))
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 }
 
 function loadPersistedTasks(): Map<string, TaskEntry> {
@@ -112,7 +113,8 @@ function loadPersistedTasks(): Map<string, TaskEntry> {
     const map = new Map<string, TaskEntry>()
     for (const t of arr) {
       // 启动时强制把"运行中"标记为"取消"（应用重启时已运行任务必然中断）
-      const status: TaskStatus = (t.status === 'running' || t.status === 'paused') ? 'cancelled' : t.status
+      const status: TaskStatus =
+        t.status === 'running' || t.status === 'paused' ? 'cancelled' : t.status
       map.set(t.id, { ...t, status })
     }
     return map
@@ -125,7 +127,7 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
   tasks: loadPersistedTasks(),
 
   createTask: (input) => {
-    const id = input.fixedId || crypto.randomUUID()
+    const id = crypto.randomUUID()
     const now = Date.now()
     const entry: TaskEntry = {
       id,
@@ -158,7 +160,7 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
     set((state) => {
       const next = new Map(state.tasks)
       const existing = next.get(id)
-      if (!existing) return state
+      if (!existing || !['running', 'paused'].includes(existing.status)) return state
       next.set(id, { ...existing, ...updates, updatedAt: Date.now() })
       return { tasks: next }
     })
@@ -168,16 +170,21 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
     set((state) => {
       const next = new Map(state.tasks)
       const existing = next.get(id)
-      if (!existing) return state
+      if (!existing || !['running', 'paused'].includes(existing.status)) return state
       const successCount = summary?.successCount ?? existing.successCount
       const failedCount = summary?.failedCount ?? existing.failedCount
       const status: TaskStatus = summary?.error
         ? 'failed'
-        : (failedCount > 0 && successCount === 0 ? 'failed' : 'success')
+        : failedCount > 0 && successCount === 0
+          ? 'failed'
+          : 'success'
       next.set(id, {
         ...existing,
         status,
         progress: 100,
+        onCancel: undefined,
+        onPause: undefined,
+        onResume: undefined,
         successCount,
         failedCount,
         error: summary?.error,
@@ -193,10 +200,13 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
     set((state) => {
       const next = new Map(state.tasks)
       const existing = next.get(id)
-      if (!existing) return state
+      if (!existing || !['running', 'paused'].includes(existing.status)) return state
       next.set(id, {
         ...existing,
         status: 'failed',
+        onCancel: undefined,
+        onPause: undefined,
+        onResume: undefined,
         error,
         finishedAt: Date.now(),
         updatedAt: Date.now()
@@ -208,19 +218,27 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
 
   cancelTask: (id) => {
     const task = get().tasks.get(id)
-    try { task?.onCancel?.() } catch { /* ignore */ }
+    if (!task || !['running', 'paused'].includes(task.status)) return
     set((state) => {
       const next = new Map(state.tasks)
       const existing = next.get(id)
-      if (!existing) return state
+      if (!existing || !['running', 'paused'].includes(existing.status)) return state
       next.set(id, {
         ...existing,
         status: 'cancelled',
+        onCancel: undefined,
+        onPause: undefined,
+        onResume: undefined,
         finishedAt: Date.now(),
         updatedAt: Date.now()
       })
       return { tasks: next }
     })
+    try {
+      task.onCancel?.()
+    } catch {
+      /* ignore */
+    }
     persistTasks(get().tasks)
   },
 
@@ -244,18 +262,5 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
       return { tasks: next }
     })
     persistTasks(get().tasks)
-  },
-
-  clearAll: () => {
-    set({ tasks: new Map() })
-    persistTasks(get().tasks)
-  },
-
-  getActiveCount: () => {
-    let count = 0
-    for (const t of get().tasks.values()) {
-      if (t.status === 'running' || t.status === 'paused') count++
-    }
-    return count
   }
 }))

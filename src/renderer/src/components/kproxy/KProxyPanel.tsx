@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Play,
   Square,
@@ -95,6 +95,7 @@ export function KProxyPanel() {
   const [isRunning, setIsRunning] = useState(false)
   const [isInitialized, setIsInitialized] = useState(false)
   const [isInitializing, setIsInitializing] = useState(false)
+  const initFlags = useRef({ initialized: false, initializing: false })
   const [config, setConfig] = useState<KProxyConfig>({
     enabled: false,
     port: 8899,
@@ -123,14 +124,14 @@ export function KProxyPanel() {
 
   // 初始化 K-Proxy
   const initKProxy = useCallback(async () => {
-    if (isInitialized || isInitializing) return
+    if (initFlags.current.initialized || initFlags.current.initializing) return
+    initFlags.current.initializing = true
     setIsInitializing(true)
     setError(null)
 
     try {
       const result = await window.api.kproxyInit()
       if (result.success) {
-        setIsInitialized(true)
         if (result.caInfo) {
           setCaInfo(result.caInfo)
         }
@@ -143,21 +144,24 @@ export function KProxyPanel() {
           setStats(status.stats as KProxyStats)
         }
         setIsRunning(status.running)
+        await checkCaInstalled()
+        initFlags.current.initialized = true
+        setIsInitialized(true)
       } else {
         setError(result.error || 'Failed to initialize K-Proxy')
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Init failed')
     } finally {
+      initFlags.current.initializing = false
       setIsInitializing(false)
     }
-  }, [isInitialized, isInitializing])
+  }, [checkCaInstalled])
 
   // 初始化
   useEffect(() => {
-    initKProxy()
-    checkCaInstalled()
-  }, [initKProxy, checkCaInstalled])
+    void initKProxy()
+  }, [initKProxy])
 
   // 监听事件
   useEffect(() => {

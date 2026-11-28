@@ -94,7 +94,7 @@ interface ApiKeyInfo {
   enabled: boolean
 }
 
-interface ProxyConfig {
+export interface ProxyConfig {
   enabled: boolean
   port: number
   host: string
@@ -121,6 +121,7 @@ interface ProxyConfig {
   // Agent 模式 + Steering
   agentMode?: 'vibe' | 'spec'
   workspacePath?: string
+  tls?: { enabled?: boolean; cert?: string; key?: string; certPath?: string; keyPath?: string }
   // v1.8 安全 / 限流 / 可观测
   maxRequestBodyBytes?: number
   allowedIPs?: string[]
@@ -292,9 +293,8 @@ export function ProxyPanel() {
         setSessionStats(result.sessionStats as SessionStats)
       }
 
-      const accountsResult = await window.api.proxyGetAccounts()
-      setAccountCount(accountsResult.accounts.length)
-      setAvailableCount(accountsResult.availableCount)
+      setAccountCount(result.pool?.total || 0)
+      setAvailableCount(result.pool?.available || 0)
     } catch (err) {
       console.error('Failed to fetch proxy status:', err)
     }
@@ -482,8 +482,13 @@ export function ProxyPanel() {
     ensureProxyResponseListenerRegistered()
     _refSetProxyRecentLogs = setRecentLogs
     // 触发一次统计刷新即可（统计有独立的 fetchStatus，不依赖订阅）
+    let statusTimer: ReturnType<typeof setTimeout> | undefined
     const unsubStatsHook = window.api.onProxyResponse(() => {
-      fetchStatus()
+      if (statusTimer) return
+      statusTimer = setTimeout(() => {
+        statusTimer = undefined
+        void fetchStatus()
+      }, 200)
     })
 
     const unsubError = window.api.onProxyError((err) => {
@@ -501,6 +506,7 @@ export function ProxyPanel() {
     return () => {
       unsubRequest()
       unsubStatsHook()
+      clearTimeout(statusTimer)
       unsubError()
       unsubStatus()
       _refSetProxyRecentLogs = null
@@ -1234,9 +1240,10 @@ export function ProxyPanel() {
                   type="number"
                   min={0}
                   max={10}
-                  value={config.maxRetries || 3}
+                  value={config.maxRetries ?? 3}
                   onChange={(e) => {
-                    const retries = parseInt(e.target.value) || 3
+                    const parsed = parseInt(e.target.value)
+                    const retries = Number.isFinite(parsed) ? Math.max(0, Math.min(10, parsed)) : 3
                     setConfig((prev) => ({ ...prev, maxRetries: retries }))
                     window.api.proxyUpdateConfig({ maxRetries: retries })
                   }}
@@ -1271,33 +1278,6 @@ export function ProxyPanel() {
                   disabled={isRunning}
                   className="rounded-control text-body h-control"
                 />
-              </div>
-              <div className="space-y-2">
-                <Label
-                  htmlFor="clientDrivenToolExecution"
-                  className="text-caption"
-                  title={
-                    isEn
-                      ? 'Recommended for OpenCode and Claude Code. Disable only when the proxy should fabricate tool results.'
-                      : '推荐用于 OpenCode 和 Claude Code。仅在需要代理伪造工具结果时关闭。'
-                  }
-                >
-                  {isEn ? 'Tool Execution' : '工具执行模式'}
-                </Label>
-                <div className="flex items-center justify-between h-control px-2.5 rounded-control border border-input bg-card">
-                  <span className="text-caption text-muted-foreground">
-                    {isEn ? 'Client-driven' : '客户端驱动'}
-                  </span>
-                  <Switch
-                    id="clientDrivenToolExecution"
-                    checked={config.clientDrivenToolExecution !== false}
-                    onCheckedChange={(checked) => {
-                      setConfig((prev) => ({ ...prev, clientDrivenToolExecution: checked }))
-                      window.api.proxyUpdateConfig({ clientDrivenToolExecution: checked })
-                    }}
-                    disabled={isRunning}
-                  />
-                </div>
               </div>
               <div className="space-y-2">
                 <Label
@@ -1447,8 +1427,8 @@ export function ProxyPanel() {
 
       {/* v1.8 反代安全 / 可观测设置（独立卡片，可折叠） */}
       <ProxySecurityPanel
-        config={config as unknown as Parameters<typeof ProxySecurityPanel>[0]['config']}
-        setConfig={setConfig as unknown as Parameters<typeof ProxySecurityPanel>[0]['setConfig']}
+        config={config}
+        setConfig={setConfig}
         isRunning={isRunning}
         isEn={isEn}
       />

@@ -3,19 +3,30 @@ import * as forge from 'node-forge'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
+import { promisify } from 'util'
 import type { CACertInfo } from './types'
+const generateKeyPair = promisify(crypto.generateKeyPair)
+async function rsaKeys(): Promise<forge.pki.rsa.KeyPair> {
+  const pair = await generateKeyPair('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs1', format: 'pem' }
+  })
+  return {
+    publicKey: forge.pki.publicKeyFromPem(pair.publicKey),
+    privateKey: forge.pki.privateKeyFromPem(pair.privateKey)
+  }
+}
 
 const CA_CERT_FILENAME = 'kproxy-ca.crt'
 const CA_KEY_FILENAME = 'kproxy-ca.key'
-const CERT_CACHE_DIR = 'kproxy-certs'
-
-// 证书缓存（避免重复生成）
-const certCache = new Map<string, { cert: string; key: string }>()
 
 /**
  * CA 证书管理器
  */
 export class CertManager {
+  private readonly certCache = new Map<string, { cert: string; key: string; expiresAt: number }>()
+  private readonly pending = new Map<string, Promise<{ cert: string; key: string }>>()
   private dataPath: string
   private caCert: forge.pki.Certificate | null = null
   private caKey: forge.pki.PrivateKey | null = null
@@ -32,18 +43,14 @@ export class CertManager {
     const certPath = path.join(this.dataPath, CA_CERT_FILENAME)
     const keyPath = path.join(this.dataPath, CA_KEY_FILENAME)
 
-    // 确保证书缓存目录存在
-    const cachePath = path.join(this.dataPath, CERT_CACHE_DIR)
-    if (!fs.existsSync(cachePath)) {
-      fs.mkdirSync(cachePath, { recursive: true })
-    }
+    await fs.promises.mkdir(this.dataPath, { recursive: true })
 
     // 尝试加载现有证书
     if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
       try {
-        const certPem = fs.readFileSync(certPath, 'utf8')
-        const keyPem = fs.readFileSync(keyPath, 'utf8')
-        
+        const certPem = await fs.promises.readFile(certPath, 'utf8')
+        const keyPem = await fs.promises.readFile(keyPath, 'utf8')
+
         this.caCert = forge.pki.certificateFromPem(certPem)
         this.caKey = forge.pki.privateKeyFromPem(keyPem)
 
@@ -67,17 +74,17 @@ export class CertManager {
   /**
    * 生成 CA 证书
    */
-  private generateCACert(certPath: string, keyPath: string): CACertInfo {
+  private async generateCACert(certPath: string, keyPath: string): Promise<CACertInfo> {
     console.log('[CertManager] Generating new CA certificate...')
 
     // 生成 RSA 密钥对
-    const keys = forge.pki.rsa.generateKeyPair(2048)
-    
+    const keys = await rsaKeys()
+
     // 创建证书
     const cert = forge.pki.createCertificate()
     cert.publicKey = keys.publicKey
     cert.serialNumber = this.generateSerialNumber()
-    
+
     // 设置有效期（10年）
     cert.validity.notBefore = new Date()
     cert.validity.notAfter = new Date()
@@ -118,8 +125,8 @@ export class CertManager {
     const keyPem = forge.pki.privateKeyToPem(keys.privateKey)
 
     // 保存到文件
-    fs.writeFileSync(certPath, certPem)
-    fs.writeFileSync(keyPath, keyPem)
+    await fs.promises.writeFile(certPath, certPem)
+    await fs.promises.writeFile(keyPath, keyPem, { mode: 0o600 })
 
     this.caCert = cert
     this.caKey = keys.privateKey
@@ -132,25 +139,30 @@ export class CertManager {
   /**
    * 为指定域名生成证书
    */
-  generateCertForHost(hostname: string): { cert: string; key: string } {
-    // 检查缓存
-    const cached = certCache.get(hostname)
-    if (cached) {
-      return cached
+  generateCertForHost(hostname: string): Promise<{ cert: string; key: string }> {
+    const cached = this.certCache.get(hostname)
+    if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached)
+    let task = this.pending.get(hostname)
+    if (!task) {
+      task = this.createHostCertificate(hostname).finally(() => this.pending.delete(hostname))
+      this.pending.set(hostname, task)
     }
+    return task
+  }
 
+  private async createHostCertificate(hostname: string): Promise<{ cert: string; key: string }> {
     if (!this.caCert || !this.caKey) {
       throw new Error('CA certificate not initialized')
     }
 
     // 生成密钥对
-    const keys = forge.pki.rsa.generateKeyPair(2048)
-    
+    const keys = await rsaKeys()
+
     // 创建证书
     const cert = forge.pki.createCertificate()
     cert.publicKey = keys.publicKey
     cert.serialNumber = this.generateSerialNumber()
-    
+
     // 设置有效期（1年）
     cert.validity.notBefore = new Date()
     cert.validity.notAfter = new Date()
@@ -197,7 +209,8 @@ export class CertManager {
     }
 
     // 缓存证书
-    certCache.set(hostname, result)
+    if (this.certCache.size >= 1000) this.certCache.delete(this.certCache.keys().next().value!)
+    this.certCache.set(hostname, { ...result, expiresAt: cert.validity.notAfter.getTime() })
 
     return result
   }
@@ -217,13 +230,6 @@ export class CertManager {
   }
 
   /**
-   * 清除证书缓存
-   */
-  clearCache(): void {
-    certCache.clear()
-  }
-
-  /**
    * 生成序列号
    */
   private generateSerialNumber(): string {
@@ -233,9 +239,15 @@ export class CertManager {
   /**
    * 提取证书信息
    */
-  private extractCertInfo(certPath: string, keyPath: string, certPem: string, keyPem: string): CACertInfo {
+  private extractCertInfo(
+    certPath: string,
+    keyPath: string,
+    certPem: string,
+    keyPem: string
+  ): CACertInfo {
     const cert = forge.pki.certificateFromPem(certPem)
-    const fingerprint = forge.md.sha256.create()
+    const fingerprint = forge.md.sha256
+      .create()
       .update(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes())
       .digest()
       .toHex()

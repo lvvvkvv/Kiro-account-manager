@@ -1,4 +1,4 @@
-import { useAppUpdate } from '@/contexts/UpdateContext'
+import { useAppUpdateBadge } from '@/contexts/UpdateContext'
 import {
   Home,
   Users,
@@ -17,7 +17,7 @@ import {
   Stethoscope,
   Archive
 } from 'lucide-react'
-import { useEffect, useId, useState } from 'react'
+import { memo, useEffect, useId, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { cn } from '@/lib/utils'
 import kiroLogoSmall from '@/assets/Kiro Logo.svg'
@@ -66,12 +66,16 @@ const menuItemsConfig: { id: PageType; labelKey: string; icon: React.ElementType
   { id: 'about', labelKey: 'nav.about', icon: Info }
 ]
 
-export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse }: SidebarProps) {
-  const { darkMode } = useAccountsStore()
-  const { state: updateState } = useAppUpdate()
-  const hasUpdate = !!(updateState.available || updateState.ready)
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+export const Sidebar = memo(function Sidebar({
+  currentPage,
+  onPageChange,
+  collapsed,
+  onToggleCollapse
+}: SidebarProps) {
+  const darkMode = useAccountsStore((state) => state.darkMode)
+  const hasUpdate = useAppUpdateBadge()
+  const { t, actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
   const [tip, setTip] = useState<{ text: string; top: number; left: number } | null>(null)
   const tipId = useId()
   const toggleLabel = collapsed
@@ -156,7 +160,12 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
             >
               <span className="relative shrink-0">
                 <Icon className={cn('shrink-0', collapsed ? 'size-5' : 'size-[18px]')} />
-                {item.id === 'about' && hasUpdate && <span aria-label={isEn ? 'Update available' : '有可用更新'} className="absolute -right-1 -top-1 size-2 rounded-full bg-red-500" />}
+                {item.id === 'about' && hasUpdate && (
+                  <span
+                    aria-label={isEn ? 'Update available' : '有可用更新'}
+                    className="absolute -right-1 -top-1 size-2 rounded-full bg-red-500"
+                  />
+                )}
               </span>
               {!collapsed && <span className="min-w-0 truncate">{label}</span>}
             </button>
@@ -200,4 +209,4 @@ export function Sidebar({ currentPage, onPageChange, collapsed, onToggleCollapse
         )}
     </aside>
   )
-}
+})

@@ -1,6 +1,5 @@
 import { PageHeader } from '../layout/PageHeader'
-import { resolveLanguage } from '@/lib/language'
-import { useState, useCallback } from 'react'
+import { useRef, useState } from 'react'
 import {
   Archive,
   Download,
@@ -15,65 +14,26 @@ import {
 import { useAccountsStore } from '@/store/accounts'
 import { useWebhookStore } from '@/store/webhooks'
 import { useTranslation } from '@/hooks/useTranslation'
+import {
+  buildPortableConfig,
+  containsConfigSecrets,
+  importPortableConfig,
+  type ConfigImportResult
+} from '@/lib/configSync'
+import {
+  REGISTRATION_PREFERENCE_KEYS,
+  TEMPLATES_KEY,
+  EMAIL_BLACKLIST_KEY
+} from '@/lib/registration'
 import { Card, CardContent, CardHeader, CardTitle, Button, Label, Switch } from '../ui'
 
-/**
- * 配置同步页面
- *
- * 把"非敏感的应用配置"（代理池、Webhook、注册模板、限速/定时/配额、过滤偏好等）
- * 导出为单一 JSON 文件，方便在多台电脑之间同步。
- *
- * 敏感数据（账号凭据、refreshToken 等）不会被导出，
- * 它们走「账号管理 - 导出」专用通道（独立加密）。
- */
-
-interface PortableConfig {
-  version: 1
-  exportedAt: string
-  app: string // "kiro-account-manager"
-  /** 代理池条目（脱敏：密码字段会被打码） */
-  proxyPool?: Array<Record<string, unknown>>
-  proxyPoolConfig?: Record<string, unknown>
-  /** Webhook 列表 */
-  webhooks?: Array<Record<string, unknown>>
-  /** RegisterPage 配置（kiro-register-config） */
-  registerConfig?: Record<string, unknown>
-  /** 注册模板（kiro-register-templates） */
-  registerTemplates?: Array<Record<string, unknown>>
-  /** 其它注册相关 localStorage 设置 */
-  registerLocalStorage?: Record<string, string>
-  /** App 设置（部分非敏感字段） */
-  appSettings?: {
-    theme?: string
-    darkMode?: boolean
-    language?: string
-    autoRefreshEnabled?: boolean
-    autoRefreshInterval?: number
-    autoRefreshConcurrency?: number
-    statusCheckInterval?: number
-    privacyMode?: boolean
-    usagePrecision?: boolean
-    autoSwitchEnabled?: boolean
-    autoSwitchThreshold?: number
-    autoSwitchInterval?: number
-    switchTarget?: string
-  }
-}
-
-const REGISTER_LS_KEYS = [
-  'kiro-register-ratelimit-enabled',
-  'kiro-register-ratelimit-max',
-  'kiro-register-autobackoff',
-  'kiro-register-dailyquota-limit',
-  'kiro-register-schedule-enabled',
-  'kiro-register-schedule-time',
-  'kiro-register-mixed-sources'
-]
-
 export function ConfigSyncPage(): React.ReactNode {
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
-  const store = useAccountsStore()
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
+  const proxyCount = useAccountsStore((state) => state.proxyPool.size)
+  const webhookCount = useWebhookStore((state) => state.webhooks.size)
+  const busy = useRef(false)
+  const [working, setWorking] = useState(false)
 
   // 导出选项（默认全开）
   const [opts, setOpts] = useState({
@@ -83,7 +43,7 @@ export function ConfigSyncPage(): React.ReactNode {
     registerTemplates: true,
     registerSettings: true,
     appSettings: true,
-    /** 包含代理密码？关闭时只导出 host:port，更安全用于分享 */
+    /** 包含代理认证信息？关闭时只导出 host:port，更安全用于分享 */
     includeProxyCredentials: false,
     /** 启用密码加密：使用用户密码 + Web Crypto AES-GCM */
     encrypt: false
@@ -91,259 +51,80 @@ export function ConfigSyncPage(): React.ReactNode {
   const [encryptPassword, setEncryptPassword] = useState('')
 
   const [lastExportSize, setLastExportSize] = useState<number | null>(null)
-  const [lastImportResult, setLastImportResult] = useState<{
-    success: boolean
-    counts?: Record<string, number>
-    error?: string
-  } | null>(null)
+  const [lastImportResult, setLastImportResult] = useState<ConfigImportResult | null>(null)
 
-  const handleExport = useCallback(async (): Promise<void> => {
-    const payload: PortableConfig = {
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      app: 'kiro-account-manager'
-    }
-
-    if (opts.proxyPool && store.proxyPool.size > 0) {
-      payload.proxyPool = Array.from(store.proxyPool.values()).map((p) => {
-        const out: Record<string, unknown> = { ...p }
-        if (!opts.includeProxyCredentials) {
-          // 脱敏：密码 + url 中的密码部分
-          delete out.password
-          out.url = p.url.replace(/:([^:@/]+)@/, ':***@')
-        }
-        return out
-      })
-      payload.proxyPoolConfig = { ...store.proxyPoolConfig }
-    }
-
-    if (opts.webhooks) {
-      const webhooks = Array.from(useWebhookStore.getState().webhooks.values())
-      payload.webhooks = webhooks.map((w) => ({ ...w }))
-    }
-
-    if (opts.registerConfig) {
-      try {
-        const raw = localStorage.getItem('kiro-register-config')
-        if (raw) payload.registerConfig = JSON.parse(raw)
-      } catch {
-        /* ignore */
+  const handleExport = async (): Promise<void> => {
+    if (busy.current) return
+    busy.current = true
+    setWorking(true)
+    try {
+      const payload = buildPortableConfig(opts)
+      if (containsConfigSecrets(payload) && !opts.encrypt) {
+        throw new Error(
+          isEn
+            ? 'This selection contains proxy/mailbox credentials or Webhook secrets. Enable encryption to export it.'
+            : '所选配置含有代理、邮箱凭据或 Webhook 等敏感信息，请启用加密导出。'
+        )
       }
-    }
-
-    if (opts.registerTemplates) {
-      try {
-        const raw = localStorage.getItem('kiro-register-templates')
-        if (raw) payload.registerTemplates = JSON.parse(raw)
-      } catch {
-        /* ignore */
-      }
-    }
-
-    if (opts.registerSettings) {
-      const reg: Record<string, string> = {}
-      for (const k of REGISTER_LS_KEYS) {
-        const v = localStorage.getItem(k)
-        if (v != null) reg[k] = v
-      }
-      payload.registerLocalStorage = reg
-    }
-
-    if (opts.appSettings) {
-      payload.appSettings = {
-        theme: store.theme,
-        darkMode: store.darkMode,
-        language: store.language,
-        autoRefreshEnabled: store.autoRefreshEnabled,
-        autoRefreshInterval: store.autoRefreshInterval,
-        autoRefreshConcurrency: store.autoRefreshConcurrency,
-        statusCheckInterval: store.statusCheckInterval,
-        privacyMode: store.privacyMode,
-        usagePrecision: store.usagePrecision,
-        autoSwitchEnabled: store.autoSwitchEnabled,
-        autoSwitchThreshold: store.autoSwitchThreshold,
-        autoSwitchInterval: store.autoSwitchInterval,
-        switchTarget: store.switchTarget
-      }
-    }
-
-    let outputText = JSON.stringify(payload, null, 2)
-    let extension = 'json'
-
-    // C4: 可选加密
-    if (opts.encrypt) {
-      if (!encryptPassword.trim()) {
-        alert(isEn ? 'Please enter encryption password' : '请输入加密密码')
-        return
-      }
-      try {
+      let outputText = JSON.stringify(payload, null, 2)
+      if (opts.encrypt) {
+        if (!encryptPassword.trim())
+          throw new Error(isEn ? 'Please enter encryption password' : '请输入加密密码')
         outputText = await encryptText(outputText, encryptPassword)
-        extension = 'kcfg'
-      } catch (err) {
-        alert(isEn ? `Encryption failed: ${err}` : `加密失败: ${err}`)
-        return
       }
+      const blob = new Blob([outputText], {
+        type: opts.encrypt ? 'application/octet-stream' : 'application/json'
+      })
+      setLastExportSize(blob.size)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `kiro-config-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.${opts.encrypt ? 'kcfg' : 'json'}`
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (error) {
+      alert(error instanceof Error ? error.message : String(error))
+    } finally {
+      busy.current = false
+      setWorking(false)
     }
+  }
 
-    setLastExportSize(outputText.length)
-
-    const blob = new Blob([outputText], {
-      type: opts.encrypt ? 'application/octet-stream' : 'application/json'
-    })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `kiro-config-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.${extension}`
-    a.click()
-    setTimeout(() => URL.revokeObjectURL(url), 1000)
-  }, [opts, store, encryptPassword, isEn])
-
-  const handleImport = useCallback(
-    async (file: File): Promise<void> => {
-      try {
-        let text = await file.text()
-        // C4: 加密文件自动识别 + 弹窗输入密码解密
-        if (file.name.endsWith('.kcfg') || text.startsWith('KCFG1:')) {
-          const pwd = prompt(isEn ? 'Enter decryption password:' : '请输入解密密码：')
-          if (!pwd) return
-          try {
-            text = await decryptText(text, pwd)
-          } catch (err) {
-            setLastImportResult({
-              success: false,
-              error: `解密失败：${err instanceof Error ? err.message : String(err)}`
-            })
-            return
-          }
-        }
-        const data = JSON.parse(text) as PortableConfig
-        if (data.app !== 'kiro-account-manager') {
-          setLastImportResult({
-            success: false,
-            error: '文件不是有效的 Kiro 账号管理器配置（app 标识不匹配）'
-          })
-          return
-        }
-
-        const counts: Record<string, number> = {}
-
-        // 代理池
-        if (data.proxyPool && data.proxyPool.length > 0) {
-          let added = 0
-          for (const p of data.proxyPool) {
-            // 跳过脱敏过的密码
-            if (
-              typeof (p as { url?: string }).url === 'string' &&
-              !(p as { url: string }).url.includes('***')
-            ) {
-              const id = store.addProxy((p as { url: string }).url, {
-                label: (p as { label?: string }).label,
-                source: 'import-config',
-                tags: (p as { tags?: string[] }).tags
-              })
-              if (id) added++
-            } else if ((p as { host?: string }).host && (p as { port?: number }).port) {
-              // 脱敏的代理：只有 host:port 时按 http 默认导入
-              const proto = (p as { protocol?: string }).protocol || 'http'
-              const url = `${proto}://${(p as { host: string }).host}:${(p as { port: number }).port}`
-              const id = store.addProxy(url, {
-                label: (p as { label?: string }).label,
-                source: 'import-config-masked',
-                tags: (p as { tags?: string[] }).tags
-              })
-              if (id) added++
-            }
-          }
-          counts['代理池'] = added
-        }
-        if (data.proxyPoolConfig) {
-          store.setProxyPoolConfig(data.proxyPoolConfig as Partial<typeof store.proxyPoolConfig>)
-        }
-
-        // Webhooks
-        if (data.webhooks && data.webhooks.length > 0) {
-          const ws = useWebhookStore.getState()
-          let added = 0
-          for (const w of data.webhooks) {
-            const input = w as Parameters<typeof ws.addWebhook>[0]
-            if (input.kind && input.url) {
-              ws.addWebhook(input)
-              added++
-            }
-          }
-          counts['Webhook'] = added
-        }
-
-        // 注册配置
-        if (data.registerConfig) {
-          try {
-            localStorage.setItem('kiro-register-config', JSON.stringify(data.registerConfig))
-            counts['注册配置'] = 1
-          } catch {
-            /* ignore */
-          }
-        }
-
-        // 注册模板
-        if (data.registerTemplates) {
-          try {
-            localStorage.setItem('kiro-register-templates', JSON.stringify(data.registerTemplates))
-            counts['注册模板'] = data.registerTemplates.length
-          } catch {
-            /* ignore */
-          }
-        }
-
-        // 注册相关 localStorage
-        if (data.registerLocalStorage) {
-          let n = 0
-          for (const [k, v] of Object.entries(data.registerLocalStorage)) {
-            if (REGISTER_LS_KEYS.includes(k)) {
-              try {
-                localStorage.setItem(k, v)
-                n++
-              } catch {
-                /* ignore */
-              }
-            }
-          }
-          counts['注册偏好'] = n
-        }
-
-        // App 设置
-        if (data.appSettings) {
-          const s = data.appSettings
-          if (s.theme != null) store.setTheme(s.theme)
-          if (s.theme == null && s.darkMode != null) store.setDarkMode(s.darkMode)
-          if (s.language != null) store.setLanguage(resolveLanguage(s.language))
-          if (s.autoRefreshEnabled != null)
-            store.setAutoRefresh(s.autoRefreshEnabled, s.autoRefreshInterval)
-          if (s.autoRefreshConcurrency != null)
-            store.setAutoRefreshConcurrency(s.autoRefreshConcurrency)
-          if (s.statusCheckInterval != null) store.setStatusCheckInterval(s.statusCheckInterval)
-          if (s.privacyMode != null) store.setPrivacyMode(s.privacyMode)
-          if (s.usagePrecision != null) store.setUsagePrecision(s.usagePrecision)
-          if (s.autoSwitchEnabled != null)
-            store.setAutoSwitch(s.autoSwitchEnabled, s.autoSwitchThreshold, s.autoSwitchInterval)
-          if (
-            s.switchTarget != null &&
-            (s.switchTarget === 'ide' || s.switchTarget === 'cli' || s.switchTarget === 'both')
-          ) {
-            store.setSwitchTarget(s.switchTarget)
-          }
-          counts['App 设置'] = 1
-        }
-
-        setLastImportResult({ success: true, counts })
-      } catch (err) {
-        setLastImportResult({
-          success: false,
-          error: err instanceof Error ? err.message : String(err)
-        })
+  const handleImport = async (file: File): Promise<void> => {
+    if (busy.current) return
+    busy.current = true
+    setWorking(true)
+    try {
+      let text = (await file.text()).replace(/^\uFEFF/, '')
+      if (file.name.toLowerCase().endsWith('.kcfg') || text.startsWith(ENC_PREFIX)) {
+        const password = prompt(isEn ? 'Enter decryption password:' : '请输入解密密码：')
+        if (password === null) return
+        text = await decryptText(text, password)
       }
-    },
-    [store]
-  )
+      const payload: unknown = JSON.parse(text)
+      if (
+        payload &&
+        typeof payload === 'object' &&
+        'type' in payload &&
+        payload.type === 'kiro-account-manager-config' &&
+        !confirm(
+          isEn
+            ? 'This legacy file will replace the proxy pool, Webhooks and preferences it contains. Continue?'
+            : '旧版配置会替换文件中包含的代理池、Webhook 和偏好，确定继续？'
+        )
+      )
+        return
+      setLastImportResult(await importPortableConfig(payload))
+    } catch (error) {
+      setLastImportResult({
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    } finally {
+      busy.current = false
+      setWorking(false)
+    }
+  }
 
   return (
     <div className="flex h-full min-w-0 flex-col overflow-y-auto text-body">
@@ -354,8 +135,8 @@ export function ConfigSyncPage(): React.ReactNode {
         subtitle={
           <>
             {isEn
-              ? 'Export & import non-sensitive app config (proxy pool, webhooks, register templates, app preferences) for multi-device sync.'
-              : '导出/导入非敏感配置（代理池、Webhook、注册模板、应用偏好），用于多设备同步'}
+              ? 'Export & import proxy pools, Webhooks, register templates and preferences for multi-device sync.'
+              : '导出/导入代理池、Webhook、注册模板和应用偏好，用于多设备同步'}
           </>
         }
       />
@@ -370,13 +151,13 @@ export function ConfigSyncPage(): React.ReactNode {
               </p>
               <p className="text-muted-foreground">
                 {isEn
-                  ? 'This export does NOT include account credentials, refresh tokens, or other sensitive secrets — use "Account Export" (under Accounts page) for those.'
-                  : '本页导出"不包含"账号凭据、Refresh Token 等敏感数据。账号导出请走"账户管理 → 导出"专用通道。'}
+                  ? 'Register config and templates may contain mailbox passwords and refresh tokens. Webhook URLs may contain access tokens. Exports containing these secrets require password encryption.'
+                  : '注册配置和模板可能含有邮箱密码、Refresh Token，Webhook 地址可能含有访问密钥。包含这些敏感信息的导出须启用密码加密。'}
               </p>
               <p className="text-muted-foreground">
                 {isEn
                   ? 'Tip: keep "Include proxy credentials" OFF when sharing the file with others.'
-                  : '提示：分享给他人时，建议关闭"包含代理密码"选项，密码会被打码。'}
+                  : '提示：分享给他人时，建议关闭"包含代理认证信息"选项，认证信息会被移除。'}
               </p>
             </div>
           </CardContent>
@@ -393,12 +174,12 @@ export function ConfigSyncPage(): React.ReactNode {
           <CardContent className="space-y-3">
             <div className="grid grid-cols-2 gap-2 text-body">
               <ExportToggle
-                label={`${isEn ? 'Proxy Pool' : '代理池'} (${store.proxyPool.size})`}
+                label={`${isEn ? 'Proxy Pool' : '代理池'} (${proxyCount})`}
                 checked={opts.proxyPool}
                 onChange={(v) => setOpts((p) => ({ ...p, proxyPool: v }))}
               />
               <ExportToggle
-                label={`${isEn ? 'Webhooks' : 'Webhook'} (${useWebhookStore.getState().webhooks.size})`}
+                label={`${isEn ? 'Webhooks' : 'Webhook'} (${webhookCount})`}
                 checked={opts.webhooks}
                 onChange={(v) => setOpts((p) => ({ ...p, webhooks: v }))}
               />
@@ -440,7 +221,7 @@ export function ConfigSyncPage(): React.ReactNode {
                   )}
                   {isEn
                     ? 'Include proxy credentials (NOT recommended for sharing)'
-                    : '包含代理密码（分享时不建议）'}
+                    : '包含代理认证信息（分享时不建议）'}
                 </Label>
               </div>
               {/* C4: 加密导出 */}
@@ -466,7 +247,7 @@ export function ConfigSyncPage(): React.ReactNode {
               <Button
                 className="ml-auto"
                 onClick={handleExport}
-                disabled={opts.encrypt && !encryptPassword.trim()}
+                disabled={working || (opts.encrypt && !encryptPassword.trim())}
               >
                 <FileJson className="h-4 w-4 mr-0" />
                 {isEn ? 'Export' : '导出'}
@@ -494,13 +275,14 @@ export function ConfigSyncPage(): React.ReactNode {
           <CardContent className="space-y-3">
             <Label className="text-body">
               {isEn
-                ? 'Choose a previously exported config JSON. Duplicates will be merged/skipped automatically.'
-                : '选择之前导出的配置 JSON 文件。重复项会自动合并/跳过。'}
+                ? 'Choose a previously exported JSON or encrypted KCFG file. Duplicates will be merged/skipped automatically.'
+                : '选择之前导出的 JSON 或加密 KCFG 文件。重复项会自动合并/跳过。'}
             </Label>
             <div className="flex items-center gap-2">
               <input
                 type="file"
-                accept="application/json,.json"
+                accept="application/json,.json,.kcfg"
+                disabled={working}
                 className="min-w-0 rounded-control border border-input bg-card px-2.5 text-body focus:outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/20 h-control py-1"
                 onChange={(e) => {
                   const file = e.target.files?.[0]
@@ -529,7 +311,11 @@ export function ConfigSyncPage(): React.ReactNode {
                         {Object.entries(lastImportResult.counts).map(([k, v]) => (
                           <div key={k} className="flex justify-between">
                             <span className="text-muted-foreground">{k}</span>
-                            <span className="font-mono tabular-nums">{v}</span>
+                            <span className="font-mono tabular-nums">
+                              {v}
+                              {(lastImportResult.skipped?.[k] || 0) > 0 &&
+                                ` (${isEn ? 'skipped' : '跳过'} ${lastImportResult.skipped?.[k]})`}
+                            </span>
                           </div>
                         ))}
                       </div>
@@ -541,6 +327,14 @@ export function ConfigSyncPage(): React.ReactNode {
                     <div>
                       <div className="font-medium">{isEn ? 'Import Failed' : '导入失败'}</div>
                       <div className="text-caption mt-0.5">{lastImportResult.error}</div>
+                      {Object.values(lastImportResult.counts || {}).some((count) => count > 0) && (
+                        <div className="text-caption mt-1">
+                          {isEn ? 'Applied before the failure: ' : '失败前已应用：'}
+                          {Object.entries(lastImportResult.counts || {})
+                            .map(([key, count]) => `${key}: ${count}`)
+                            .join(', ')}
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}
@@ -562,6 +356,7 @@ export function ConfigSyncPage(): React.ReactNode {
               variant="outline"
               size="sm"
               className="text-red-600 border-red-200 hover:bg-red-50 dark:hover:bg-red-950/20"
+              disabled={working}
               onClick={() => {
                 if (
                   !confirm(
@@ -571,10 +366,14 @@ export function ConfigSyncPage(): React.ReactNode {
                   )
                 )
                   return
-                for (const k of REGISTER_LS_KEYS) localStorage.removeItem(k)
-                localStorage.removeItem('kiro-register-templates')
-                localStorage.removeItem('kiro-register-email-blacklist')
-                alert(isEn ? 'Done. Please reload the page.' : '已重置，请刷新页面')
+                try {
+                  for (const k of REGISTRATION_PREFERENCE_KEYS) localStorage.removeItem(k)
+                  localStorage.removeItem(TEMPLATES_KEY)
+                  localStorage.removeItem(EMAIL_BLACKLIST_KEY)
+                  alert(isEn ? 'Done. Please reload the page.' : '已重置，请刷新页面')
+                } catch (error) {
+                  alert(error instanceof Error ? error.message : String(error))
+                }
               }}
             >
               <RefreshCw className="h-3.5 w-3.5 mr-0.5" />
@@ -631,7 +430,8 @@ async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey>
 function b64encode(bytes: ArrayBuffer | Uint8Array): string {
   const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
   let s = ''
-  for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i])
+  for (let i = 0; i < arr.length; i += 32768)
+    s += String.fromCharCode(...arr.subarray(i, i + 32768))
   return btoa(s)
 }
 function b64decode(s: string): Uint8Array {

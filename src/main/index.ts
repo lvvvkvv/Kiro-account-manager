@@ -1,8 +1,23 @@
+import { AccountWork } from './accountWork'
+import { PendingAccountCredentials } from './accountCredentials'
+import { writeCliCredentials } from './cliCredentials'
+import type ElectronStore from 'electron-store'
+import { AccountBackupScheduler } from './accountBackup'
+import { validateAccountData, type AccountStorageStatus } from '../shared/accountData'
+import { AppQuitCoordinator } from './quit'
+import { WindowShortcut } from './windowShortcut'
+import { configureAdminRestart, restoreRestartProfile } from './machineIdRestart'
+import { registerMachineIdIPC } from './ipc/machineId'
+import { registerKiroSettingsIPC } from './ipc/kiroSettings'
+import { registerWebhookIPC } from './ipc/webhooks'
+import { openBrowserInPrivateMode } from './privateBrowser'
+import { registerSubscriptionIPC } from './ipc/subscriptions'
+import { beginDiagnostic, cancelDiagnostic, runDiagnostics } from './diagnostics'
+import { mapConcurrent } from '../shared/asyncPool'
 import { isTokenRefreshDue, tokenRefreshAt, tokenRefreshConcurrency } from '../shared/tokenRefresh'
 import { TokenRefreshCoordinator } from './tokenRefreshCoordinator'
-import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, autoUpdater as nativeAutoUpdater } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, autoUpdater as nativeAutoUpdater } from 'electron'
 import { AppUpdateService } from './updater/service'
-import * as machineIdModule from './machineId'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { writeFile, readFile } from 'fs/promises'
@@ -18,7 +33,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, setProfileArnPersistCallback, setAgentMode } from './proxy/kiroApi'
+import { fetchKiroModels, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, setProfileArnPersistCallback, setAgentMode } from './proxy/kiroApi'
 import {
   writeKiroAuthTokenFile,
   readKiroAuthTokenFile,
@@ -28,12 +43,13 @@ import {
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
 import { openaiToKiro } from './proxy/translator'
-import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
+import { getSystemProxy, getCachedProxyAgent, closeCachedProxyAgents } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
   createTray,
+  getTray,
   destroyTray,
   updateTrayMenu,
   updateCurrentAccount,
@@ -41,29 +57,133 @@ import {
   setTrayTooltip,
   updateTrayLanguage,
   type TraySettings,
+  type TrayAccountInfo,
   defaultTraySettings
 } from './tray'
 
 // Shared by the renderer, background scheduler and tray.
 let appUpdates: AppUpdateService | null = null
 
-async function prepareUpdateQuit(): Promise<void> {
-  stopMainPoolTokenRefresh()
-  stopKiroAuthTokenWatcher?.()
-  if (proxyServer?.isRunning()) await proxyServer.stop()
+const accountWork = new AccountWork()
+const pendingAccountCredentials = new PendingAccountCredentials()
+
+let shutdownPreparation: Promise<void> | undefined
+let quiescingAccounts: Promise<void> | undefined
+let resumeAccountServices: (() => Promise<void>) | undefined
+let quitWorkGeneration = 0
+
+function quiesceAccountWork(): Promise<void> {
+  quitWorkGeneration++
+  if (quiescingAccounts) return quiescingAccounts
+  const hadPoolTimer = !!mainPoolRefreshTimer
+  const hadWatcher = !!stopKiroAuthTokenWatcher
+  const server = proxyServer
   const kproxy = getKProxyService()
-  if (kproxy?.isRunning()) await kproxy.stop()
-  flushStoreWrites()
-  if (lastSavedData && store) {
-    store.set('accountData', lastSavedData)
-    await createBackup(lastSavedData)
-    await flushBackupNow()
+  const restartProxy = !!server && (server.isRunning() || server.isStarting())
+  const restartKProxy = !!kproxy?.isRunning()
+  resumeAccountServices = async () => {
+    accountWork.paused = false
+    if (hadPoolTimer) startMainPoolTokenRefresh()
+    if (hadWatcher) startKiroAuthTokenWatcher()
+    if (lastSwitchedAccountId) {
+      const data = lastSavedData as {
+        accounts?: Record<string, { credentials?: { expiresAt?: number } }>
+      } | null
+      const expiry = data?.accounts?.[lastSwitchedAccountId]?.credentials?.expiresAt
+      if (expiry) scheduleProactiveRenewal(lastSwitchedAccountId, expiry)
+    }
+    if (restartProxy && !server?.isRunning()) await server?.start()
+    if (restartKProxy && !kproxy?.isRunning()) await kproxy?.start()
   }
-  await proxyLogStore.flushSaveNow()
-  const { shutdownTlsClientPool } = await import('./registration/tlsClientPool')
-  await shutdownTlsClientPool()
+  const jobs = accountWork.pause()
+  stopMainPoolTokenRefresh()
+  clearProactiveRenewal('preparing quit')
+  stopKiroAuthTokenWatcher?.()
+  stopKiroAuthTokenWatcher = null
+  quiescingAccounts = (async () => {
+    const results = await Promise.allSettled([
+      jobs,
+      restartProxy ? server!.stop() : Promise.resolve(),
+      restartKProxy ? kproxy!.stop() : Promise.resolve()
+    ])
+    const failed = results.find((result) => result.status === 'rejected')
+    if (failed?.status === 'rejected') throw failed.reason
+  })()
+  return quiescingAccounts
 }
 
+function resumeAfterFailedQuit(): void {
+  const generation = quitWorkGeneration
+  // A deadline can stop waiting before an accepted network operation finishes. Let it commit first.
+  void Promise.allSettled([quiescingAccounts, shutdownPreparation])
+    .then(async () => {
+      if (generation !== quitWorkGeneration) return
+      const resume = resumeAccountServices
+      quiescingAccounts = undefined
+      resumeAccountServices = undefined
+      await resume?.()
+    })
+    .catch((error) => console.error('[Exit] Could not resume background services:', error))
+}
+
+function prepareUpdateQuit(): Promise<void> {
+  return (shutdownPreparation ??= (async () => {
+    stopMainPoolTokenRefresh()
+    stopKiroAuthTokenWatcher?.()
+    if (proxyServer?.isRunning()) await proxyServer.stop()
+    const kproxy = getKProxyService()
+    if (kproxy?.isRunning()) await kproxy.stop()
+    await closeCachedProxyAgents(true)
+    flushStoreWrites()
+    flushAccountData()
+    await flushBackupNow()
+    await proxyLogStore.flushSaveNow()
+    const { shutdownTlsClientPool } = await import('./registration/tlsClientPool')
+    await shutdownTlsClientPool()
+  })().finally(() => {
+    shutdownPreparation = undefined
+  }))
+}
+restoreRestartProfile()
+function finishQuit(): void {
+  isQuitting = true
+  try {
+    destroyTray()
+  } catch (error) {
+    console.error('[Exit] Failed to destroy tray:', error)
+  }
+  try {
+    unregisterProtocol()
+  } catch (error) {
+    console.error('[Exit] Failed to unregister protocol:', error)
+  }
+}
+const appQuit = new AppQuitCoordinator(
+  () => mainWindow,
+  prepareUpdateQuit,
+  () => {
+    finishQuit()
+    app.exit(0)
+  },
+  (error) => {
+    revealMainWindow()
+    void dialog.showMessageBox({
+      type: 'error',
+      message: '未能完成退出，窗口已保留 / Could not finish quitting',
+      detail: String(error)
+    })
+  },
+  quiesceAccountWork,
+  resumeAfterFailedQuit
+)
+configureAdminRestart(() => appQuit.prepare(), finishQuit)
+function revealMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (process.platform === 'darwin') app.dock?.show()
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
 // ============ Kiro API 调用 ============
 const KIRO_API_BASE = 'https://app.kiro.dev/service/KiroWebPortalService/operation'
 // REST API 端点配置 - 官方 Kiro 插件仅支持 us-east-1 和 eu-central-1
@@ -126,14 +246,14 @@ function getNetworkAgent(): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      const agent = getCachedProxyAgent(proxyUrl)
       if (agent) return agent
     }
   }
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  const envAgent = safeCreateProxyAgent(envProxy)
+  const envAgent = getCachedProxyAgent(envProxy)
   if (envAgent) return envAgent
-  return safeCreateProxyAgent(getSystemProxy())
+  return getCachedProxyAgent(getSystemProxy())
 }
 
 /**
@@ -147,11 +267,15 @@ function getNetworkAgent(): Dispatcher | undefined {
 async function fetchWithAppProxy(
   url: string,
   options: RequestInit,
-  overrideProxyUrl?: string
+  overrideProxyUrl?: string,
+  timeoutMs = 60_000
 ): Promise<Response> {
+  options = { ...options, signal: options.signal
+    ? AbortSignal.any([options.signal, AbortSignal.timeout(timeoutMs)])
+    : AbortSignal.timeout(timeoutMs) }
   // 优先尝试账号绑定代理
   if (overrideProxyUrl) {
-    const accountAgent = safeCreateProxyAgent(overrideProxyUrl)
+    const accountAgent = getCachedProxyAgent(overrideProxyUrl)
     if (accountAgent) {
       return await undiciFetch(url, { ...options, dispatcher: accountAgent } as UndiciRequestInit) as unknown as Response
     }
@@ -163,10 +287,6 @@ async function fetchWithAppProxy(
   return await fetch(url, options)
 }
 
-// 兼容函数，指向 getNetworkAgent
-function getKProxyAgent(): Dispatcher | undefined {
-  return getNetworkAgent()
-}
 
 // ============ OIDC Token 刷新 ============
 interface OidcRefreshResult {
@@ -204,6 +324,7 @@ export function normalizeProxyUrl(url: string): string {
 
 // 设置代理环境变量
 function applyProxySettings(enabled: boolean, url: string): void {
+  void closeCachedProxyAgents()
   if (enabled && url) {
     const normalized = normalizeProxyUrl(url)
     process.env.HTTP_PROXY = normalized
@@ -229,22 +350,44 @@ const pendingStoreWrites: Map<string, unknown> = new Map()
 let storeFlushTimer: ReturnType<typeof setTimeout> | null = null
 const STORE_FLUSH_INTERVAL = 5000 // 5 秒批量写入一次
 
+let storeFlushRetries = 0
+function scheduleStoreFlush(delay = STORE_FLUSH_INTERVAL): void {
+  if (storeFlushTimer) return
+  storeFlushTimer = setTimeout(() => {
+    storeFlushTimer = null
+    try {
+      flushStoreWrites()
+    } catch (error) {
+      updateAccountStorageStatus({ writeError: String(error) })
+      if (++storeFlushRetries <= 3) scheduleStoreFlush(STORE_FLUSH_INTERVAL * storeFlushRetries)
+    }
+  }, delay)
+}
 function debouncedStoreSet(key: string, value: unknown): void {
   pendingStoreWrites.set(key, value)
-  if (!storeFlushTimer) {
-    storeFlushTimer = setTimeout(flushStoreWrites, STORE_FLUSH_INTERVAL)
-  }
+  storeFlushRetries = 0
+  scheduleStoreFlush()
 }
-
 function flushStoreWrites(): void {
-  storeFlushTimer = null
-  if (!store || pendingStoreWrites.size === 0) return
-  for (const [key, value] of pendingStoreWrites) {
-    store.set(key, value)
+  if (storeFlushTimer) {
+    clearTimeout(storeFlushTimer)
+    storeFlushTimer = null
   }
+  if (!store || (!pendingStoreWrites.size && !accountDataDirty)) return
+  const batch = Object.fromEntries(pendingStoreWrites)
+  if (accountDataDirty) {
+    validateAccountData(lastSavedData)
+    batch.accountData = lastSavedData
+  }
+  store.set(batch)
   pendingStoreWrites.clear()
+  storeFlushRetries = 0
+  if (accountDataDirty) {
+    accountDataDirty = false
+    void createBackup(lastSavedData)
+  }
+  updateAccountStorageStatus({ writeError: null })
 }
-
 let trayMenuTimer: ReturnType<typeof setTimeout> | null = null
 
 function debouncedUpdateTrayMenu(): void {
@@ -265,25 +408,16 @@ function initProxyServer(): ProxyServer {
   proxyLogStore.initialize(app.getPath('userData'))
 
   // 从 store 加载保存的配置，如果没有则使用默认配置
-  const savedConfig = store?.get('proxyConfig') as Partial<ProxyConfig> | undefined
-  // 从 store 加载保存的 Usage API 类型
-  const savedUsageApiType = store?.get('usageApiType') as 'rest' | 'cbor' | undefined
-  if (savedUsageApiType) {
-    setUsageApiType(savedUsageApiType)
-  }
-  // 从 store 加载保存的 K-Proxy 代理设置
-  const savedUseKProxyForApi = store?.get('useKProxyForApi') as boolean | undefined
-  if (savedUseKProxyForApi !== undefined) {
-    setUseKProxyForApi(savedUseKProxyForApi)
-  }
+  const savedStore = store?.store ?? {}
+  const savedConfig = savedStore.proxyConfig as Partial<ProxyConfig> | undefined
   // 从 store 加载保存的累计 credits 和 tokens
-  const savedTotalCredits = (store?.get('proxyTotalCredits') as number) || 0
-  const savedInputTokens = (store?.get('proxyInputTokens') as number) || 0
-  const savedOutputTokens = (store?.get('proxyOutputTokens') as number) || 0
+  const savedTotalCredits = (savedStore.proxyTotalCredits as number) || 0
+  const savedInputTokens = (savedStore.proxyInputTokens as number) || 0
+  const savedOutputTokens = (savedStore.proxyOutputTokens as number) || 0
   // 从 store 加载保存的请求统计
-  const savedTotalRequests = (store?.get('proxyTotalRequests') as number) || 0
-  const savedSuccessRequests = (store?.get('proxySuccessRequests') as number) || 0
-  const savedFailedRequests = (store?.get('proxyFailedRequests') as number) || 0
+  const savedTotalRequests = (savedStore.proxyTotalRequests as number) || 0
+  const savedSuccessRequests = (savedStore.proxySuccessRequests as number) || 0
+  const savedFailedRequests = (savedStore.proxyFailedRequests as number) || 0
   const defaultConfig: ProxyConfig = {
     enabled: false,
     port: 5580,
@@ -302,6 +436,8 @@ function initProxyServer(): ProxyServer {
   
   // 合并保存的配置和默认配置
   const config: ProxyConfig = savedConfig ? { ...defaultConfig, ...savedConfig } : defaultConfig
+
+  setLogStreamEvents(config.logStreamEvents === true)
 
   // 恢复 payload 大小限制
   if (config.payloadSizeLimitKB) {
@@ -325,6 +461,14 @@ function initProxyServer(): ProxyServer {
       },
       onResponse: (info) => {
         mainWindow?.webContents.send('proxy-response', info)
+      },
+      onConfigChanged: (config) => {
+        setLogStreamEvents(config.logStreamEvents === true)
+        setEnableTokenBufferReserve(config.enableTokenBufferReserve === true)
+        if (config.payloadSizeLimitKB !== undefined) setPayloadSizeLimitKB(config.payloadSizeLimitKB)
+        if (config.tokenBufferReserve !== undefined) setTokenBufferReserve(config.tokenBufferReserve)
+        if (config.agentMode) setAgentMode(config.agentMode)
+        debouncedStoreSet('proxyConfig', config)
       },
       onError: (error) => {
         console.error('[ProxyServer] Error:', error)
@@ -360,14 +504,7 @@ function initProxyServer(): ProxyServer {
         }
       },
       // 账号更新回调 - 通知渲染进程更新账号数据
-      onAccountUpdate: (account) => {
-        mainWindow?.webContents.send('proxy-account-update', {
-          id: account.id,
-          accessToken: account.accessToken,
-          refreshToken: account.refreshToken,
-          expiresAt: account.expiresAt
-        })
-      },
+      onAccountUpdate: persistProxyAccountUpdate,
       // 账号被 Kiro 后端长期封禁 - 通知渲染进程标记 lastError + 持久化到 store
       // 不同于 token 失效，需要人工解封；账号池已自动跳过该账号
       onAccountSuspended: (info) => {
@@ -393,6 +530,7 @@ function initProxyServer(): ProxyServer {
                 lastError: `[${info.reason}] ${info.message}`,
                 lastCheckedAt: Date.now()
               }
+              stageAccountData(data)
             }
           } catch (e) {
             console.error('[ProxyServer] Failed to update suspended state in memory:', e)
@@ -430,11 +568,13 @@ function initProxyServer(): ProxyServer {
         // 构建 accountId → proxyUrl 映射（用于反代时 N:1 分桶）
         const bindings = accountData.accountProxyBindings || {}
         const proxyPool = accountData.proxyPool || {}
+        const poolHasHealthyProxy = Object.values(proxyPool).some((proxy) => proxy.enabled && proxy.status !== 'dead')
         const buildProxyUrl = (accountId: string): string | undefined => {
           const proxyId = bindings[accountId]
           if (!proxyId) return undefined
           const p = proxyPool[proxyId]
-          if (!p || !p.enabled || p.status === 'dead') return undefined
+          if (!p || !p.enabled) return undefined
+          if (p.status === 'dead' && poolHasHealthyProxy) return undefined
           return p.url
         }
 
@@ -453,11 +593,12 @@ function initProxyServer(): ProxyServer {
             region: acc.credentials?.region || 'us-east-1',
             authMethod: acc.credentials?.authMethod,
             provider: acc.credentials?.provider || acc.idp,
+            groupId: acc.groupId,
             proxyUrl: buildProxyUrl(acc.id)
           }))
         if (proxyAccounts.length > 0 && proxyServer) {
           const pool = proxyServer.getAccountPool()
-          proxyAccounts.forEach(acc => pool.addAccount(acc))
+          pool.syncAccounts(proxyAccounts)
           const boundCount = proxyAccounts.filter(a => a.proxyUrl).length
           console.log(`[ProxyServer] Lazy-synced ${proxyAccounts.length} accounts from store (${boundCount} with bound proxy)`)
         }
@@ -483,6 +624,7 @@ function initProxyServer(): ProxyServer {
         const data = lastSavedData as { accounts?: Record<string, Record<string, unknown>> }
         if (data.accounts?.[accountId]) {
           data.accounts[accountId] = { ...data.accounts[accountId], profileArn }
+          stageAccountData(data)
         }
       }
       console.log(`[ProxyServer] Persisted Enterprise profileArn for ${accountId}: ${profileArn}`)
@@ -513,117 +655,8 @@ function initProxyServer(): ProxyServer {
 }
 
 // ============ 隐私模式打开浏览器 ============
-import { exec, execSync } from 'child_process'
-
-// 获取 Windows 默认浏览器
-function getWindowsDefaultBrowser(): string {
-  try {
-    // 从注册表读取默认浏览器
-    const progId = execSync(
-      'reg query "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice" /v ProgId',
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
-    )
-    
-    if (progId.includes('ChromeHTML') || progId.includes('Google')) return 'chrome'
-    if (progId.includes('MSEdgeHTM') || progId.includes('Edge')) return 'msedge'
-    if (progId.includes('FirefoxURL') || progId.includes('Firefox')) return 'firefox'
-    if (progId.includes('BraveHTML') || progId.includes('Brave')) return 'brave'
-    if (progId.includes('Opera')) return 'opera'
-    
-    return 'unknown'
-  } catch {
-    return 'unknown'
-  }
-}
-
-// 使用隐私模式打开浏览器
-function openBrowserInPrivateMode(url: string): void {
-  const platform = process.platform
-  console.log(`[Browser] Opening in private mode on ${platform}: ${url}`)
-
-  try {
-    if (platform === 'win32') {
-      // Windows: 检测默认浏览器并使用对应的隐私模式参数
-      const defaultBrowser = getWindowsDefaultBrowser()
-      console.log(`[Browser] Detected default browser: ${defaultBrowser}`)
-      
-      let command = ''
-      switch (defaultBrowser) {
-        case 'chrome':
-          command = `start chrome --incognito "${url}"`
-          break
-        case 'msedge':
-          command = `start msedge -inprivate "${url}"`
-          break
-        case 'firefox':
-          command = `start firefox -private-window "${url}"`
-          break
-        case 'brave':
-          command = `start brave --incognito "${url}"`
-          break
-        case 'opera':
-          command = `start opera --private "${url}"`
-          break
-        default:
-          // 未知浏览器，尝试常见浏览器
-          console.log('[Browser] Unknown default browser, trying common browsers...')
-          exec(`start chrome --incognito "${url}"`, (err) => {
-            if (err) {
-              exec(`start msedge -inprivate "${url}"`, (err2) => {
-                if (err2) {
-                  exec(`start firefox -private-window "${url}"`, (err3) => {
-                    if (err3) {
-                      console.log('[Browser] Fallback to default browser (non-private)')
-                      shell.openExternal(url)
-                    }
-                  })
-                }
-              })
-            }
-          })
-          return
-      }
-      
-      exec(command, (err) => {
-        if (err) {
-          console.log(`[Browser] Failed to open ${defaultBrowser}, fallback to default`)
-          shell.openExternal(url)
-        }
-      })
-    } else if (platform === 'darwin') {
-      // macOS: 尝试 Chrome -> Firefox -> 默认浏览器
-      exec(`open -na "Google Chrome" --args --incognito "${url}"`, (err) => {
-        if (err) {
-          exec(`open -a Firefox --args -private-window "${url}"`, (err2) => {
-            if (err2) {
-              console.log('[Browser] Fallback to default browser')
-              shell.openExternal(url)
-            }
-          })
-        }
-      })
-    } else {
-      // Linux: 尝试 Chrome -> Chromium -> Firefox
-      exec(`google-chrome --incognito "${url}"`, (err) => {
-        if (err) {
-          exec(`chromium --incognito "${url}"`, (err2) => {
-            if (err2) {
-              exec(`firefox -private-window "${url}"`, (err3) => {
-                if (err3) {
-                  console.log('[Browser] Fallback to default browser')
-                  shell.openExternal(url)
-                }
-              })
-            }
-          })
-        }
-      })
-    }
-  } catch (error) {
-    console.error('[Browser] Error opening in private mode:', error)
-    shell.openExternal(url)
-  }
-}
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 
 // IdC (BuilderId) 的 OIDC Token 刷新
 async function refreshOidcToken(
@@ -720,6 +753,105 @@ let refreshConcurrency = 100
 const tokenRefreshCoordinator = new TokenRefreshCoordinator<OidcRefreshResult>(() => refreshConcurrency)
 
 // 通用 Token 刷新 - 根据 authMethod 选择刷新方式
+const execFileAsync = promisify(execFile)
+function runCertificateCommand(
+  file: string,
+  args: string[]
+): Promise<{ stdout: string; stderr: string }> {
+  return execFileAsync(file, args, { encoding: 'utf-8', timeout: 30000, windowsHide: true })
+}
+
+function configuredKProxyService(
+  config: Partial<KProxyConfig>
+): ReturnType<typeof initKProxyService> {
+  const existing = getKProxyService()
+  if (existing) return existing
+  const service = initKProxyService(config, {
+    onRequest: (info) => {
+      mainWindow?.webContents.send('kproxy-request', info)
+    },
+    onResponse: (info) => {
+      mainWindow?.webContents.send('kproxy-response', info)
+    },
+    onError: (error) => {
+      console.error('[KProxy] Error:', error)
+      mainWindow?.webContents.send('kproxy-error', error.message)
+    },
+    onStatusChange: (running, port) => {
+      mainWindow?.webContents.send('kproxy-status-change', { running, port })
+    },
+    onMitmIntercept: (host, modified) => {
+      mainWindow?.webContents.send('kproxy-mitm', { host, modified })
+    },
+    onDeviceMappingsChange: (mappings) => debouncedStoreSet('kproxyDeviceMappings', mappings)
+  })
+  const mappings = store?.get('kproxyDeviceMappings') as DeviceIdMapping[] | undefined
+  service.restoreDeviceIdMappings(mappings || [])
+  return service
+}
+
+function persistProxyAccountUpdate(account: ProxyAccount, expectedRefreshToken?: string): void {
+  const data = (lastSavedData || store?.get('accountData')) as
+    | { accounts?: Record<string, { credentials?: Record<string, unknown> }> }
+    | undefined
+  const current = data?.accounts?.[account.id]
+  if (
+    current &&
+    expectedRefreshToken !== undefined &&
+    current.credentials?.refreshToken !== expectedRefreshToken
+  )
+    return
+  const credentials = {
+    accessToken: account.accessToken,
+    refreshToken: account.refreshToken,
+    expiresAt: account.expiresAt
+  }
+  if (current && data?.accounts) {
+    if (mainWindow && !mainWindow.isDestroyed())
+      pendingAccountCredentials.record(account.id, current.credentials, { ...current.credentials, ...credentials })
+    data.accounts[account.id] = {
+      ...current,
+      credentials: { ...current.credentials, ...credentials }
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) persistAccountData(data)
+    else stageAccountData(data)
+  }
+  if (mainWindow && !mainWindow.isDestroyed())
+    mainWindow.webContents.send('proxy-account-update', {
+      id: account.id,
+      ...credentials,
+      expectedRefreshToken
+    })
+}
+
+function commitAccountCredentials(
+  id: string,
+  credentials: Record<string, unknown>,
+  expectedRefreshToken?: string,
+  profileArn?: string
+): boolean {
+  const data = (lastSavedData || store?.get('accountData')) as
+    | { accounts?: Record<string, { credentials?: Record<string, unknown>; profileArn?: string }> }
+    | undefined
+  const account = data?.accounts?.[id]
+  if (
+    !account ||
+    !data?.accounts ||
+    (expectedRefreshToken !== undefined &&
+      account.credentials?.refreshToken !== expectedRefreshToken)
+  )
+    return false
+  const patch = Object.fromEntries(
+    Object.entries(credentials).filter(([, value]) => value !== undefined)
+  )
+  const next = { ...account.credentials, ...patch }
+  if (mainWindow && !mainWindow.isDestroyed())
+    pendingAccountCredentials.record(id, account.credentials, next, profileArn)
+  data.accounts[id] = { ...account, credentials: next, ...(profileArn ? { profileArn } : {}) }
+  stageAccountData(data)
+  return true
+}
+
 async function refreshTokenByMethod(
   token: string,
   clientId: string,
@@ -957,7 +1089,6 @@ async function kiroApiRequest<T>(
   const machineId = accountMachineId || getCurrentMachineId()
   const logTag = email || `token:${accessToken?.slice(-6) || '?'}`
   console.log(`[Kiro API] ${operation} [${logTag}] ${idp} machineId=${machineId?.slice(0, 8) || 'none'}`)
-  const agent = getKProxyAgent()
   
   // 使用 undici fetch 支持代理
   const headers: Record<string, string> = {
@@ -971,21 +1102,9 @@ async function kiroApiRequest<T>(
     'cookie': `Idp=${idp}; AccessToken=${accessToken}`
   }
   
-  let response: Response
-  if (agent) {
-    response = await undiciFetch(`${KIRO_API_BASE}/${operation}`, {
-      method: 'POST',
-      headers,
-      body: Buffer.from(encode(body)),
-      dispatcher: agent
-    } as UndiciRequestInit) as unknown as Response
-  } else {
-    response = await fetchWithAppProxy(`${KIRO_API_BASE}/${operation}`, {
-      method: 'POST',
-      headers,
-      body: Buffer.from(encode(body))
-    })
-  }
+  const response = await fetchWithAppProxy(`${KIRO_API_BASE}/${operation}`, {
+    method: 'POST', headers, body: Buffer.from(encode(body))
+  })
 
   if (!response.ok) {
     // 尝试解析 CBOR 格式的错误响应
@@ -1106,7 +1225,6 @@ async function fetchRestApi(
   accessToken: string,
   machineId?: string
 ): Promise<Response> {
-  const agent = getKProxyAgent()
   const headers: Record<string, string> = {
     'Accept': 'application/json',
     'Authorization': `Bearer ${accessToken}`,
@@ -1114,13 +1232,7 @@ async function fetchRestApi(
     'x-amz-user-agent': getKiroAmzUserAgent(machineId)
   }
   const url = `${baseUrl}${path}`
-  if (agent) {
-    return await undiciFetch(url, {
-      method: 'GET',
-      headers,
-      dispatcher: agent
-    } as UndiciRequestInit) as unknown as Response
-  }
+
   return await fetchWithAppProxy(url, { method: 'GET', headers })
 }
 
@@ -1155,6 +1267,7 @@ async function getUsageLimitsRest(
   // 如果主端点返回 403，尝试备用端点
   if (response.status === 403) {
     console.log(`[Kiro REST API] Primary 403, fallback → ${fallbackBase}`)
+    await response.body?.cancel()
     response = await fetchRestApi(fallbackBase, path, accessToken, machineId)
   }
   
@@ -1351,6 +1464,48 @@ async function getUsageAndLimits(
   }
 }
 
+type AccountInfoResult = {
+  usage: PromiseSettledResult<UnifiedUsageResponse>
+  userInfo: PromiseSettledResult<UserInfoResponse>
+}
+const accountInfoCoordinator = new TokenRefreshCoordinator<AccountInfoResult>(() => refreshConcurrency)
+function fetchAccountInfo(
+  accessToken: string,
+  idp: string,
+  profileArn?: string,
+  machineId?: string,
+  region?: string,
+  email?: string
+): Promise<AccountInfoResult> {
+  return accountInfoCoordinator.run(
+    JSON.stringify([accessToken, idp, profileArn, machineId, region]),
+    async () => {
+      const [usage, userInfo] = await Promise.allSettled([
+        getUsageAndLimits(accessToken, idp, profileArn, machineId, region, email),
+        getUserInfo(accessToken, idp, machineId, email)
+      ])
+      return { usage, userInfo }
+    }
+  )
+}
+async function getRequiredAccountInfo(
+  accessToken: string,
+  idp: string,
+  machineId?: string,
+  region?: string,
+  email?: string
+): Promise<[UserInfoResponse | undefined, UnifiedUsageResponse]> {
+  const info = await fetchAccountInfo(accessToken, idp, undefined, machineId, region, email)
+  if (info.usage.status === 'rejected') throw info.usage.reason
+  if (
+    info.userInfo.status === 'rejected' &&
+    /423|AccountSuspended/.test(String(info.userInfo.reason))
+  ) {
+    throw info.userInfo.reason
+  }
+  return [info.userInfo.status === 'fulfilled' ? info.userInfo.value : undefined, info.usage.value]
+}
+
 // GetUserInfo API - 只需要 accessToken 即可调用
 interface UserInfoResponse {
   email?: string
@@ -1368,21 +1523,64 @@ async function getUserInfo(accessToken: string, idp: string = 'BuilderId', accou
 const PROTOCOL_PREFIX = 'kiro'
 
 // electron-store 实例（延迟初始化）
-let store: {
-  get: (key: string, defaultValue?: unknown) => unknown
-  set: (key: string, value: unknown) => void
-  path: string
-} | null = null
+let store: Pick<ElectronStore, 'get' | 'set' | 'path' | 'store'> | null = null
 
 // 最后保存的数据（用于崩溃恢复）
 let lastSavedData: unknown = null
 let storeInitialization: Promise<void> | null = null
 
+let accountDataDirty = false
+let accountStorageStatus: AccountStorageStatus = { backupError: null, writeError: null }
+let accountBackup: AccountBackupScheduler | undefined
+function updateAccountStorageStatus(patch: Partial<AccountStorageStatus>): void {
+  const next = { ...accountStorageStatus, ...patch }
+  if (
+    next.backupError === accountStorageStatus.backupError &&
+    next.writeError === accountStorageStatus.writeError
+  )
+    return
+  accountStorageStatus = next
+  try {
+    if (mainWindow && !mainWindow.isDestroyed())
+      mainWindow.webContents.send('account-storage-status', accountStorageStatus)
+  } catch (error) {
+    console.warn('[Store] Could not report storage status:', error)
+  }
+}
+function stageAccountData(data: unknown): void {
+  lastSavedData = data
+  accountDataDirty = true
+  storeFlushRetries = 0
+  scheduleStoreFlush()
+}
+function persistAccountData(data: unknown, fromRenderer = false): void {
+  validateAccountData(data)
+  if (fromRenderer) pendingAccountCredentials.merge(data)
+  if (!store) throw new Error('账号数据尚未加载')
+  try {
+    store.set('accountData', data)
+  } catch (error) {
+    stageAccountData(data)
+    updateAccountStorageStatus({ writeError: String(error) })
+    throw error
+  }
+  lastSavedData = data
+  accountDataDirty = false
+  updateAccountStorageStatus({ writeError: null })
+  void createBackup(data)
+}
+function flushAccountData(): void {
+  if (accountDataDirty) persistAccountData(lastSavedData)
+}
+
 async function initStore(): Promise<void> {
   // 多个启动任务共用恢复过程；恢复失败后禁止后续保存覆盖原数据，也不重复请求钥匙串。
   if (!storeInitialization) {
     storeInitialization = initializeStore().catch((error) => {
-      dialog.showErrorBox('账号数据加载失败', '为防止覆盖现有账号和备份，已暂停数据写入。请保留用户数据目录，恢复原数据或密钥文件后重启应用；如正在迁移旧备份，请允许钥匙串访问。')
+      dialog.showErrorBox(
+        '账号数据加载失败',
+        '为防止覆盖现有账号和备份，已暂停数据写入。请保留用户数据目录，恢复原数据或密钥文件后重启应用；如正在迁移旧备份，请允许钥匙串访问。'
+      )
       throw error
     })
   }
@@ -1392,17 +1590,20 @@ async function initStore(): Promise<void> {
 async function initializeStore(): Promise<void> {
   const Store = (await import('electron-store')).default
   const path = await import('path')
-  
+
   const storeInstance = new Store({
     name: 'kiro-accounts',
     encryptionKey: 'kiro-account-manager-secret-key'
   })
-  
+
   // 主数据保持原格式和密钥。正常升级直接从它创建本地备份，不访问钥匙串。
   const { initializeAccountBackup } = await import('./secureBackup')
   const backupDir = path.dirname(storeInstance.path)
-  const mainData = storeInstance.get('accountData')
-  const backupData = await initializeAccountBackup(backupDir, mainData)
+  const initialStore = storeInstance.store
+  const mainData = initialStore.accountData
+  const backupData = await initializeAccountBackup(backupDir, mainData, (error) =>
+    updateAccountStorageStatus({ backupError: String(error) })
+  )
   if (mainData == null && backupData !== null) {
     console.log('[Store] Restoring data from backup...')
     storeInstance.set('accountData', backupData)
@@ -1410,28 +1611,43 @@ async function initializeStore(): Promise<void> {
   }
 
   // 只有主数据或备份成功读取后才发布 store，防止恢复期间被空数据覆盖。
-  store = storeInstance as unknown as typeof store
+  store = storeInstance
+  lastSavedData = backupData
+  accountDataDirty = false
+  const { writeSecureBackup } = await import('./secureBackup')
+  accountBackup = new AccountBackupScheduler(
+    (data) => writeSecureBackup(backupDir, data),
+    (error) => updateAccountStorageStatus({ backupError: error })
+  )
 
   // 一次性迁移：清理 BuilderId 占位符 profileArn 等脏数据
   // 详见 migrateAccountDataIfNeeded 注释
   try {
-    migrateAccountDataIfNeeded()
+    migrateAccountDataIfNeeded(
+      (initialStore.accountDataMigration as Record<string, number> | undefined) ?? {}
+    )
   } catch (error) {
     console.error('[Store] Account data migration failed:', error)
   }
 
-  const accountSettings = storeInstance.get('accountData') as { autoRefreshConcurrency?: number } | undefined
+  // These preferences apply independently of tray/proxy-server initialization.
+  const savedUsageApiType = initialStore.usageApiType
+  setUsageApiType(savedUsageApiType === 'cbor' ? 'cbor' : 'rest')
+  setUseKProxyForApi(initialStore.useKProxyForApi === true)
+
+  const accountSettings = backupData as { autoRefreshConcurrency?: number } | undefined
   refreshConcurrency = tokenRefreshConcurrency(accountSettings?.autoRefreshConcurrency)
 
   // 加载主动续期开关状态（默认关闭）
   try {
-    proactiveRenewalEnabled = !!storeInstance.get('proactiveRenewalEnabled', false)
-    console.log(`[ProactiveRenewal] Loaded from settings: ${proactiveRenewalEnabled ? 'enabled' : 'disabled'}`)
+    proactiveRenewalEnabled = initialStore.proactiveRenewalEnabled === true
+    console.log(
+      `[ProactiveRenewal] Loaded from settings: ${proactiveRenewalEnabled ? 'enabled' : 'disabled'}`
+    )
   } catch (e) {
     console.warn('[ProactiveRenewal] Failed to load setting:', e)
   }
 }
-
 // ============ Kiro IDE Auth Token 反向同步 ============
 //
 // Kiro IDE 桌面端自己也有 refresh loop：每 N 秒检查 token 是否快到期，到期就用磁盘里的
@@ -1454,6 +1670,7 @@ let stopKiroAuthTokenWatcher: (() => void) | null = null
 function startKiroAuthTokenWatcher(): void {
   if (stopKiroAuthTokenWatcher) return
   stopKiroAuthTokenWatcher = watchKiroAuthTokenFile(async (token) => {
+    if (accountWork.paused) return
     const sig = `${token.accessToken}|${token.refreshToken}`
     if (sig === lastWrittenTokenSignature) {
       // 反代自己刚写的，跳过避免回环
@@ -1465,7 +1682,7 @@ function startKiroAuthTokenWatcher(): void {
     }
     lastSyncedFromIdeSignature = sig
     try {
-      await syncIdeTokenChangeToStore(token)
+      await accountWork.run(() => syncIdeTokenChangeToStore(token))
     } catch (e) {
       console.warn('[KiroAuthSync] syncIdeTokenChangeToStore failed:', e)
     }
@@ -1490,7 +1707,7 @@ async function syncIdeTokenChangeToStore(token: {
       return
     }
   }
-  const accountData = store?.get('accountData') as
+  const accountData = (lastSavedData || store?.get('accountData')) as
     | { accounts?: Record<string, { id?: string; email?: string; credentials?: { accessToken?: string; refreshToken?: string; expiresAt?: number } }> }
     | null
     | undefined
@@ -1549,14 +1766,16 @@ async function syncIdeTokenChangeToStore(token: {
 
   const accountToUpdate = accountData.accounts[matchedId]
   if (!accountToUpdate) return
-  accountToUpdate.credentials = {
+  const previousRefreshToken = accountToUpdate.credentials?.refreshToken
+  const refreshedCredentials = {
     ...accountToUpdate.credentials,
     accessToken: token.accessToken,
     refreshToken: token.refreshToken,
     expiresAt: Date.parse(token.expiresAt) || Date.now() + 3600 * 1000
   }
 
-  store!.set('accountData', accountData)
+  if (!commitAccountCredentials(matchedId, refreshedCredentials, previousRefreshToken)) return
+  if (!mainWindow || mainWindow.isDestroyed()) flushAccountData()
   console.log(
     `[KiroAuthSync] Synced IDE-refreshed token back to account ${accountToUpdate.email || matchedId} (${matchedReason})`
   )
@@ -1564,7 +1783,9 @@ async function syncIdeTokenChangeToStore(token: {
   try {
     mainWindow?.webContents.send('kiro-ide-token-changed', {
       accountId: matchedId,
-      reason: matchedReason
+      reason: matchedReason,
+      expectedRefreshToken: previousRefreshToken,
+      credentials: refreshedCredentials
     })
   } catch (e) {
     console.warn('[KiroAuthSync] failed to notify renderer:', e)
@@ -1595,7 +1816,7 @@ function clearProactiveRenewal(reason?: string): void {
  */
 function scheduleProactiveRenewal(accountId: string, expiresAtMs: number): void {
   clearProactiveRenewal()
-  if (!proactiveRenewalEnabled) return
+  if (!proactiveRenewalEnabled || accountWork.paused) return
   const msUntilRenewal = tokenRefreshAt(accountId, expiresAtMs) - Date.now()
   // 若已错过随机时间（包括已过期），立刻续期
   const delay = Math.max(msUntilRenewal, 0)
@@ -1605,11 +1826,12 @@ function scheduleProactiveRenewal(accountId: string, expiresAtMs: number): void 
   )
   proactiveRenewalTimer = setTimeout(() => {
     proactiveRenewalTimer = null
-    void runProactiveRenewal(accountId)
+    void accountWork.run(() => runProactiveRenewal(accountId)).catch(console.error)
   }, delay)
 }
 
 async function runProactiveRenewal(accountId: string): Promise<void> {
+  const switchGeneration = ideSwitchGeneration
   if (!proactiveRenewalEnabled) {
     console.log('[ProactiveRenewal] Disabled, skip run')
     return
@@ -1622,7 +1844,7 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
       return
     }
   }
-  const accountData = store?.get('accountData') as
+  const accountData = (lastSavedData || store?.get('accountData')) as
     | { accounts?: Record<string, { id?: string; email?: string; profileArn?: string; proxyUrl?: string; credentials?: { refreshToken?: string; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; startUrl?: string; provider?: string; accessToken?: string; expiresAt?: number } }> }
     | null
     | undefined
@@ -1660,6 +1882,11 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
     )
     return
   }
+  const shouldWriteToIde = switchGeneration === ideSwitchGeneration && proactiveRenewalEnabled &&
+    (!lastSwitchedAccountId || lastSwitchedAccountId === accountId)
+  const latestData = (lastSavedData || store?.get('accountData')) as typeof accountData
+  const latestAccount = latestData?.accounts?.[accountId]
+  if (!latestAccount || latestAccount.credentials?.refreshToken !== creds.refreshToken) return
   const newAccess = refreshResult.accessToken
   const newRefresh = refreshResult.refreshToken || creds.refreshToken
   const expiresIn = refreshResult.expiresIn ?? 3600
@@ -1673,7 +1900,7 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
   })
 
   // 1. 写磁盘（同步给 IDE）
-  try {
+  if (shouldWriteToIde) try {
     await writeKiroAuthTokenFile({
       accessToken: newAccess,
       refreshToken: newRefresh,
@@ -1686,28 +1913,32 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
       clientSecret: creds.clientSecret || undefined,
       profileArn: resolvedProfileArn
     })
-    lastWrittenTokenSignature = `${newAccess}|${newRefresh}`
-    lastSwitchedAccountId = accountId
+    if (switchGeneration === ideSwitchGeneration) {
+      lastWrittenTokenSignature = `${newAccess}|${newRefresh}`
+      lastSwitchedAccountId = accountId
+    }
   } catch (e) {
     console.warn('[ProactiveRenewal] Failed to write IDE token file (will still try store sync):', e)
   }
 
-  // 2. 写 store（同步反代/UI）
+  // 文件写入也会 await：提交时再次取最新数据，保留这段时间的账号/设置修改。
   if (store) {
-    account.credentials = {
-      ...creds,
-      accessToken: newAccess,
-      refreshToken: newRefresh,
-      expiresAt: newExpiresAt
-    }
-    store.set('accountData', accountData)
+    const currentData = (lastSavedData || store.get('accountData')) as typeof accountData
+    const current = currentData?.accounts?.[accountId]
+    if (!current || (current.credentials?.refreshToken !== creds.refreshToken &&
+      current.credentials?.refreshToken !== newRefresh)) return
+    commitAccountCredentials(accountId, { accessToken: newAccess,
+      refreshToken: newRefresh, expiresAt: newExpiresAt }, current.credentials?.refreshToken)
+    if (!mainWindow || mainWindow.isDestroyed()) flushAccountData()
   }
 
   // 3. 通知 renderer reload
   try {
     mainWindow?.webContents.send('kiro-ide-token-changed', {
       accountId,
-      reason: 'proactive-renewal'
+      reason: 'proactive-renewal',
+      expectedRefreshToken: creds.refreshToken,
+      credentials: { accessToken: newAccess, refreshToken: newRefresh, expiresAt: newExpiresAt }
     })
   } catch {
     /* renderer 可能已关闭 */
@@ -1718,8 +1949,8 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
       `Next renewal in ${Math.max(0, Math.round((tokenRefreshAt(accountId, newExpiresAt) - Date.now()) / 1000))}s`
   )
 
-  // 4. 调度下一次
-  scheduleProactiveRenewal(accountId, newExpiresAt)
+  // 切号期间只更新凭证，不把旧账号重新设为当前 IDE 账号。
+  if (switchGeneration === ideSwitchGeneration) scheduleProactiveRenewal(accountId, newExpiresAt)
 }
 
 /**
@@ -1727,96 +1958,20 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
  * 但 Kiro IDE 内部逻辑依赖该字段存在，移除后导致严重问题，已回退。
  * 保留函数壳和标记写入，防止旧版本回滚时重复执行。
  */
-function migrateAccountDataIfNeeded(): void {
+function migrateAccountDataIfNeeded(saved?: Record<string, number>): void {
   if (!store) return
-  const MIGRATION_KEY = 'accountDataMigration'
-  const FLAG = 'builderIdArn'
-  const migrationState = (store.get(MIGRATION_KEY, {}) as Record<string, number>) || {}
-  const accountData = store.get('accountData') as
-    | { accounts?: Record<string, { id?: string; provider?: string; profileArn?: string; email?: string }> }
-    | null
-    | undefined
-
-  if (!accountData?.accounts) {
-    if (!migrationState[FLAG]) {
-      store.set(MIGRATION_KEY, { ...migrationState, [FLAG]: 1 })
-    }
-    return
-  }
-
-  // profileArn 占位符不再清理 —— Kiro IDE 内部逻辑依赖该字段存在
-  // 保留迁移标记写入以避免旧版本回滚时重复执行
-
-  if (!migrationState[FLAG]) {
-    store.set(MIGRATION_KEY, { ...migrationState, [FLAG]: 1 })
-  }
+  const migrationState = saved ?? (store.get('accountDataMigration', {}) as Record<string, number>)
+  if (!migrationState?.builderIdArn)
+    store.set('accountDataMigration', { ...migrationState, builderIdArn: 1 })
 }
 
-// ============ 备份节流配置 ============
-// 备份是为容灾兜底，不需要每次保存都全量重写文件，按时间节流即可大幅降低磁盘 IO。
-const BACKUP_THROTTLE_MS = 5 * 60 * 1000 // 5 分钟最多写一次备份
-let lastBackupTime = 0
-let pendingBackupData: unknown = null
-let pendingBackupTimer: ReturnType<typeof setTimeout> | null = null
-
-/**
- * 创建数据备份（节流）
- * - 距上次备份不足 BACKUP_THROTTLE_MS 时，仅记录数据指针，不立即写盘
- * - 节流窗口结束后，自动 flush 最新一份数据
- * - 退出前可手动调用 flushBackupNow() 强制写盘
- */
-async function createBackup(data: unknown): Promise<void> {
-  pendingBackupData = data
-  const now = Date.now()
-  const elapsed = now - lastBackupTime
-
-  if (elapsed >= BACKUP_THROTTLE_MS) {
-    // 节流窗口已过，立即写盘
-    await writeBackupNow()
-    return
-  }
-
-  // 在节流窗口内：调度一次延迟 flush（如果尚未调度）
-  if (!pendingBackupTimer) {
-    const delay = BACKUP_THROTTLE_MS - elapsed
-    pendingBackupTimer = setTimeout(() => {
-      pendingBackupTimer = null
-      void writeBackupNow()
-    }, delay)
-  }
+// Backup encryption and legacy migration stay in secureBackup; the scheduler owns timing/retries.
+function createBackup(data: unknown): void {
+  accountBackup?.request(data)
 }
-
-/**
- * 真正执行备份写盘。仅当 pendingBackupData 非空时写入。
- */
-async function writeBackupNow(): Promise<void> {
-  if (!store || pendingBackupData == null) return
-  const data = pendingBackupData
-  pendingBackupData = null
-  lastBackupTime = Date.now()
-  try {
-    const path = await import('path')
-    const { writeSecureBackup } = await import('./secureBackup')
-    await writeSecureBackup(path.dirname(store.path), data)
-    console.log('[Backup] Data backup created (local-key encrypted)')
-  } catch (error) {
-    console.error('[Backup] Failed to create backup:', error)
-  }
-}
-
-/**
- * 强制 flush 待写的备份（用于退出前兜底）
- */
 async function flushBackupNow(): Promise<void> {
-  if (pendingBackupTimer) {
-    clearTimeout(pendingBackupTimer)
-    pendingBackupTimer = null
-  }
-  if (pendingBackupData != null) {
-    await writeBackupNow()
-  }
+  await accountBackup?.flush()
 }
-
 let mainWindow: BrowserWindow | null = null
 
 // ============ Kiro IDE Auth 同步状态 ============
@@ -1832,6 +1987,7 @@ let lastSyncedFromIdeSignature: string | null = null
 // 在过期前 10～30 分钟随机续期并同步磁盘，降低与 IDE 自身刷新发生竞争的机会。
 // 仅对"当前 IDE 激活账号"（lastSwitchedAccountId）维护一个 timer，开销小。
 // 默认关闭，需用户在 Settings 中显式打开。
+let ideSwitchGeneration = 0
 let proactiveRenewalEnabled = false
 let proactiveRenewalTimer: NodeJS.Timeout | null = null
 
@@ -1854,6 +2010,7 @@ type BackgroundRefreshAccount = {
     clientId?: string
     clientSecret?: string
     region?: string
+    startUrl?: string
     authMethod?: string
     accessToken?: string
     provider?: string
@@ -1887,7 +2044,7 @@ async function runMainPoolTokenRefreshTick(): Promise<number> {
   try {
     if (!store) { await initStore() }
     if (!store) return 60_000
-    const data = store.get('accountData') as {
+    const data = (lastSavedData || store.get('accountData')) as {
       accounts?: Record<string, {
         id?: string
         email?: string
@@ -1900,6 +2057,7 @@ async function runMainPoolTokenRefreshTick(): Promise<number> {
           clientId?: string
           clientSecret?: string
           region?: string
+          startUrl?: string
           authMethod?: string
           accessToken?: string
           provider?: string
@@ -1939,6 +2097,7 @@ async function runMainPoolTokenRefreshTick(): Promise<number> {
           clientId: creds.clientId,
           clientSecret: creds.clientSecret,
           region: creds.region,
+          startUrl: creds.startUrl,
           authMethod: creds.authMethod,
           accessToken: creds.accessToken,
           provider: creds.provider,
@@ -1986,62 +2145,17 @@ let traySettings: TraySettings = { ...defaultTraySettings }
 let isQuitting = false // 标记是否真正退出应用
 
 // ============ 全局快捷键设置 ============
-let showWindowShortcut = process.platform === 'darwin' ? 'Command+Shift+K' : 'Ctrl+Shift+K'
-
-// 加载快捷键设置
+const windowShortcut = new WindowShortcut(revealMainWindow, async value => {
+  await initStore()
+  if (!store) throw new Error('设置存储尚未就绪')
+  store.set('showWindowShortcut', value)
+})
 async function loadShortcutSettings(): Promise<void> {
-  try {
-    await initStore()
-    const saved = store?.get('showWindowShortcut') as string | undefined
-    if (saved) {
-      showWindowShortcut = saved
-    }
-  } catch (error) {
-    console.error('[Shortcut] Failed to load shortcut settings:', error)
-  }
+  await initStore()
+  const saved = store?.get('showWindowShortcut')
+  try { windowShortcut.start(typeof saved === 'string' ? saved : process.platform === 'darwin' ? 'Command+Shift+K' : 'Ctrl+Shift+K') }
+  catch (error) { console.error('[Shortcut] Initial registration failed:', error) }
 }
-
-// 保存快捷键设置
-async function saveShortcutSettings(): Promise<void> {
-  try {
-    await initStore()
-    store?.set('showWindowShortcut', showWindowShortcut)
-  } catch (error) {
-    console.error('[Shortcut] Failed to save shortcut settings:', error)
-  }
-}
-
-// 注册显示主窗口的快捷键
-function registerShowWindowShortcut(): void {
-  // 先注销所有已注册的快捷键
-  globalShortcut.unregisterAll()
-  
-  if (!showWindowShortcut) return
-  
-  try {
-    const success = globalShortcut.register(showWindowShortcut, () => {
-      if (mainWindow) {
-        // macOS: 显示窗口时恢复 Dock 图标
-        if (process.platform === 'darwin' && app.dock) {
-          app.dock.show()
-        }
-        if (mainWindow.isMinimized()) mainWindow.restore()
-        mainWindow.show()
-        mainWindow.focus()
-      }
-    })
-    if (success) {
-      console.log(`[Shortcut] Registered: ${showWindowShortcut}`)
-    } else {
-      console.warn(`[Shortcut] Failed to register: ${showWindowShortcut}`)
-    }
-  } catch (error) {
-    console.error('[Shortcut] Error registering shortcut:', error)
-  }
-}
-let currentProxyAccount: { id: string; email: string; idp: string; status: string; subscription?: string; usage?: { usedCredits: number; totalCredits: number; totalRequests: number; successRequests: number; failedRequests: number } } | null = null
-let allAccounts: { id: string; email: string; idp: string; status: string }[] = []
-
 // 加载托盘设置
 async function loadTraySettings(): Promise<void> {
   try {
@@ -2057,32 +2171,18 @@ async function loadTraySettings(): Promise<void> {
 
 // 保存托盘设置
 async function saveTraySettings(): Promise<void> {
-  try {
-    await initStore()
-    store?.set('traySettings', traySettings)
-  } catch (error) {
-    console.error('[Tray] Failed to save tray settings:', error)
-  }
+  await initStore()
+  if (!store) throw new Error('设置存储尚未就绪')
+  store.set('traySettings', traySettings)
 }
 
 // 初始化托盘
 function initTray(): void {
   if (!traySettings.enabled) return
 
+  updateTrayLanguage((store?.get('accountData') as { language?: string } | undefined)?.language === 'en' ? 'en' : 'zh')
   createTray({
-    onShowWindow: () => {
-      if (mainWindow) {
-        // macOS: 显示窗口时恢复 Dock 图标
-        if (process.platform === 'darwin' && app.dock) {
-          app.dock.show()
-        }
-        if (mainWindow.isMinimized()) {
-          mainWindow.restore()
-        }
-        mainWindow.show()
-        mainWindow.focus()
-      }
-    },
+    onShowWindow: revealMainWindow,
     getUpdateState: () => appUpdates?.snapshot() ?? null,
     onInstallUpdate: async () => {
       try { await appUpdates?.install() }
@@ -2092,10 +2192,7 @@ function initTray(): void {
         })
       }
     },
-    onQuit: () => {
-      isQuitting = true
-      app.quit()
-    },
+    onQuit: () => { if (!appUpdates?.snapshot().installing) void appQuit.request() },
     onRefreshAccount: async () => {
       mainWindow?.webContents.send('tray-refresh-account')
     },
@@ -2105,7 +2202,7 @@ function initTray(): void {
     onToggleProxy: async () => {
       const server = initProxyServer()
       if (server.isRunning()) {
-        server.stop()
+        await server.stop()
       } else {
         await server.start()
       }
@@ -2118,8 +2215,6 @@ function initTray(): void {
         port: server.getConfig().port
       }
     },
-    getCurrentAccount: () => currentProxyAccount,
-    getAccountList: () => allAccounts,
     getProxyStats: () => {
       const server = initProxyServer()
       const stats = server.getStats()
@@ -2180,90 +2275,94 @@ function createWindow(): void {
     // 检查代理服务自启动配置
     setTimeout(async () => {
       try {
+        if (accountWork.paused) return
         await initStore()
         if (!store) return
         
         const savedProxyConfig = store.get('proxyConfig') as ProxyConfig | undefined
-        if (!savedProxyConfig?.autoStart) return
-        
-        console.log('[ProxyServer] Auto-starting proxy server...')
-        const server = initProxyServer()
-        server.updateConfig(savedProxyConfig)
-        
-        // 自启动时同步账号到代理池（含重试机制应对冷启动数据延迟）
-        const syncAccountsToPool = (): number => {
-          const accountData = store!.get('accountData') as {
-            accounts?: Record<string, any>
-            accountProxyBindings?: Record<string, string>
-            proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
-          } | undefined
-          if (!accountData?.accounts) return 0
+        if (savedProxyConfig?.autoStart) {
 
-          const bindings = accountData.accountProxyBindings || {}
-          const proxyPool = accountData.proxyPool || {}
-          const buildProxyUrl = (accountId: string): string | undefined => {
-            const proxyId = bindings[accountId]
-            if (!proxyId) return undefined
-            const p = proxyPool[proxyId]
-            if (!p || !p.enabled || p.status === 'dead') return undefined
-            return p.url
+          console.log('[ProxyServer] Auto-starting proxy server...')
+          const server = initProxyServer()
+          server.updateConfig(savedProxyConfig)
+
+          // 自启动时同步账号到代理池（含重试机制应对冷启动数据延迟）
+          const syncAccountsToPool = (): number => {
+            const accountData = store!.get('accountData') as {
+              accounts?: Record<string, any>
+              accountProxyBindings?: Record<string, string>
+              proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+            } | undefined
+            if (!accountData?.accounts) return 0
+
+            const bindings = accountData.accountProxyBindings || {}
+            const proxyPool = accountData.proxyPool || {}
+            const poolHasHealthyProxy = Object.values(proxyPool).some((proxy) => proxy.enabled && proxy.status !== 'dead')
+            const buildProxyUrl = (accountId: string): string | undefined => {
+              const proxyId = bindings[accountId]
+              if (!proxyId) return undefined
+              const p = proxyPool[proxyId]
+              if (!p || !p.enabled) return undefined
+              if (p.status === 'dead' && poolHasHealthyProxy) return undefined
+              return p.url
+            }
+
+            const proxyAccounts = Object.values(accountData.accounts)
+              .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
+              .map((acc: any) => {
+                const provider = acc.credentials?.provider || acc.idp
+                const authMethod = acc.credentials?.authMethod
+                const profileArn = acc.profileArn || acc.credentials?.profileArn
+                // BuilderId/Social 不需要预填 profileArn（resolveProfileArn 会兜底，流式端点自动不传占位符）
+                // Enterprise 留给自愈获取真实 ARN
+                return {
+                  id: acc.id,
+                  email: acc.email,
+                  accessToken: acc.credentials.accessToken,
+                  refreshToken: acc.credentials?.refreshToken,
+                  profileArn,
+                  expiresAt: acc.credentials?.expiresAt,
+                  machineId: acc.machineId,
+                  clientId: acc.credentials?.clientId,
+                  clientSecret: acc.credentials?.clientSecret,
+                  region: acc.credentials?.region || 'us-east-1',
+                  authMethod,
+                  provider,
+                  groupId: acc.groupId,
+              proxyUrl: buildProxyUrl(acc.id)
+                }
+              })
+            if (proxyAccounts.length > 0) {
+              const pool = server.getAccountPool()
+              pool.syncAccounts(proxyAccounts)
+            }
+            return proxyAccounts.length
           }
 
-          const proxyAccounts = Object.values(accountData.accounts)
-            .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
-            .map((acc: any) => {
-              const provider = acc.credentials?.provider || acc.idp
-              const authMethod = acc.credentials?.authMethod
-              const profileArn = acc.profileArn || acc.credentials?.profileArn
-              // BuilderId/Social 不需要预填 profileArn（resolveProfileArn 会兜底，流式端点自动不传占位符）
-              // Enterprise 留给自愈获取真实 ARN
-              return {
-                id: acc.id,
-                email: acc.email,
-                accessToken: acc.credentials.accessToken,
-                refreshToken: acc.credentials?.refreshToken,
-                profileArn,
-                expiresAt: acc.credentials?.expiresAt,
-                machineId: acc.machineId,
-                clientId: acc.credentials?.clientId,
-                clientSecret: acc.credentials?.clientSecret,
-                region: acc.credentials?.region || 'us-east-1',
-                authMethod,
-                provider,
-                proxyUrl: buildProxyUrl(acc.id)
-              }
-            })
-          if (proxyAccounts.length > 0) {
-            const pool = server.getAccountPool()
-            pool.clear()
-            proxyAccounts.forEach(acc => pool.addAccount(acc))
+          let syncedCount = syncAccountsToPool()
+          if (syncedCount > 0) {
+            console.log('[ProxyServer] Auto-synced', syncedCount, 'accounts')
+          } else {
+            // 冷启动时 store 可能还没有数据（渲染进程尚未初始化完成），延迟重试
+            console.log('[ProxyServer] No accounts found on initial sync, will retry...')
+            const retrySync = (attempt: number) => {
+              setTimeout(() => {
+                const count = syncAccountsToPool()
+                if (count > 0) {
+                  console.log(`[ProxyServer] Retry #${attempt}: synced ${count} accounts`)
+                } else if (attempt < 5) {
+                  retrySync(attempt + 1)
+                } else {
+                  console.log('[ProxyServer] All retry attempts exhausted, no accounts available. Accounts will sync when UI loads.')
+                }
+              }, attempt * 2000) // 2s, 4s, 6s, 8s, 10s
+            }
+            retrySync(1)
           }
-          return proxyAccounts.length
+
+          await server.start()
+          console.log('[ProxyServer] Auto-started successfully on port', savedProxyConfig.port || 5580)
         }
-
-        let syncedCount = syncAccountsToPool()
-        if (syncedCount > 0) {
-          console.log('[ProxyServer] Auto-synced', syncedCount, 'accounts')
-        } else {
-          // 冷启动时 store 可能还没有数据（渲染进程尚未初始化完成），延迟重试
-          console.log('[ProxyServer] No accounts found on initial sync, will retry...')
-          const retrySync = (attempt: number) => {
-            setTimeout(() => {
-              const count = syncAccountsToPool()
-              if (count > 0) {
-                console.log(`[ProxyServer] Retry #${attempt}: synced ${count} accounts`)
-              } else if (attempt < 5) {
-                retrySync(attempt + 1)
-              } else {
-                console.log('[ProxyServer] All retry attempts exhausted, no accounts available. Accounts will sync when UI loads.')
-              }
-            }, attempt * 2000) // 2s, 4s, 6s, 8s, 10s
-          }
-          retrySync(1)
-        }
-        
-        await server.start()
-        console.log('[ProxyServer] Auto-started successfully on port', savedProxyConfig.port || 5580)
       } catch (error) {
         console.error('[ProxyServer] Auto-start failed:', error)
       }
@@ -2273,24 +2372,7 @@ function createWindow(): void {
         const savedKProxyConfig = store?.get('kproxyConfig') as KProxyConfig | undefined
         if (savedKProxyConfig?.autoStart) {
           console.log('[KProxy] Auto-starting K-Proxy MITM...')
-          const service = initKProxyService(savedKProxyConfig, {
-            onRequest: (info) => {
-              mainWindow?.webContents.send('kproxy-request', info)
-            },
-            onResponse: (info) => {
-              mainWindow?.webContents.send('kproxy-response', info)
-            },
-            onError: (error) => {
-              console.error('[KProxy] Error:', error)
-              mainWindow?.webContents.send('kproxy-error', error.message)
-            },
-            onStatusChange: (running, port) => {
-              mainWindow?.webContents.send('kproxy-status-change', { running, port })
-            },
-            onMitmIntercept: (host, modified) => {
-              mainWindow?.webContents.send('kproxy-mitm', { host, modified })
-            }
-          })
+          const service = configuredKProxyService(savedKProxyConfig)
           await service.initialize()
           await service.start()
           console.log('[KProxy] Auto-started successfully')
@@ -2301,47 +2383,27 @@ function createWindow(): void {
     }, 1000)
   })
 
-  mainWindow.on('close', (event) => {
-    // 托盘最小化逻辑 - 必须同步检查并调用 preventDefault
-    if (traySettings.enabled && !isQuitting) {
-      if (traySettings.closeAction === 'minimize') {
-        // 直接最小化到托盘
-        event.preventDefault()
-        mainWindow?.hide()
-        // macOS: 隐藏窗口时隐藏 Dock 图标
-        if (process.platform === 'darwin' && app.dock) {
-          app.dock.hide()
-        }
-        return
-      } else if (traySettings.closeAction === 'ask' && mainWindow) {
-        // 询问用户 - 先阻止关闭，再异步处理
-        event.preventDefault()
-        // 通知渲染进程显示自定义对话框
-        mainWindow.webContents.send('show-close-confirm-dialog')
-        return
-      }
-      // closeAction === 'quit' 时继续关闭流程
-    }
-
-    // 窗口关闭前保存数据（同步保存，不等待备份）
-    if (lastSavedData && store) {
-      try {
-        console.log('[Window] Saving data before close...')
-        store.set('accountData', lastSavedData)
-        // 备份异步进行，不阻塞关闭
-        createBackup(lastSavedData).then(() => {
-          console.log('[Window] Backup created')
-        }).catch(err => {
-          console.error('[Window] Backup failed:', err)
-        })
-        console.log('[Window] Data saved successfully')
-      } catch (error) {
-        console.error('[Window] Failed to save data:', error)
-      }
-    }
+  mainWindow.on('close', event => {
+    if (isQuitting) return
+    event.preventDefault()
+    if (appUpdates?.snapshot().installing) return
+    if (traySettings.enabled && traySettings.closeAction === 'minimize') {
+      if (getTray()) { mainWindow?.hide(); if(process.platform === 'darwin') app.dock?.hide() }
+      else { revealMainWindow(); void dialog.showMessageBox({ type: 'error', message: '系统托盘不可用，窗口已保留 / System tray unavailable' }) }
+    } else if (traySettings.enabled && traySettings.closeAction === 'ask') {
+      mainWindow?.webContents.send('show-close-confirm-dialog')
+    } else if (!traySettings.enabled && process.platform === 'darwin') {
+      const window = mainWindow
+      void appQuit.flushRenderer().then(() => {
+        flushStoreWrites()
+        flushAccountData()
+        window?.destroy()
+      }).catch(error => console.error('[Window] Could not save before close:', error))
+    } else { void appQuit.request() }
   })
 
   mainWindow.on('closed', () => {
+    pendingAccountCredentials.clear()
     mainWindow = null
   })
 
@@ -2433,11 +2495,19 @@ app.whenReady().then(async () => {
   initTray()
 
   appUpdates = new AppUpdateService({
-    fetch: fetchWithAppProxy,
+    // Metadata keeps its shorter deadline; archives may take up to fifteen minutes.
+    fetch: (url, options) => fetchWithAppProxy(url, options, undefined, 15 * 60 * 1000),
     renderer: () => mainWindow,
     routingInUse: () => !!(proxyServer?.isRunning() || getKProxyService()?.isRunning()),
     changed: () => updateTrayMenu(),
     prepareQuit: prepareUpdateQuit,
+    beforeQuit: async () => {
+      if (appQuit.isPreparing) throw new Error('正在退出应用 / Quit is already in progress')
+      await quiesceAccountWork()
+    },
+    resume: () => {
+      if (!appQuit.isPreparing && !isQuitting) resumeAfterFailedQuit()
+    },
     quit: (nativeInstall) => {
       if (nativeInstall) { nativeInstall(); return }
       isQuitting = true
@@ -2469,7 +2539,7 @@ app.whenReady().then(async () => {
   ipcMain.on('open-external', (_event, url: string, usePrivateMode?: boolean) => {
     if (typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'))) {
       if (usePrivateMode) {
-        openBrowserInPrivateMode(url)
+        void openBrowserInPrivateMode(url).catch(error => console.error('[Browser] Open failed:', error))
       } else {
         shell.openExternal(url)
       }
@@ -2499,36 +2569,28 @@ app.whenReady().then(async () => {
 
   // IPC: 获取显示主窗口快捷键
   ipcMain.handle('get-show-window-shortcut', () => {
-    return showWindowShortcut
+    return windowShortcut.value
   })
 
   // IPC: 设置显示主窗口快捷键
-  ipcMain.handle('set-show-window-shortcut', async (_event, shortcut: string) => {
-    try {
-      showWindowShortcut = shortcut
-      await saveShortcutSettings()
-      registerShowWindowShortcut()
-      return { success: true }
-    } catch (error) {
-      return { success: false, error: String(error) }
-    }
-  })
+  ipcMain.handle('set-show-window-shortcut', (_event, value: string) => windowShortcut.set(value))
 
   // IPC: 保存托盘设置
   ipcMain.handle('save-tray-settings', async (_event, settings: Partial<TraySettings>) => {
     try {
+      const previous = traySettings
       traySettings = { ...traySettings, ...settings }
-      await saveTraySettings()
+      try { await saveTraySettings() } catch(error) { traySettings = previous; throw error }
       
       // 根据设置启用/禁用托盘
       if (settings.enabled !== undefined) {
         if (settings.enabled) {
           initTray()
         } else {
+          revealMainWindow()
           destroyTray()
         }
       }
-      
       return { success: true }
     } catch (error) {
       console.error('[Tray] Failed to save settings:', error)
@@ -2537,8 +2599,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 更新托盘账户信息（从渲染进程调用）
-  ipcMain.on('update-tray-account', (_event, account: typeof currentProxyAccount) => {
-    currentProxyAccount = account
+  ipcMain.on('update-tray-account', (_event, account: TrayAccountInfo | null) => {
     updateCurrentAccount(account)
     
     // 更新托盘提示
@@ -2550,8 +2611,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 更新托盘账户列表（从渲染进程调用）
-  ipcMain.on('update-tray-account-list', (_event, accounts: typeof allAccounts) => {
-    allAccounts = accounts
+  ipcMain.on('update-tray-account-list', (_event, accounts: TrayAccountInfo[]) => {
     updateAccountList(accounts)
   })
 
@@ -2566,29 +2626,17 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 关闭确认对话框响应
-  ipcMain.on('close-confirm-response', (_event, action: 'minimize' | 'quit' | 'cancel', rememberChoice: boolean) => {
-    if (action === 'minimize') {
-      mainWindow?.hide()
-      // macOS: 隐藏窗口时隐藏 Dock 图标
-      if (process.platform === 'darwin' && app.dock) {
-        app.dock.hide()
-      }
-    } else if (action === 'quit') {
-      // 如果用户选择记住选择
-      if (rememberChoice) {
-        traySettings.closeAction = 'quit'
-        saveTraySettings()
-      }
-      isQuitting = true
-      app.quit()
+  ipcMain.on('close-confirm-response', async (_event, action: 'minimize' | 'quit' | 'cancel', rememberChoice: boolean) => {
+    if(action === 'cancel') return
+    if(action !== 'quit' && action !== 'minimize') return
+    if(action === 'minimize' && !getTray()) { revealMainWindow(); return }
+    if(rememberChoice) {
+      const previous = traySettings
+      traySettings = { ...traySettings, closeAction: action }
+      try { await saveTraySettings() } catch(error) { traySettings = previous; console.error('[Tray] Failed to remember close choice:',error); return }
     }
-    // cancel 时不做任何操作
-    
-    // 如果用户选择记住"最小化"选择
-    if (action === 'minimize' && rememberChoice) {
-      traySettings.closeAction = 'minimize'
-      saveTraySettings()
-    }
+    if(action === 'quit') { if (!appUpdates?.snapshot().installing) void appQuit.request() }
+    else { mainWindow?.hide(); if(process.platform === 'darwin') app.dock?.hide() }
   })
 
   // IPC: 获取应用版本
@@ -2601,54 +2649,10 @@ app.whenReady().then(async () => {
    * 测试一组目标 URL 的连通性（用于诊断面板）
    * 支持指定代理 URL；返回每个目标的延迟与错误
    */
-  ipcMain.handle('diagnose:run', async (_event, params: {
-    proxyUrl?: string
-    targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
-  }) => {
-    const { proxyUrl, targets } = params || {}
-    const agent = proxyUrl ? safeCreateProxyAgent(proxyUrl) : undefined
-
-    const results = await Promise.all((targets || []).map(async (t) => {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), t.timeoutMs ?? 8000)
-      const start = Date.now()
-      try {
-        const init: UndiciRequestInit = {
-          method: 'GET',
-          signal: controller.signal,
-          headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }
-        }
-        if (agent) init.dispatcher = agent
-        const resp = await undiciFetch(t.url, init)
-        const latencyMs = Date.now() - start
-        const expected = t.expectStatus
-        const ok = expected ? expected.includes(resp.status) : (resp.status >= 200 && resp.status < 400)
-        return {
-          id: t.id,
-          label: t.label,
-          url: t.url,
-          success: ok,
-          httpStatus: resp.status,
-          latencyMs,
-          error: ok ? undefined : `HTTP ${resp.status}`
-        }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err)
-        return {
-          id: t.id,
-          label: t.label,
-          url: t.url,
-          success: false,
-          latencyMs: Date.now() - start,
-          error: controller.signal.aborted ? '超时' : errMsg
-        }
-      } finally {
-        clearTimeout(timer)
-      }
-    }))
-
-    return { results }
-  })
+  ipcMain.handle('diagnose:run', (_event, params: Parameters<typeof runDiagnostics>[0]) =>
+    runDiagnostics(params)
+  )
+  ipcMain.handle('diagnose:cancel', (_event, requestId: string) => cancelDiagnostic(requestId))
 
   // ============ 代理池验活 ============
   /**
@@ -2663,24 +2667,14 @@ app.whenReady().then(async () => {
    * 设置账号在反代场景下使用的出口代理 URL
    * 同时更新：反代账号池里现存的 ProxyAccount.proxyUrl + store 持久化的 accountProxyBindings
    */
-  ipcMain.handle('account-set-proxy-binding', async (_event, accountId: string, proxyUrl: string | undefined) => {
-    try {
-      if (!accountId) return { success: false }
-      // 更新反代账号池内存中的 proxyUrl
-      if (proxyServer) {
-        const pool = proxyServer.getAccountPool()
-        const acc = pool.getAccount(accountId)
-        if (acc) {
-          acc.proxyUrl = proxyUrl || undefined
-          console.log(`[ProxyServer] Account ${acc.email || accountId.slice(0, 8)} proxy ${proxyUrl ? `bound to ${proxyUrl.replace(/:([^:@/]+)@/, ':***@')}` : 'unbound'}`)
-        }
-      }
+  ipcMain.handle(
+    'account-set-proxy-bindings',
+    (_event, updates: Array<{ id: string; proxyUrl?: string }>) => {
+      const pool = proxyServer?.getAccountPool()
+      for (const { id, proxyUrl } of updates) pool?.updateAccount(id, { proxyUrl })
       return { success: true }
-    } catch (err) {
-      console.error('[account-set-proxy-binding] error:', err)
-      return { success: false }
     }
-  })
+  )
 
   // ============ 通用 HTTP 诊断探测 ============
   /**
@@ -2688,13 +2682,14 @@ app.whenReady().then(async () => {
    * 用于"一键诊断"面板中检测 Kiro API / 邮箱服务 / 公网连通性。
    */
   ipcMain.handle('diagnose:http-probe', async (_event, params: {
+    requestId?: string
     url: string
     method?: 'GET' | 'HEAD'
     timeoutMs?: number
   }) => {
     const { url, method = 'GET', timeoutMs = 5000 } = params || {}
     if (!url) return { success: false, error: 'Missing url' }
-    const controller = new AbortController()
+    const { controller, finish } = beginDiagnostic(params.requestId)
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     const start = Date.now()
     try {
@@ -2704,6 +2699,7 @@ app.whenReady().then(async () => {
         headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }
       })
       const latencyMs = Date.now() - start
+      await resp.body?.cancel()
       return { success: resp.ok, latencyMs, status: resp.status }
     } catch (err) {
       const isAbort = controller.signal.aborted
@@ -2714,276 +2710,362 @@ app.whenReady().then(async () => {
       }
     } finally {
       clearTimeout(timer)
+      finish()
     }
   })
 
   // IPC: 账号测活 —— 指定账号走反代逻辑（callKiroApi，与反代服务器同一底层调用）
   // 给指定模型发一条测试消息，验证账号是否能正常返回，用于一键诊断"账号测活"功能
-  ipcMain.handle('diagnose:account-liveness', async (_event, params: {
-    account: {
-      id?: string
-      email?: string
-      accessToken?: string
-      refreshToken?: string
-      clientId?: string
-      clientSecret?: string
-      region?: string
-      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
-      provider?: string
-      profileArn?: string
-      machineId?: string
-      expiresAt?: number
-      proxyUrl?: string
-    }
-    model?: string
-    message?: string
-    timeoutMs?: number
-  }) => {
-    const acc = params?.account
-    const model = (params?.model || 'claude-sonnet-4.5').trim()
-    const message = (params?.message || 'Hi, reply with "pong" only.').trim()
-    const timeoutMs = params?.timeoutMs ?? 45000
-    const start = Date.now()
-
-    if (!acc || !acc.accessToken) {
-      return { success: false, error: '账号缺少 accessToken', latencyMs: 0 }
-    }
-
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-    try {
-      // 1) Token 即将过期/已过期 → 先刷新（走账号绑定代理）
-      let accessToken = acc.accessToken
-      const needsRefresh = acc.expiresAt ? (acc.expiresAt - Date.now() < 60_000) : false
-      if (needsRefresh && acc.refreshToken) {
-        try {
-          const r = await refreshTokenByMethod(
-            acc.refreshToken,
-            acc.clientId || '',
-            acc.clientSecret || '',
-            acc.region || 'us-east-1',
-            acc.authMethod,
-            acc.proxyUrl
-          )
-          if (r.success && r.accessToken) accessToken = r.accessToken
-        } catch { /* 刷新失败则用原 token 尝试，让真实错误暴露出来 */ }
-      }
-
-      // 2) 构建 ProxyAccount（callKiroApi 需要的账号结构）
-      const proxyAccount: ProxyAccount = {
-        id: acc.id || 'diagnose',
-        email: acc.email,
-        accessToken,
-        refreshToken: acc.refreshToken,
-        clientId: acc.clientId,
-        clientSecret: acc.clientSecret,
-        region: acc.region || 'us-east-1',
-        authMethod: acc.authMethod,
-        provider: acc.provider,
-        profileArn: acc.profileArn,
-        machineId: acc.machineId,
-        proxyUrl: acc.proxyUrl,
-        expiresAt: acc.expiresAt
-      }
-
-      // 3) 构建最小 OpenAI chat 请求 → 转 Kiro payload
-      const payload = openaiToKiro({
-        model,
-        messages: [{ role: 'user', content: message }],
-        stream: false,
-        max_tokens: 64
-      }, proxyAccount.profileArn)
-
-      // 4) 调用（与反代服务器内部完全相同的底层调用）
-      const result = await callKiroApi(proxyAccount, payload, controller.signal)
-      const latencyMs = Date.now() - start
-      const content = (result.content || '').trim()
-      return {
-        success: true,
-        latencyMs,
-        model,
-        content: content.slice(0, 500),
-        usage: {
-          inputTokens: result.usage?.inputTokens || 0,
-          outputTokens: result.usage?.outputTokens || 0,
-          credits: result.usage?.credits || 0
+  ipcMain.handle(
+    'diagnose:account-liveness',
+    async (
+      _event,
+      params: {
+        requestId?: string
+        account: {
+          id?: string
+          email?: string
+          accessToken?: string
+          refreshToken?: string
+          clientId?: string
+          clientSecret?: string
+          region?: string
+          authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
+          provider?: string
+          profileArn?: string
+          machineId?: string
+          expiresAt?: number
+          proxyUrl?: string
         }
+        model?: string
+        message?: string
+        timeoutMs?: number
       }
-    } catch (err) {
-      const isAbort = controller.signal.aborted
-      const rawMsg = err instanceof Error ? err.message : String(err)
-      return {
-        success: false,
-        latencyMs: Date.now() - start,
-        model,
-        error: isAbort ? `超时 (${timeoutMs}ms)` : rawMsg
+    ) => {
+      const incoming = params?.account
+      const data = (lastSavedData || store?.get('accountData')) as
+        | {
+            accounts?: Record<
+              string,
+              { credentials?: Record<string, unknown>; machineId?: string; profileArn?: string }
+            >
+          }
+        | undefined
+      const saved = incoming?.id ? data?.accounts?.[incoming.id] : undefined
+      const pooled = incoming?.id ? proxyServer?.getAccountPool().getAccount(incoming.id) : undefined
+      const acc = incoming
+        ? ({
+            ...incoming,
+            ...pooled,
+            ...saved?.credentials,
+            proxyUrl: incoming.proxyUrl,
+            machineId: saved?.machineId || pooled?.machineId || incoming.machineId,
+            profileArn: saved?.profileArn || pooled?.profileArn || incoming.profileArn
+          } as typeof incoming)
+        : undefined
+      const model = (params?.model || 'claude-sonnet-4.5').trim()
+      const message = (params?.message || 'Hi, reply with "pong" only.').trim()
+      const timeoutMs = params?.timeoutMs ?? 45000
+      const start = Date.now()
+
+      if (!acc || !acc.accessToken) {
+        return { success: false, error: '账号缺少 accessToken', latencyMs: 0 }
       }
-    } finally {
-      clearTimeout(timer)
+
+      const { controller, finish } = beginDiagnostic(params.requestId)
+      const timer = setTimeout(() => controller.abort(), timeoutMs)
+      try {
+        // 1) Token 即将过期/已过期 → 先刷新（走账号绑定代理）
+        let accessToken = acc.accessToken
+        const needsRefresh = acc.expiresAt ? acc.expiresAt - Date.now() < 60_000 : false
+        if (needsRefresh && acc.refreshToken) {
+          try {
+            const expectedToken = acc.refreshToken
+            // Refresh is shared with background/proxy work. Persist rotation even when this caller cancels.
+            const refresh = accountWork.run(() => refreshTokenByMethod(
+              expectedToken,
+              acc.clientId || '',
+              acc.clientSecret || '',
+              acc.region || 'us-east-1',
+              acc.authMethod,
+              acc.proxyUrl
+            ).then((result) => {
+              if (result.success && result.accessToken) {
+                const updated = {
+                  ...acc,
+                  id: acc.id || 'diagnose',
+                  accessToken: result.accessToken,
+                  refreshToken: result.refreshToken || expectedToken,
+                  expiresAt: Date.now() + (result.expiresIn || 3600) * 1000
+                }
+                persistProxyAccountUpdate(updated, expectedToken)
+                const pool = proxyServer?.getAccountPool()
+                if (pool?.getAccount(updated.id)?.refreshToken === expectedToken)
+                  pool.updateAccount(updated.id, updated)
+                return updated
+              }
+              return undefined
+            }))
+            let abort: () => void = () => {}
+            try {
+              const cancelled = new Promise<never>((_resolve, reject) => {
+                abort = () => reject(new Error('已取消'))
+                controller.signal.addEventListener('abort', abort, { once: true })
+                if (controller.signal.aborted) abort()
+              })
+              const updated = await Promise.race([refresh, cancelled])
+              if (updated) {
+                Object.assign(acc, updated)
+                accessToken = updated.accessToken
+              }
+            } finally {
+              controller.signal.removeEventListener('abort', abort)
+            }
+          } catch {
+            /* 刷新失败则用原 token 尝试，让真实错误暴露出来 */
+          }
+        }
+
+        // 2) 构建 ProxyAccount（callKiroApi 需要的账号结构）
+        const proxyAccount: ProxyAccount = {
+          id: acc.id || 'diagnose',
+          email: acc.email,
+          accessToken,
+          refreshToken: acc.refreshToken,
+          clientId: acc.clientId,
+          clientSecret: acc.clientSecret,
+          region: acc.region || 'us-east-1',
+          authMethod: acc.authMethod,
+          provider: acc.provider,
+          profileArn: acc.profileArn,
+          machineId: acc.machineId,
+          proxyUrl: acc.proxyUrl,
+          expiresAt: acc.expiresAt
+        }
+
+        // 3) 构建最小 OpenAI chat 请求 → 转 Kiro payload
+        const payload = openaiToKiro(
+          {
+            model,
+            messages: [{ role: 'user', content: message }],
+            stream: false,
+            max_tokens: 64
+          },
+          proxyAccount.profileArn
+        )
+
+        // 4) 调用（与反代服务器内部完全相同的底层调用）
+        controller.signal.throwIfAborted()
+        const result = await callKiroApi(proxyAccount, payload, controller.signal)
+        const latencyMs = Date.now() - start
+        const content = (result.content || '').trim()
+        return {
+          success: true,
+          latencyMs,
+          model,
+          content: content.slice(0, 500),
+          usage: {
+            inputTokens: result.usage?.inputTokens || 0,
+            outputTokens: result.usage?.outputTokens || 0,
+            credits: result.usage?.credits || 0
+          }
+        }
+      } catch (err) {
+        const isAbort = controller.signal.aborted
+        const rawMsg = err instanceof Error ? err.message : String(err)
+        return {
+          success: false,
+          latencyMs: Date.now() - start,
+          model,
+          error: isAbort ? `超时 (${timeoutMs}ms)` : rawMsg
+        }
+      } finally {
+        clearTimeout(timer)
+        finish()
+      }
     }
-  })
+  )
 
   // IPC: 加载账号数据
   ipcMain.handle('load-accounts', async () => {
+    await initStore()
+    const data = lastSavedData || store!.get('accountData', null)
+    if (data !== null) validateAccountData(data)
+    return data
+  })
+  ipcMain.handle('get-account-storage-status', async () => {
+    await initStore()
+    return accountStorageStatus
+  })
+  ipcMain.handle('retry-account-storage', async () => {
+    await initStore()
     try {
-      await initStore()
-      return store!.get('accountData', null)
+      flushStoreWrites()
+      await flushBackupNow()
     } catch (error) {
-      console.error('Failed to load accounts:', error)
-      return null
+      updateAccountStorageStatus({ writeError: String(error) })
     }
+    return accountStorageStatus
   })
 
-  // IPC: 保存账号数据
-  ipcMain.handle('save-accounts', async (_event, data) => {
-    try {
-      await initStore()
-      store!.set('accountData', data)
-      refreshConcurrency = tokenRefreshConcurrency(data?.autoRefreshConcurrency)
-      
-      // 保存最后的数据（用于崩溃恢复）
-      lastSavedData = data
-      
-      // 每次保存时也创建备份
-      await createBackup(data)
-    } catch (error) {
-      console.error('Failed to save accounts:', error)
-      throw error
-    }
+  ipcMain.handle('save-accounts', async (_event, data: unknown) => {
+    if (_event.sender.isDestroyed()) return
+    await initStore()
+    if (_event.sender.isDestroyed()) return
+    persistAccountData(data, true)
+    refreshConcurrency = tokenRefreshConcurrency(
+      (data as { autoRefreshConcurrency?: number }).autoRefreshConcurrency
+    )
   })
 
   // IPC: 刷新账号 Token（支持 IdC 和社交登录）
   ipcMain.handle('refresh-account-token', async (_event, account) => {
-    try {
-      const { refreshToken, clientId, clientSecret, region, authMethod, startUrl, provider } = account.credentials || {}
-
-      if (!refreshToken) {
-        return { success: false, error: { message: '缺少 Refresh Token' } }
-      }
-
-      // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
-      if (authMethod !== 'social' && (!clientId || !clientSecret)) {
-        return { success: false, error: { message: '缺少 OIDC 刷新凭证 (clientId/clientSecret)' } }
-      }
-
-      // 查找账号绑定的代理 URL（账号池中已有 proxyUrl 字段）
-      const boundProxyUrl = proxyServer
-        ? (proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl)
-        : undefined
-
-      console.log(`[IPC] Refreshing token (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
-
-      // 根据 authMethod 选择刷新方式（透传账号绑定代理）
-      const refreshResult = await refreshTokenByMethod(
-        refreshToken,
-        clientId || '',
-        clientSecret || '',
-        region || 'us-east-1',
-        authMethod,
-        boundProxyUrl
-      )
-
-      if (!refreshResult.success || !refreshResult.accessToken) {
-        return { success: false, error: { message: refreshResult.error || 'Token 刷新失败' } }
-      }
-
-      const newAccess = refreshResult.accessToken
-      const newRefresh = refreshResult.refreshToken || refreshToken
-      const expiresIn = refreshResult.expiresIn ?? 3600
-
-      // bug B 修复：仅当该账号是 Kiro IDE 当前激活账号时，同步写入磁盘 token 文件
-      // 判定优先级（任一命中即视为"是当前激活账号"）：
-      //   1) 磁盘 token 的 refreshToken === renderer 传入的 account.credentials.refreshToken（最准）
-      //   2) account.id === lastSwitchedAccountId（反代刚切过号的兜底）
-      // 不同步的场景：用户在反代里刷新的是"非当前激活账号"，避免误覆盖 IDE 当前账号
-      let syncedToIde = false
-      let syncSkipReason: string | undefined
+    return accountWork.run(async () => {
       try {
-        const diskToken = await readKiroAuthTokenFile()
-        const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
-        const matchByLastSwitch = !!account.id && lastSwitchedAccountId === account.id
-        if (matchByRefresh || matchByLastSwitch) {
-          const resolvedProfileArn = resolveProfileArnForWrite({
-            profileArn: account.profileArn,
-            authMethod,
-            provider,
-            region
-          })
-          await writeKiroAuthTokenFile({
+        const { refreshToken, clientId, clientSecret, region, authMethod, startUrl, provider } =
+          account.credentials || {}
+
+        if (!refreshToken) {
+          return { success: false, error: { message: '缺少 Refresh Token' } }
+        }
+
+        // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
+        if (authMethod !== 'social' && (!clientId || !clientSecret)) {
+          return { success: false, error: { message: '缺少 OIDC 刷新凭证 (clientId/clientSecret)' } }
+        }
+
+        // 查找账号绑定的代理 URL（账号池中已有 proxyUrl 字段）
+        const boundProxyUrl = proxyServer
+          ? proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl
+          : undefined
+
+        console.log(
+          `[IPC] Refreshing token (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`
+        )
+
+        // 根据 authMethod 选择刷新方式（透传账号绑定代理）
+        const refreshResult = await refreshTokenByMethod(
+          refreshToken,
+          clientId || '',
+          clientSecret || '',
+          region || 'us-east-1',
+          authMethod,
+          boundProxyUrl
+        )
+
+        if (!refreshResult.success || !refreshResult.accessToken) {
+          return { success: false, error: { message: refreshResult.error || 'Token 刷新失败' } }
+        }
+
+        const newAccess = refreshResult.accessToken
+        const newRefresh = refreshResult.refreshToken || refreshToken
+        const expiresIn = refreshResult.expiresIn ?? 3600
+        commitAccountCredentials(
+          account.id,
+          {
             accessToken: newAccess,
             refreshToken: newRefresh,
-            expiresAtIso: new Date(Date.now() + expiresIn * 1000).toISOString(),
-            authMethod: (authMethod === 'social' ? 'social' : 'IdC'),
-            provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
-            region: region || diskToken?.region,
-            startUrl,
-            clientId: clientId || undefined,
-            clientSecret: clientSecret || undefined,
-            profileArn: resolvedProfileArn
-          })
-          // 记录刚写入的签名，避免 watcher 触发反向同步回环
-          lastWrittenTokenSignature = `${newAccess}|${newRefresh}`
-          if (account.id) lastSwitchedAccountId = account.id
-          syncedToIde = true
-          console.log(`[Refresh] Synced refreshed token to Kiro IDE for account ${account.email || account.id}`)
-          // 重新 schedule 主动续期 timer（基于新 expiresAt，覆盖任何旧 timer）
-          if (proactiveRenewalEnabled && account.id) {
-            scheduleProactiveRenewal(account.id, Date.now() + expiresIn * 1000)
-          }
-        } else {
-          syncSkipReason = diskToken
-            ? '该账号不是 Kiro IDE 当前激活账号，跳过磁盘同步'
-            : '磁盘上未找到 kiro-auth-token.json（IDE 未登录），跳过磁盘同步'
-        }
-      } catch (e) {
-        syncSkipReason = `磁盘同步异常：${e instanceof Error ? e.message : String(e)}`
-        console.warn('[Refresh] Failed to sync token to IDE:', e)
-      }
+            expiresAt: Date.now() + expiresIn * 1000
+          },
+          refreshToken
+        )
 
-      // 刷新后自动获取 profileArn（仅 Enterprise 需要调 API，其他类型不调）
-      let resolvedEnterpriseArn: string | undefined
-      const existingProfileArn = account.profileArn || account.credentials?.profileArn
-      if (!existingProfileArn) {
-        const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
-        if (isEnt) {
-          try {
-            resolvedEnterpriseArn = await fetchEnterpriseProfileArn({
-              id: account.id || '',
-              accessToken: newAccess,
-              region: region || 'us-east-1',
+        // bug B 修复：仅当该账号是 Kiro IDE 当前激活账号时，同步写入磁盘 token 文件
+        // 判定优先级（任一命中即视为"是当前激活账号"）：
+        //   1) 磁盘 token 的 refreshToken === renderer 传入的 account.credentials.refreshToken（最准）
+        //   2) account.id === lastSwitchedAccountId（反代刚切过号的兜底）
+        // 不同步的场景：用户在反代里刷新的是"非当前激活账号"，避免误覆盖 IDE 当前账号
+        let syncedToIde = false
+        let syncSkipReason: string | undefined
+        try {
+          const diskToken = await readKiroAuthTokenFile()
+          const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
+          const matchByLastSwitch = !!account.id && lastSwitchedAccountId === account.id
+          if (matchByRefresh || matchByLastSwitch) {
+            const resolvedProfileArn = resolveProfileArnForWrite({
+              profileArn: account.profileArn,
+              authMethod,
               provider,
-              authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined,
-              machineId: account.machineId
+              region
             })
-            if (resolvedEnterpriseArn) {
-              console.log(`[Refresh] Enterprise profileArn auto-resolved: ${resolvedEnterpriseArn}`)
+            await writeKiroAuthTokenFile({
+              accessToken: newAccess,
+              refreshToken: newRefresh,
+              expiresAtIso: new Date(Date.now() + expiresIn * 1000).toISOString(),
+              authMethod: authMethod === 'social' ? 'social' : 'IdC',
+              provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
+              region: region || diskToken?.region,
+              startUrl,
+              clientId: clientId || undefined,
+              clientSecret: clientSecret || undefined,
+              profileArn: resolvedProfileArn
+            })
+            // 记录刚写入的签名，避免 watcher 触发反向同步回环
+            lastWrittenTokenSignature = `${newAccess}|${newRefresh}`
+            if (account.id) lastSwitchedAccountId = account.id
+            syncedToIde = true
+            console.log(
+              `[Refresh] Synced refreshed token to Kiro IDE for account ${account.email || account.id}`
+            )
+            // 重新 schedule 主动续期 timer（基于新 expiresAt，覆盖任何旧 timer）
+            if (proactiveRenewalEnabled && account.id) {
+              scheduleProactiveRenewal(account.id, Date.now() + expiresIn * 1000)
             }
-          } catch (e) {
-            console.warn('[Refresh] Failed to fetch Enterprise profileArn:', e)
+          } else {
+            syncSkipReason = diskToken
+              ? '该账号不是 Kiro IDE 当前激活账号，跳过磁盘同步'
+              : '磁盘上未找到 kiro-auth-token.json（IDE 未登录），跳过磁盘同步'
+          }
+        } catch (e) {
+          syncSkipReason = `磁盘同步异常：${e instanceof Error ? e.message : String(e)}`
+          console.warn('[Refresh] Failed to sync token to IDE:', e)
+        }
+
+        // 刷新后自动获取 profileArn（仅 Enterprise 需要调 API，其他类型不调）
+        let resolvedEnterpriseArn: string | undefined
+        const existingProfileArn = account.profileArn || account.credentials?.profileArn
+        if (!existingProfileArn) {
+          const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
+          if (isEnt) {
+            try {
+              resolvedEnterpriseArn = await fetchEnterpriseProfileArn({
+                id: account.id || '',
+                accessToken: newAccess,
+                region: region || 'us-east-1',
+                provider,
+                authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined,
+                machineId: account.machineId
+              })
+              if (resolvedEnterpriseArn) {
+                console.log(`[Refresh] Enterprise profileArn auto-resolved: ${resolvedEnterpriseArn}`)
+              }
+            } catch (e) {
+              console.warn('[Refresh] Failed to fetch Enterprise profileArn:', e)
+            }
+          }
+          // BuilderId/Social 不调 API，不需要返回 profileArn（反代自愈时用 resolveProfileArn 兜底）
+        }
+
+        return {
+          success: true,
+          data: {
+            accessToken: newAccess,
+            refreshToken: newRefresh,
+            expiresIn,
+            // Enterprise 自动获取的 profileArn（renderer 需要存储到账号数据）
+            profileArn: resolvedEnterpriseArn || undefined,
+            // 让 renderer 决定是否给用户显示"已同步到 IDE"的反馈
+            syncedToIde,
+            syncSkipReason
           }
         }
-        // BuilderId/Social 不调 API，不需要返回 profileArn（反代自愈时用 resolveProfileArn 兜底）
-      }
-
-      return {
-        success: true,
-        data: {
-          accessToken: newAccess,
-          refreshToken: newRefresh,
-          expiresIn,
-          // Enterprise 自动获取的 profileArn（renderer 需要存储到账号数据）
-          profileArn: resolvedEnterpriseArn || undefined,
-          // 让 renderer 决定是否给用户显示"已同步到 IDE"的反馈
-          syncedToIde,
-          syncSkipReason
+      } catch (error) {
+        return {
+          success: false,
+          error: { message: error instanceof Error ? error.message : 'Unknown error' }
         }
       }
-    } catch (error) {
-      return {
-        success: false,
-        error: { message: error instanceof Error ? error.message : 'Unknown error' }
-      }
-    }
+    })
   })
 
   // ============ 主动续期开关 IPC ============
@@ -3081,10 +3163,7 @@ app.whenReady().then(async () => {
 
       try {
         console.log('[SSO] Fetching user info and usage data...')
-        const [userInfoResult, usageResult] = await Promise.all([
-          getUserInfo(ssoResult.accessToken).catch(e => { console.error('[SSO] getUserInfo failed:', e); return undefined }),
-          getUsageAndLimits(ssoResult.accessToken, 'BuilderId', undefined, undefined, region).catch(e => { console.error('[SSO] getUsageAndLimits failed:', e); return undefined })
-        ])
+        const [userInfoResult, usageResult] = await Promise.all([getUserInfo(ssoResult.accessToken).catch(() => undefined), getUsageAndLimits(ssoResult.accessToken, 'BuilderId', undefined, undefined, region).catch(() => undefined)])
         userInfo = userInfoResult
         usageData = usageResult
         console.log('[SSO] userInfo:', userInfo?.email)
@@ -3193,71 +3272,8 @@ app.whenReady().then(async () => {
   ipcMain.handle('check-account-status', async (_event, account) => {
     console.log(`[IPC] check-account-status [${account?.email || 'unknown'}]`)
 
-    interface Bonus {
-      bonusCode?: string
-      displayName?: string
-      usageLimit?: number
-      usageLimitWithPrecision?: number
-      currentUsage?: number
-      currentUsageWithPrecision?: number
-      status?: string
-      expiresAt?: string  // API 返回的是 expiresAt
-    }
-
-    interface FreeTrialInfo {
-      usageLimit?: number
-      usageLimitWithPrecision?: number
-      currentUsage?: number
-      currentUsageWithPrecision?: number
-      freeTrialStatus?: string
-      freeTrialExpiry?: string
-    }
-
-    interface UsageBreakdown {
-      usageLimit?: number
-      usageLimitWithPrecision?: number
-      currentUsage?: number
-      currentUsageWithPrecision?: number
-      displayName?: string
-      displayNamePlural?: string
-      resourceType?: string
-      currency?: string
-      unit?: string
-      overageRate?: number
-      overageCap?: number
-      bonuses?: Bonus[]
-      freeTrialInfo?: FreeTrialInfo
-    }
-
-    interface SubscriptionInfo {
-      subscriptionTitle?: string
-      type?: string
-      upgradeCapability?: string
-      overageCapability?: string
-      subscriptionManagementTarget?: string
-    }
-
-    interface UserInfo {
-      email?: string
-      userId?: string
-    }
-
-    interface OverageConfiguration {
-      overageEnabled?: boolean
-      overageStatus?: string
-    }
-
-    interface UsageResponse {
-      daysUntilReset?: number
-      nextDateReset?: string
-      usageBreakdownList?: UsageBreakdown[]
-      overageConfiguration?: OverageConfiguration
-      subscriptionInfo?: SubscriptionInfo
-      userInfo?: UserInfo
-    }
-
     // 解析 API 响应的辅助函数
-    const parseUsageResponse = (result: UsageResponse, newCredentials?: {
+    const parseUsageResponse = (result: UnifiedUsageResponse, newCredentials?: {
       accessToken: string
       refreshToken?: string
       expiresIn?: number
@@ -3411,16 +3427,7 @@ app.whenReady().then(async () => {
       // 第一次尝试：使用当前 accessToken
       try {
         // 并行调用 GetUserInfo 和 getUsageAndLimits
-        const [userInfoResult, usageResult] = await Promise.all([
-          getUserInfo(accessToken, idp, accountMachineId, account?.email).catch((err: Error) => {
-            // 封禁错误不能吞掉，必须向上抛出
-            if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
-              throw err
-            }
-            return undefined
-          }),
-          getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region, account?.email)
-        ])
+        const [userInfoResult, usageResult] = await getRequiredAccountInfo(accessToken, idp, accountMachineId, region, account?.email)
         return parseUsageResponse(usageResult, undefined, userInfoResult)
       } catch (apiError) {
         const errorMsg = apiError instanceof Error ? apiError.message : ''
@@ -3454,15 +3461,7 @@ app.whenReady().then(async () => {
             console.log('[IPC] Token refreshed, retrying API call...')
             
             // 用新 token 并行调用 GetUserInfo 和 getUsageAndLimits
-            const [userInfoResult, usageResult] = await Promise.all([
-              getUserInfo(refreshResult.accessToken, idp, accountMachineId).catch((err: Error) => {
-                if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
-                  throw err
-                }
-                return undefined
-              }),
-              getUsageAndLimits(refreshResult.accessToken, idp, undefined, accountMachineId, region)
-            ])
+            const [userInfoResult, usageResult] = await getRequiredAccountInfo(refreshResult.accessToken, idp, accountMachineId, region, account?.email)
             
             // 返回结果并包含新凭证
             return parseUsageResponse(usageResult, {
@@ -3500,548 +3499,257 @@ app.whenReady().then(async () => {
     let success = 0
     let failed = 0
 
-    // 串行处理每批，避免并发过高
-    for (let i = 0; i < accounts.length; i += concurrency) {
-      const batch = accounts.slice(i, i + concurrency)
-      
-      await Promise.allSettled(
-        batch.map(async (account) => {
-          // 去重：渲染进程定时器与主进程调度器可能同时触发刷新，
-          // 对同一账号并发刷新会让其中一个用到被 rotate 作废的旧 refreshToken。
-          // 已在途则跳过本次（不计入成败，等在途那次的结果回流即可）。
-          if (account.id && poolRefreshInFlightIds.has(account.id)) {
-            return
+    // worker 完成后立即取下一项；信息查询另受共享协调器限制。
+    let lastProgressAt = 0
+    const reportProgress = (): void => {
+      if (Date.now() - lastProgressAt < 120 && completed < accounts.length) return
+      lastProgressAt = Date.now()
+      mainWindow?.webContents.send('background-refresh-progress', { completed, total: accounts.length, success, failed })
+    }
+    await mapConcurrent(accounts, tokenRefreshConcurrency(concurrency), async (account) => {
+      if (accountWork.paused) return
+      try {
+        if (account.id && poolRefreshInFlightIds.has(account.id)) {
+          return
+        }
+        if (account.id) poolRefreshInFlightIds.add(account.id)
+        try {
+          const { refreshToken, clientId, clientSecret, region, startUrl, authMethod, accessToken, provider } =
+            account.credentials
+          const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
+
+          // 查询账号绑定的代理（从主进程账号池）
+          const boundProxyUrl = proxyServer
+            ? proxyServer.getAccountPool().getAccount(account.id)?.proxyUrl
+            : undefined
+
+          // 确定正确的 idp
+          let idp = 'BuilderId'
+          if (authMethod === 'social') {
+            idp = provider || account.idp || 'BuilderId'
+          } else if (provider) {
+            idp = provider
           }
-          if (account.id) poolRefreshInFlightIds.add(account.id)
-          try {
-            const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider } = account.credentials
-            const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
 
-            // 查询账号绑定的代理（从主进程账号池）
-            const boundProxyUrl = proxyServer
-              ? proxyServer.getAccountPool().getAccount(account.id)?.proxyUrl
-              : undefined
+          let newAccessToken = accessToken
+          let newRefreshToken = refreshToken
+          let newExpiresIn: number | undefined
+          let newExpiresAt: number | undefined
 
-            // 确定正确的 idp
-            let idp = 'BuilderId'
-            if (authMethod === 'social') {
-              idp = provider || account.idp || 'BuilderId'
-            } else if (provider) {
-              idp = provider
-            }
-            
-            let newAccessToken = accessToken
-            let newRefreshToken = refreshToken
-            let newExpiresIn: number | undefined
-
-            // 只有需要刷新 Token 时才刷新
-            if (needsTokenRefresh) {
-              if (!refreshToken) {
-                failed++
-                completed++
-                return
-              }
-
-              // 刷新 Token（透传账号绑定代理）
-              const refreshResult = await refreshTokenByMethod(
-                refreshToken,
-                clientId || '',
-                clientSecret || '',
-                region || 'us-east-1',
-                authMethod,
-                boundProxyUrl
-              )
-
-              if (!refreshResult.success) {
-                failed++
-                completed++
-                // 通知渲染进程刷新失败
-                mainWindow?.webContents.send('background-refresh-result', {
-                  id: account.id,
-                  success: false,
-                  error: refreshResult.error
-                })
-                return
-              }
-
-              newAccessToken = refreshResult.accessToken || accessToken
-              newRefreshToken = refreshResult.refreshToken || refreshToken
-              newExpiresIn = refreshResult.expiresIn
-
-              // 仅当该账号是 Kiro IDE 当前激活账号时，同步新 token 到磁盘 token 文件。
-              // 否则 IDE 在 ~50min 后会用磁盘上"被自动刷新作废"的旧 refreshToken 调 OIDC → 401 → logoutAndForget。
-              // 判定优先级（任一命中）：1) 磁盘 refresh 匹配账号  2) lastSwitchedAccountId 匹配
-              if (newAccessToken && newRefreshToken && newExpiresIn) {
-                try {
-                  const diskToken = await readKiroAuthTokenFile()
-                  const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
-                  const matchByLastSwitch = lastSwitchedAccountId === account.id
-                  if (matchByRefresh || matchByLastSwitch) {
-                    const resolvedProfileArn = resolveProfileArnForWrite({
-                      profileArn: diskToken?.profileArn,
-                      authMethod,
-                      provider,
-                      region
-                    })
-                    await writeKiroAuthTokenFile({
-                      accessToken: newAccessToken,
-                      refreshToken: newRefreshToken,
-                      expiresAtIso: new Date(Date.now() + newExpiresIn * 1000).toISOString(),
-                      authMethod: (authMethod === 'social' ? 'social' : 'IdC'),
-                      provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
-                      region: region || diskToken?.region,
-                      // background-batch-refresh 没传 startUrl，但 disk 的 clientIdHash 不再变；
-                      // helper 会用默认 startUrl 计算同一 hash，写入的 client 注册文件路径也不会变
-                      clientId: clientId || undefined,
-                      clientSecret: clientSecret || undefined,
-                      profileArn: resolvedProfileArn
-                    })
-                    lastWrittenTokenSignature = `${newAccessToken}|${newRefreshToken}`
-                    if (account.id) lastSwitchedAccountId = account.id
-                    console.log(`[BackgroundRefresh] Synced refreshed token to Kiro IDE for account ${account.id}`)
-                    if (proactiveRenewalEnabled && account.id) {
-                      scheduleProactiveRenewal(account.id, Date.now() + newExpiresIn * 1000)
-                    }
-                  }
-                } catch (e) {
-                  console.warn(`[BackgroundRefresh] sync to IDE failed for ${account.id}:`, e)
-                }
-              }
+          // 只有需要刷新 Token 时才刷新
+          if (needsTokenRefresh) {
+            if (!refreshToken) {
+              failed++
+              completed++
+              mainWindow?.webContents.send('background-refresh-result', { id: account.id, success: false,
+              expectedRefreshToken: account.credentials.refreshToken, error: '缺少 Refresh Token' })
+              return
             }
 
-            // Enterprise 账号：后台刷新后自动获取 profileArn（BuilderId/Social 不需要调 API）
-            const existingProfileArn = account.profileArn || account.credentials?.profileArn
-            let resolvedBgProfileArn: string | undefined
-            const isEnt = (provider || account.idp) === 'Enterprise' || authMethod === 'external_idp'
-            if (!existingProfileArn && newAccessToken && isEnt) {
+            // 刷新 Token（透传账号绑定代理）
+            const refreshResult = await refreshTokenByMethod(
+              refreshToken,
+              clientId || '',
+              clientSecret || '',
+              region || 'us-east-1',
+              authMethod,
+              boundProxyUrl
+            )
+
+            if (!refreshResult.success) {
+              failed++
+              completed++
+              // 通知渲染进程刷新失败
+              mainWindow?.webContents.send('background-refresh-result', {
+                id: account.id,
+                expectedRefreshToken: account.credentials.refreshToken,
+                success: false,
+                error: refreshResult.error
+              })
+              return
+            }
+
+            newAccessToken = refreshResult.accessToken || accessToken
+            newRefreshToken = refreshResult.refreshToken || refreshToken
+            newExpiresIn = refreshResult.expiresIn
+            newExpiresAt = newExpiresIn ? Date.now() + newExpiresIn * 1000 : undefined
+            commitAccountCredentials(account.id, {
+              accessToken: newAccessToken, refreshToken: newRefreshToken, expiresAt: newExpiresAt
+            }, refreshToken)
+
+            // 仅当该账号是 Kiro IDE 当前激活账号时，同步新 token 到磁盘 token 文件。
+            // 否则 IDE 在 ~50min 后会用磁盘上"被自动刷新作废"的旧 refreshToken 调 OIDC → 401 → logoutAndForget。
+            // 判定优先级（任一命中）：1) 磁盘 refresh 匹配账号  2) lastSwitchedAccountId 匹配
+            if (newAccessToken && newRefreshToken && newExpiresIn) {
               try {
-                resolvedBgProfileArn = await fetchEnterpriseProfileArn({
-                  id: account.id || '',
-                  accessToken: newAccessToken,
-                  region: region || 'us-east-1',
-                  provider: provider || account.idp,
-                  authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined,
-                  machineId: account.machineId
-                })
-                if (resolvedBgProfileArn) {
-                  console.log(`[BackgroundRefresh] Enterprise profileArn auto-resolved: ${resolvedBgProfileArn} (${account.id})`)
+                const diskToken = await readKiroAuthTokenFile()
+                const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
+                const matchByLastSwitch = lastSwitchedAccountId === account.id
+                if (matchByRefresh || matchByLastSwitch) {
+                  const resolvedProfileArn = resolveProfileArnForWrite({
+                    profileArn: diskToken?.profileArn,
+                    authMethod,
+                    provider,
+                    region
+                  })
+                  await writeKiroAuthTokenFile({
+                    accessToken: newAccessToken,
+                    refreshToken: newRefreshToken,
+                    expiresAtIso: new Date(Date.now() + newExpiresIn * 1000).toISOString(),
+                    authMethod: authMethod === 'social' ? 'social' : 'IdC',
+                    provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
+                    region: region || diskToken?.region,
+              startUrl,
+                    // background-batch-refresh 没传 startUrl，但 disk 的 clientIdHash 不再变；
+                    // helper 会用默认 startUrl 计算同一 hash，写入的 client 注册文件路径也不会变
+                    clientId: clientId || undefined,
+                    clientSecret: clientSecret || undefined,
+                    profileArn: resolvedProfileArn
+                  })
+                  lastWrittenTokenSignature = `${newAccessToken}|${newRefreshToken}`
+                  if (account.id) lastSwitchedAccountId = account.id
+                  console.log(
+                    `[BackgroundRefresh] Synced refreshed token to Kiro IDE for account ${account.id}`
+                  )
+                  if (proactiveRenewalEnabled && account.id) {
+                    scheduleProactiveRenewal(account.id, Date.now() + newExpiresIn * 1000)
+                  }
                 }
               } catch (e) {
-                console.warn(`[BackgroundRefresh] Failed to fetch Enterprise profileArn for ${account.id}:`, e)
+                console.warn(`[BackgroundRefresh] sync to IDE failed for ${account.id}:`, e)
               }
             }
+          }
 
-            // 获取账号信息
-            if (!newAccessToken) {
-              failed++
-              completed++
-              return
-            }
-
-            // 根据 syncInfo 决定是否检测账户信息
-            let parsedUsage: {
-              current: number
-              limit: number
-              baseCurrent: number
-              baseLimit: number
-              freeTrialCurrent: number
-              freeTrialLimit: number
-              freeTrialExpiry?: string
-              bonuses: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
-              nextResetDate?: string
-              resourceDetail?: {
-                displayName?: string
-                displayNamePlural?: string
-                resourceType?: string
-                currency?: string
-                unit?: string
-                overageRate?: number
-                overageCap?: number
-                overageEnabled?: boolean
-              }
-            } | undefined
-            let userInfoData: UserInfoResponse | undefined
-            let subscriptionData: { type: string; title: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string } | undefined
-            let status = 'active'
-            let errorMessage: string | undefined
-
-            if (syncInfo) {
-              // 调用 getUsageAndLimits API（根据配置选择 REST 或 CBOR 格式）
-              try {
-                interface UsageBreakdownItem {
-                  resourceType?: string
-                  displayName?: string
-                  currentUsage?: number
-                  currentUsageWithPrecision?: number
-                  usageLimit?: number
-                  usageLimitWithPrecision?: number
-                  freeTrialInfo?: {
-                    freeTrialStatus?: string
-                    usageLimit?: number
-                    usageLimitWithPrecision?: number
-                    currentUsage?: number
-                    currentUsageWithPrecision?: number
-                    freeTrialExpiry?: string
-                  }
-                  bonuses?: Array<{
-                    bonusCode?: string
-                    displayName?: string
-                    usageLimit?: number
-                    usageLimitWithPrecision?: number
-                    currentUsage?: number
-                    currentUsageWithPrecision?: number
-                    expiresAt?: string
-                    status?: string
-                  }>
-                }
-                interface UsageResponse {
-                  usageBreakdownList?: UsageBreakdownItem[]
-                  nextDateReset?: string
-                  subscriptionInfo?: {
-                    subscriptionTitle?: string
-                    type?: string
-                    overageCapability?: string
-                    upgradeCapability?: string
-                    subscriptionManagementTarget?: string
-                  }
-                  overageConfiguration?: {
-                    overageStatus?: string
-                    overageEnabled?: boolean
-                    overageLimit?: number | null
-                  }
-                }
-                console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
-                const rawUsage = await getUsageAndLimits(newAccessToken, idp, undefined, account.machineId, region) as UsageResponse
-                
-                // 解析使用量数据
-                const creditUsage = rawUsage.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
-                const baseCurrent = creditUsage?.currentUsageWithPrecision ?? creditUsage?.currentUsage ?? 0
-                const baseLimit = creditUsage?.usageLimitWithPrecision ?? creditUsage?.usageLimit ?? 0
-                let freeTrialCurrent = 0
-                let freeTrialLimit = 0
-                let freeTrialExpiry: string | undefined
-                if (creditUsage?.freeTrialInfo?.freeTrialStatus === 'ACTIVE') {
-                  freeTrialCurrent = creditUsage.freeTrialInfo.currentUsageWithPrecision ?? creditUsage.freeTrialInfo.currentUsage ?? 0
-                  freeTrialLimit = creditUsage.freeTrialInfo.usageLimitWithPrecision ?? creditUsage.freeTrialInfo.usageLimit ?? 0
-                  freeTrialExpiry = creditUsage.freeTrialInfo.freeTrialExpiry
-                }
-                const bonuses: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }> = []
-                if (creditUsage?.bonuses) {
-                  for (const bonus of creditUsage.bonuses) {
-                    if (bonus.status === 'ACTIVE') {
-                      bonuses.push({
-                        code: bonus.bonusCode || '',
-                        name: bonus.displayName || '',
-                        current: bonus.currentUsageWithPrecision ?? bonus.currentUsage ?? 0,
-                        limit: bonus.usageLimitWithPrecision ?? bonus.usageLimit ?? 0,
-                        expiresAt: bonus.expiresAt
-                      })
-                    }
-                  }
-                }
-                const totalLimit = baseLimit + freeTrialLimit + bonuses.reduce((sum, b) => sum + b.limit, 0)
-                const totalCurrent = baseCurrent + freeTrialCurrent + bonuses.reduce((sum, b) => sum + b.current, 0)
-                
-                parsedUsage = {
-                  current: totalCurrent,
-                  limit: totalLimit,
-                  baseCurrent,
-                  baseLimit,
-                  freeTrialCurrent,
-                  freeTrialLimit,
-                  freeTrialExpiry,
-                  bonuses,
-                  nextResetDate: rawUsage.nextDateReset,
-                  resourceDetail: creditUsage ? {
-                    displayName: creditUsage.displayName,
-                    displayNamePlural: (creditUsage as { displayNamePlural?: string }).displayNamePlural,
-                    resourceType: creditUsage.resourceType,
-                    currency: (creditUsage as { currency?: string }).currency,
-                    unit: (creditUsage as { unit?: string }).unit,
-                    overageRate: (creditUsage as { overageRate?: number }).overageRate,
-                    overageCap: (creditUsage as { overageCap?: number }).overageCap,
-                    overageEnabled: rawUsage.overageConfiguration?.overageStatus === 'ENABLED' || rawUsage.overageConfiguration?.overageEnabled === true
-                  } : undefined
-                }
-                
-                // 解析订阅信息（注意检查顺序：先检查更具体的类型）
-                const subscriptionTitle = rawUsage.subscriptionInfo?.subscriptionTitle || 'Free'
-                let subscriptionType = 'Free'
-                const titleUpper = subscriptionTitle.toUpperCase()
-                if (titleUpper.includes('PRO+') || titleUpper.includes('PRO_PLUS') || titleUpper.includes('PROPLUS')) {
-                  subscriptionType = 'Pro_Plus'
-                } else if (titleUpper.includes('POWER')) {
-                  subscriptionType = 'Enterprise'
-                } else if (titleUpper.includes('PRO')) {
-                  subscriptionType = 'Pro'
-                } else if (titleUpper.includes('ENTERPRISE')) {
-                  subscriptionType = 'Enterprise'
-                } else if (titleUpper.includes('TEAMS')) {
-                  subscriptionType = 'Teams'
-                }
-                
-                // 计算剩余天数和到期时间
-                let daysRemaining: number | undefined
-                let expiresAt: number | undefined
-                if (rawUsage.nextDateReset) {
-                  expiresAt = new Date(rawUsage.nextDateReset).getTime()
-                  daysRemaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / (1000 * 60 * 60 * 24)))
-                }
-                
-                subscriptionData = {
-                  type: subscriptionType,
-                  title: subscriptionTitle,
-                  daysRemaining,
-                  expiresAt,
-                  overageCapability: rawUsage.subscriptionInfo?.overageCapability,
-                  upgradeCapability: rawUsage.subscriptionInfo?.upgradeCapability,
-                  subscriptionManagementTarget: rawUsage.subscriptionInfo?.subscriptionManagementTarget
-                }
-              } catch (apiError) {
-                const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
-                console.log(`[BackgroundRefresh] Usage API error for ${account.id}:`, errMsg)
-                if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
-                  status = 'error'
-                  errorMessage = errMsg
-                }
-              }
-
-              // 调用 GetUserInfo API 获取用户状态
-              try {
-                userInfoData = await getUserInfo(newAccessToken, idp, account.machineId)
-              } catch (apiError) {
-                const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
-                if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
-                  status = 'error'
-                  errorMessage = errMsg
-                }
-              }
-            }
-
-            success++
-            completed++
-
-            // 通知渲染进程更新账号
-            mainWindow?.webContents.send('background-refresh-result', {
-              id: account.id,
-              success: true,
-              data: {
+          // Enterprise 账号：后台刷新后自动获取 profileArn（BuilderId/Social 不需要调 API）
+          const existingProfileArn = account.profileArn || account.credentials?.profileArn
+          let resolvedBgProfileArn: string | undefined
+          const isEnt = (provider || account.idp) === 'Enterprise' || authMethod === 'external_idp'
+          if (!existingProfileArn && newAccessToken && isEnt) {
+            try {
+              resolvedBgProfileArn = await fetchEnterpriseProfileArn({
+                id: account.id || '',
                 accessToken: newAccessToken,
-                refreshToken: newRefreshToken,
-                expiresIn: newExpiresIn,
-                profileArn: resolvedBgProfileArn || undefined,
-                usage: parsedUsage,
-                subscription: subscriptionData,
-                userInfo: syncInfo ? userInfoData : undefined,
-                status,
-                errorMessage
+                region: region || 'us-east-1',
+                provider: provider || account.idp,
+                authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined,
+                machineId: account.machineId
+              })
+              if (resolvedBgProfileArn) {
+                console.log(
+                  `[BackgroundRefresh] Enterprise profileArn auto-resolved: ${resolvedBgProfileArn} (${account.id})`
+                )
               }
-            })
-          } catch (e) {
+            } catch (e) {
+              console.warn(
+                `[BackgroundRefresh] Failed to fetch Enterprise profileArn for ${account.id}:`,
+                e
+              )
+            }
+          }
+
+          if (resolvedBgProfileArn) commitAccountCredentials(account.id,
+            { profileArn: resolvedBgProfileArn }, newRefreshToken, resolvedBgProfileArn)
+
+          // 获取账号信息
+          if (!newAccessToken) {
             failed++
             completed++
-            mainWindow?.webContents.send('background-refresh-result', {
-              id: account.id,
-              success: false,
-              error: e instanceof Error ? e.message : 'Unknown error'
-            })
-          } finally {
-            if (account.id) poolRefreshInFlightIds.delete(account.id)
+            mainWindow?.webContents.send('background-refresh-result', { id: account.id, success: false,
+              expectedRefreshToken: account.credentials.refreshToken, error: '缺少 accessToken' })
+            return
           }
-        })
-      )
 
-      // 通知进度
-      mainWindow?.webContents.send('background-refresh-progress', {
-        completed,
-        total: accounts.length,
-        success,
-        failed
-      })
-
-      // 批次间延迟，让主进程有喘息时间
-      if (i + concurrency < accounts.length) {
-        await new Promise(resolve => setTimeout(resolve, 100))
-      }
-    }
-
-    console.log(`[BackgroundRefresh] Completed: ${success} success, ${failed} failed`)
-    return { success: true, completed, successCount: success, failedCount: failed }
-  }
-  // 暴露给主进程调度器复用（startMainPoolTokenRefresh）
-  backgroundBatchRefreshImpl = backgroundBatchRefresh
-  ipcMain.handle('background-batch-refresh', (_event, accounts: BackgroundRefreshAccount[], concurrency: number = 10, syncInfo: boolean = true) => backgroundBatchRefresh(accounts, concurrency, syncInfo))
-  // 启动主进程池 token 刷新调度器（不依赖窗口可见/存活，挂托盘也照常刷新）
-  startMainPoolTokenRefresh()
-
-  // IPC: 后台批量检查账号状态（不刷新 Token，只检查状态）
-  ipcMain.handle('background-batch-check', async (_event, accounts: Array<{
-    id: string
-    email: string
-    credentials: {
-      accessToken: string
-      refreshToken?: string
-      clientId?: string
-      clientSecret?: string
-      region?: string
-      authMethod?: string
-      provider?: string
-    }
-    idp?: string
-  }>, concurrency: number = 10) => {
-    console.log(`[BackgroundCheck] Starting batch check for ${accounts.length} accounts, concurrency: ${concurrency}`)
-    
-    let completed = 0
-    let success = 0
-    let failed = 0
-
-    // 串行处理每批
-    for (let i = 0; i < accounts.length; i += concurrency) {
-      const batch = accounts.slice(i, i + concurrency)
-      
-      await Promise.allSettled(
-        batch.map(async (account) => {
-          try {
-            const { accessToken, authMethod, provider } = account.credentials
-            
-            if (!accessToken) {
-              failed++
-              completed++
-              mainWindow?.webContents.send('background-check-result', {
-                id: account.id,
-                success: false,
-                error: '缺少 accessToken'
-              })
-              return
-            }
-
-            // 确定 idp
-            let idp = account.idp || 'BuilderId'
-            if (authMethod === 'social' && provider) {
-              idp = provider
-            }
-
-            // 调用 API 获取用量和用户信息（根据配置选择 REST 或 CBOR 格式）
-            const [usageRes, userInfoRes] = await Promise.allSettled([
-              getUsageAndLimits(accessToken, idp, undefined, undefined, account.credentials?.region, account.email) as Promise<{
-                usageBreakdownList?: Array<{
-                  resourceType?: string
-                  displayName?: string
-                  usageLimit?: number
-                  usageLimitWithPrecision?: number
-                  currentUsage?: number
-                  currentUsageWithPrecision?: number
-                  freeTrialInfo?: {
-                    freeTrialStatus?: string
-                    usageLimit?: number
-                    usageLimitWithPrecision?: number
-                    currentUsage?: number
-                    currentUsageWithPrecision?: number
-                    freeTrialExpiry?: string
-                  }
-                  bonuses?: Array<{
-                    bonusCode?: string
-                    displayName?: string
-                    usageLimit?: number
-                    usageLimitWithPrecision?: number
-                    currentUsage?: number
-                    currentUsageWithPrecision?: number
-                    expiresAt?: string
-                    status?: string
-                  }>
-                }>
-                nextDateReset?: string
-                subscriptionInfo?: {
-                  subscriptionTitle?: string
-                  type?: string
-                  overageCapability?: string
-                  upgradeCapability?: string
-                  subscriptionManagementTarget?: string
-                }
-                overageConfiguration?: {
-                  overageStatus?: string
-                  overageEnabled?: boolean
-                  overageLimit?: number | null
-                }
-                userInfo?: {
-                  email?: string
-                  userId?: string
-                }
-              }>,
-              kiroApiRequest<{
-                email?: string
-                userId?: string
-                status?: string
-                idp?: string
-              }>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp, undefined, account.email).catch((err: Error) => {
-                // 封禁错误不能吞掉，需要在后续逻辑中检测
-                if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
-                  throw err
-                }
-                return null
-              })
-            ])
-
-            // 解析响应（kiroApiRequest 直接返回数据或抛出异常）
-            let usageData: {
-              current: number
-              limit: number
-              baseCurrent?: number
-              baseLimit?: number
-              freeTrialCurrent?: number
-              freeTrialLimit?: number
-              freeTrialExpiry?: string
-              bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
-              nextResetDate?: string
-            } | null = null
-            let subscriptionData: {
-              type: string
-              title: string
-              daysRemaining?: number
-              expiresAt?: number
-              overageCapability?: string
-              upgradeCapability?: string
-              subscriptionManagementTarget?: string
-            } | null = null
-            let resourceDetail: {
-              displayName?: string
-              displayNamePlural?: string
-              resourceType?: string
-              currency?: string
-              unit?: string
-              overageRate?: number
-              overageCap?: number
-              overageEnabled?: boolean
-            } | undefined
-            let userInfoData: {
-              email?: string
-              userId?: string
-              status?: string
-            } | null = null
-            let status = 'active'
-            let errorMessage: string | undefined
-
-            // 处理用量响应
-            if (usageRes.status === 'fulfilled') {
-              const rawUsage = usageRes.value
-              // 解析 Credits 使用量（和单个检查一致）
-              const creditUsage = rawUsage.usageBreakdownList?.find(
-                (b) => b.resourceType === 'CREDIT' || b.displayName === 'Credits'
+          const info = syncInfo
+            ? await fetchAccountInfo(
+                newAccessToken,
+                idp,
+                resolvedBgProfileArn || existingProfileArn,
+                account.machineId,
+                region
               )
-              
-              const baseCurrent = creditUsage?.currentUsageWithPrecision ?? creditUsage?.currentUsage ?? 0
+            : undefined
+
+          // 根据 syncInfo 决定是否检测账户信息
+          let parsedUsage:
+            | {
+                current: number
+                limit: number
+                baseCurrent: number
+                baseLimit: number
+                freeTrialCurrent: number
+                freeTrialLimit: number
+                freeTrialExpiry?: string
+                bonuses: Array<{
+                  code: string
+                  name: string
+                  current: number
+                  limit: number
+                  expiresAt?: string
+                }>
+                nextResetDate?: string
+                resourceDetail?: {
+                  displayName?: string
+                  displayNamePlural?: string
+                  resourceType?: string
+                  currency?: string
+                  unit?: string
+                  overageRate?: number
+                  overageCap?: number
+                  overageEnabled?: boolean
+                }
+              }
+            | undefined
+          let userInfoData: UserInfoResponse | undefined
+          let subscriptionData:
+            | {
+                type: string
+                title: string
+                daysRemaining?: number
+                expiresAt?: number
+                overageCapability?: string
+                upgradeCapability?: string
+                subscriptionManagementTarget?: string
+              }
+            | undefined
+          let status = 'active'
+          let errorMessage: string | undefined
+
+          if (syncInfo) {
+            // 调用 getUsageAndLimits API（根据配置选择 REST 或 CBOR 格式）
+            try {
+              console.log(
+                `[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`
+              )
+              if (info!.usage.status === 'rejected') throw info!.usage.reason
+              const rawUsage = info!.usage.value
+
+              // 解析使用量数据
+              const creditUsage = rawUsage.usageBreakdownList?.find((b) => b.resourceType === 'CREDIT')
+              const baseCurrent =
+                creditUsage?.currentUsageWithPrecision ?? creditUsage?.currentUsage ?? 0
               const baseLimit = creditUsage?.usageLimitWithPrecision ?? creditUsage?.usageLimit ?? 0
               let freeTrialCurrent = 0
               let freeTrialLimit = 0
               let freeTrialExpiry: string | undefined
               if (creditUsage?.freeTrialInfo?.freeTrialStatus === 'ACTIVE') {
-                freeTrialLimit = creditUsage.freeTrialInfo.usageLimitWithPrecision ?? creditUsage.freeTrialInfo.usageLimit ?? 0
-                freeTrialCurrent = creditUsage.freeTrialInfo.currentUsageWithPrecision ?? creditUsage.freeTrialInfo.currentUsage ?? 0
+                freeTrialCurrent =
+                  creditUsage.freeTrialInfo.currentUsageWithPrecision ??
+                  creditUsage.freeTrialInfo.currentUsage ??
+                  0
+                freeTrialLimit =
+                  creditUsage.freeTrialInfo.usageLimitWithPrecision ??
+                  creditUsage.freeTrialInfo.usageLimit ??
+                  0
                 freeTrialExpiry = creditUsage.freeTrialInfo.freeTrialExpiry
               }
-              
-              // 解析 bonuses
-              const bonuses: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }> = []
+              const bonuses: Array<{
+                code: string
+                name: string
+                current: number
+                limit: number
+                expiresAt?: string
+              }> = []
               if (creditUsage?.bonuses) {
                 for (const bonus of creditUsage.bonuses) {
                   if (bonus.status === 'ACTIVE') {
@@ -4055,11 +3763,12 @@ app.whenReady().then(async () => {
                   }
                 }
               }
-              
-              const totalLimit = baseLimit + freeTrialLimit + bonuses.reduce((sum, b) => sum + b.limit, 0)
-              const totalCurrent = baseCurrent + freeTrialCurrent + bonuses.reduce((sum, b) => sum + b.current, 0)
-              
-              usageData = {
+              const totalLimit =
+                baseLimit + freeTrialLimit + bonuses.reduce((sum, b) => sum + b.limit, 0)
+              const totalCurrent =
+                baseCurrent + freeTrialCurrent + bonuses.reduce((sum, b) => sum + b.current, 0)
+
+              parsedUsage = {
                 current: totalCurrent,
                 limit: totalLimit,
                 baseCurrent,
@@ -4068,28 +3777,33 @@ app.whenReady().then(async () => {
                 freeTrialLimit,
                 freeTrialExpiry,
                 bonuses,
-                nextResetDate: rawUsage.nextDateReset
-              }
-
-              // 解析资源详情（含超额信息）
-              if (creditUsage) {
-                resourceDetail = {
-                  displayName: creditUsage.displayName,
-                  displayNamePlural: (creditUsage as { displayNamePlural?: string }).displayNamePlural,
-                  resourceType: creditUsage.resourceType,
-                  currency: (creditUsage as { currency?: string }).currency,
-                  unit: (creditUsage as { unit?: string }).unit,
-                  overageRate: (creditUsage as { overageRate?: number }).overageRate,
-                  overageCap: (creditUsage as { overageCap?: number }).overageCap,
-                  overageEnabled: rawUsage.overageConfiguration?.overageStatus === 'ENABLED' || rawUsage.overageConfiguration?.overageEnabled === true
-                }
+                nextResetDate: rawUsage.nextDateReset,
+                resourceDetail: creditUsage
+                  ? {
+                      displayName: creditUsage.displayName,
+                      displayNamePlural: (creditUsage as { displayNamePlural?: string })
+                        .displayNamePlural,
+                      resourceType: creditUsage.resourceType,
+                      currency: (creditUsage as { currency?: string }).currency,
+                      unit: (creditUsage as { unit?: string }).unit,
+                      overageRate: (creditUsage as { overageRate?: number }).overageRate,
+                      overageCap: (creditUsage as { overageCap?: number }).overageCap,
+                      overageEnabled:
+                        rawUsage.overageConfiguration?.overageStatus === 'ENABLED' ||
+                        rawUsage.overageConfiguration?.overageEnabled === true
+                    }
+                  : undefined
               }
 
               // 解析订阅信息（注意检查顺序：先检查更具体的类型）
-              const subscriptionTitle = rawUsage.subscriptionInfo?.subscriptionTitle ?? 'Free'
+              const subscriptionTitle = rawUsage.subscriptionInfo?.subscriptionTitle || 'Free'
               let subscriptionType = 'Free'
               const titleUpper = subscriptionTitle.toUpperCase()
-              if (titleUpper.includes('PRO+') || titleUpper.includes('PRO_PLUS') || titleUpper.includes('PROPLUS')) {
+              if (
+                titleUpper.includes('PRO+') ||
+                titleUpper.includes('PRO_PLUS') ||
+                titleUpper.includes('PROPLUS')
+              ) {
                 subscriptionType = 'Pro_Plus'
               } else if (titleUpper.includes('POWER')) {
                 subscriptionType = 'Enterprise'
@@ -4100,7 +3814,7 @@ app.whenReady().then(async () => {
               } else if (titleUpper.includes('TEAMS')) {
                 subscriptionType = 'Teams'
               }
-              
+
               // 计算剩余天数和到期时间
               let daysRemaining: number | undefined
               let expiresAt: number | undefined
@@ -4108,7 +3822,7 @@ app.whenReady().then(async () => {
                 expiresAt = new Date(rawUsage.nextDateReset).getTime()
                 daysRemaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / (1000 * 60 * 60 * 24)))
               }
-              
+
               subscriptionData = {
                 type: subscriptionType,
                 title: subscriptionTitle,
@@ -4118,88 +3832,411 @@ app.whenReady().then(async () => {
                 upgradeCapability: rawUsage.subscriptionInfo?.upgradeCapability,
                 subscriptionManagementTarget: rawUsage.subscriptionInfo?.subscriptionManagementTarget
               }
-            } else if (usageRes.status === 'rejected') {
-              // API 调用失败（可能是封禁或 Token 过期）
-              const errorMsg = usageRes.reason?.message || String(usageRes.reason)
-              console.log(`[BackgroundCheck] Usage API failed for ${account.email}:`, errorMsg)
-              if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
-                status = 'error'
-                errorMessage = errorMsg
-              } else if (errorMsg.includes('401')) {
-                status = 'expired'
-                errorMessage = 'Token 已过期，请刷新'
-              } else {
-                status = 'error'
-                errorMessage = errorMsg
-              }
-            }
-
-            // 处理用户信息响应
-            if (userInfoRes.status === 'fulfilled' && userInfoRes.value) {
-              const rawUserInfo = userInfoRes.value
-              userInfoData = {
-                email: rawUserInfo.email,
-                userId: rawUserInfo.userId,
-                status: rawUserInfo.status
-              }
-              // 检查用户状态（Stale 视为正常，仅 Suspended/Disabled 等视为异常）
-              if (rawUserInfo.status && rawUserInfo.status !== 'Active' && rawUserInfo.status !== 'Stale' && status !== 'error') {
-                status = 'error'
-                errorMessage = `用户状态异常: ${rawUserInfo.status}`
-              }
-            } else if (userInfoRes.status === 'rejected') {
-              // GetUserInfo 失败（封禁错误会到这里）
-              const errMsg = userInfoRes.reason?.message || String(userInfoRes.reason)
-              if (errMsg.includes('423') || errMsg.includes('AccountSuspended')) {
+            } catch (apiError) {
+              const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
+              console.log(`[BackgroundRefresh] Usage API error for ${account.id}:`, errMsg)
+              status = 'error'
+              errorMessage = errMsg
+              if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
                 status = 'error'
                 errorMessage = errMsg
               }
             }
 
-            success++
-            completed++
-
-            // 通知渲染进程更新账号
-            mainWindow?.webContents.send('background-check-result', {
-              id: account.id,
-              success: true,
-              data: {
-                usage: usageData ? { ...usageData, resourceDetail } : null,
-                subscription: subscriptionData,
-                userInfo: userInfoData,
-                status,
-                errorMessage
+            // 调用 GetUserInfo API 获取用户状态
+            try {
+              if (info!.userInfo.status === 'rejected') throw info!.userInfo.reason
+              userInfoData = info!.userInfo.value
+            } catch (apiError) {
+              const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
+              if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
+                status = 'error'
+                errorMessage = errMsg
               }
-            })
-          } catch (e) {
-            failed++
-            completed++
-            mainWindow?.webContents.send('background-check-result', {
-              id: account.id,
-              success: false,
-              error: e instanceof Error ? e.message : 'Unknown error'
-            })
+            }
+          }
+
+          success++
+          completed++
+
+          // 通知渲染进程更新账号
+          mainWindow?.webContents.send('background-refresh-result', {
+            id: account.id,
+            expectedRefreshToken: account.credentials.refreshToken,
+            success: true,
+            data: {
+              ...(needsTokenRefresh
+                ? {
+                    accessToken: newAccessToken,
+                    refreshToken: newRefreshToken,
+                    expiresIn: newExpiresIn,
+                    expiresAt: newExpiresAt
+                  }
+                : {}),
+              profileArn: resolvedBgProfileArn || undefined,
+              usage: parsedUsage,
+              subscription: subscriptionData,
+              userInfo: syncInfo ? userInfoData : undefined,
+              status,
+              errorMessage
+            }
+          })
+        } catch (e) {
+          failed++
+          completed++
+          mainWindow?.webContents.send('background-refresh-result', {
+            id: account.id,
+            success: false,
+            error: e instanceof Error ? e.message : 'Unknown error'
+          })
+        } finally {
+          if (account.id) poolRefreshInFlightIds.delete(account.id)
+        }
+      } finally {
+        reportProgress()
+      }
+    })
+    mainWindow?.webContents.send('background-refresh-progress', { completed, total: accounts.length, success, failed })
+
+    if (!mainWindow || mainWindow.isDestroyed()) flushAccountData()
+    console.log(`[BackgroundRefresh] Completed: ${success} success, ${failed} failed`)
+    return { success: true, completed, successCount: success, failedCount: failed }
+  }
+  // 暴露给主进程调度器复用（startMainPoolTokenRefresh）
+  backgroundBatchRefreshImpl = (accounts, concurrency, syncInfo) => accountWork.run(() => backgroundBatchRefresh(accounts, concurrency, syncInfo))
+  ipcMain.handle('background-batch-refresh', (_event, accounts: BackgroundRefreshAccount[], concurrency: number = 10, syncInfo: boolean = true) => accountWork.paused ? Promise.resolve({ success: true, completed: 0, successCount: 0, failedCount: 0 }) : backgroundBatchRefreshImpl!(accounts, concurrency, syncInfo))
+  // 启动主进程池 token 刷新调度器（不依赖窗口可见/存活，挂托盘也照常刷新）
+  startMainPoolTokenRefresh()
+
+  // IPC: 后台批量检查账号状态（不刷新 Token，只检查状态）
+  ipcMain.handle(
+    'background-batch-check',
+    async (
+      _event,
+      accounts: Array<{
+        id: string
+        email: string
+        credentials: {
+          accessToken: string
+          refreshToken?: string
+          clientId?: string
+          clientSecret?: string
+          region?: string
+          authMethod?: string
+          provider?: string
+        }
+        idp?: string
+      }>,
+      concurrency: number = 10
+    ) => {
+      if (accountWork.paused) return { success: true, completed: 0, successCount: 0, failedCount: 0 }
+      return accountWork.run(async () => {
+        console.log(
+          `[BackgroundCheck] Starting batch check for ${accounts.length} accounts, concurrency: ${concurrency}`
+        )
+
+        let completed = 0
+        let success = 0
+        let failed = 0
+
+        // 使用连续 worker，避免慢请求阻塞整个下一批。
+        let lastProgressAt = 0
+        const reportProgress = (): void => {
+          if (Date.now() - lastProgressAt < 120 && completed < accounts.length) return
+          lastProgressAt = Date.now()
+          mainWindow?.webContents.send('background-check-progress', {
+            completed,
+            total: accounts.length,
+            success,
+            failed
+          })
+        }
+        await mapConcurrent(accounts, tokenRefreshConcurrency(concurrency), async (account) => {
+          if (accountWork.paused) return
+          try {
+            try {
+              const { accessToken, authMethod, provider } = account.credentials
+
+              if (!accessToken) {
+                failed++
+                completed++
+                mainWindow?.webContents.send('background-check-result', {
+                  id: account.id,
+                  success: false,
+                  error: '缺少 accessToken'
+                })
+                return
+              }
+
+              // 确定 idp
+              let idp = account.idp || 'BuilderId'
+              if (authMethod === 'social' && provider) {
+                idp = provider
+              }
+
+              // 调用 API 获取用量和用户信息（根据配置选择 REST 或 CBOR 格式）
+              const { usage: usageRes, userInfo: userInfoRes } = await fetchAccountInfo(
+                accessToken,
+                idp,
+                undefined,
+                undefined,
+                account.credentials.region,
+                account.email
+              )
+
+              // 解析响应（kiroApiRequest 直接返回数据或抛出异常）
+              let usageData: {
+                current: number
+                limit: number
+                baseCurrent?: number
+                baseLimit?: number
+                freeTrialCurrent?: number
+                freeTrialLimit?: number
+                freeTrialExpiry?: string
+                bonuses?: Array<{
+                  code: string
+                  name: string
+                  current: number
+                  limit: number
+                  expiresAt?: string
+                }>
+                nextResetDate?: string
+              } | null = null
+              let subscriptionData: {
+                type: string
+                title: string
+                daysRemaining?: number
+                expiresAt?: number
+                overageCapability?: string
+                upgradeCapability?: string
+                subscriptionManagementTarget?: string
+              } | null = null
+              let resourceDetail:
+                | {
+                    displayName?: string
+                    displayNamePlural?: string
+                    resourceType?: string
+                    currency?: string
+                    unit?: string
+                    overageRate?: number
+                    overageCap?: number
+                    overageEnabled?: boolean
+                  }
+                | undefined
+              let userInfoData: {
+                email?: string
+                userId?: string
+                status?: string
+              } | null = null
+              let status = 'active'
+              let errorMessage: string | undefined
+
+              // 处理用量响应
+              if (usageRes.status === 'fulfilled') {
+                const rawUsage = usageRes.value
+                // 解析 Credits 使用量（和单个检查一致）
+                const creditUsage = rawUsage.usageBreakdownList?.find(
+                  (b) => b.resourceType === 'CREDIT' || b.displayName === 'Credits'
+                )
+
+                const baseCurrent =
+                  creditUsage?.currentUsageWithPrecision ?? creditUsage?.currentUsage ?? 0
+                const baseLimit = creditUsage?.usageLimitWithPrecision ?? creditUsage?.usageLimit ?? 0
+                let freeTrialCurrent = 0
+                let freeTrialLimit = 0
+                let freeTrialExpiry: string | undefined
+                if (creditUsage?.freeTrialInfo?.freeTrialStatus === 'ACTIVE') {
+                  freeTrialLimit =
+                    creditUsage.freeTrialInfo.usageLimitWithPrecision ??
+                    creditUsage.freeTrialInfo.usageLimit ??
+                    0
+                  freeTrialCurrent =
+                    creditUsage.freeTrialInfo.currentUsageWithPrecision ??
+                    creditUsage.freeTrialInfo.currentUsage ??
+                    0
+                  freeTrialExpiry = creditUsage.freeTrialInfo.freeTrialExpiry
+                }
+
+                // 解析 bonuses
+                const bonuses: Array<{
+                  code: string
+                  name: string
+                  current: number
+                  limit: number
+                  expiresAt?: string
+                }> = []
+                if (creditUsage?.bonuses) {
+                  for (const bonus of creditUsage.bonuses) {
+                    if (bonus.status === 'ACTIVE') {
+                      bonuses.push({
+                        code: bonus.bonusCode || '',
+                        name: bonus.displayName || '',
+                        current: bonus.currentUsageWithPrecision ?? bonus.currentUsage ?? 0,
+                        limit: bonus.usageLimitWithPrecision ?? bonus.usageLimit ?? 0,
+                        expiresAt: bonus.expiresAt
+                      })
+                    }
+                  }
+                }
+
+                const totalLimit =
+                  baseLimit + freeTrialLimit + bonuses.reduce((sum, b) => sum + b.limit, 0)
+                const totalCurrent =
+                  baseCurrent + freeTrialCurrent + bonuses.reduce((sum, b) => sum + b.current, 0)
+
+                usageData = {
+                  current: totalCurrent,
+                  limit: totalLimit,
+                  baseCurrent,
+                  baseLimit,
+                  freeTrialCurrent,
+                  freeTrialLimit,
+                  freeTrialExpiry,
+                  bonuses,
+                  nextResetDate: rawUsage.nextDateReset
+                }
+
+                // 解析资源详情（含超额信息）
+                if (creditUsage) {
+                  resourceDetail = {
+                    displayName: creditUsage.displayName,
+                    displayNamePlural: (creditUsage as { displayNamePlural?: string })
+                      .displayNamePlural,
+                    resourceType: creditUsage.resourceType,
+                    currency: (creditUsage as { currency?: string }).currency,
+                    unit: (creditUsage as { unit?: string }).unit,
+                    overageRate: (creditUsage as { overageRate?: number }).overageRate,
+                    overageCap: (creditUsage as { overageCap?: number }).overageCap,
+                    overageEnabled:
+                      rawUsage.overageConfiguration?.overageStatus === 'ENABLED' ||
+                      rawUsage.overageConfiguration?.overageEnabled === true
+                  }
+                }
+
+                // 解析订阅信息（注意检查顺序：先检查更具体的类型）
+                const subscriptionTitle = rawUsage.subscriptionInfo?.subscriptionTitle ?? 'Free'
+                let subscriptionType = 'Free'
+                const titleUpper = subscriptionTitle.toUpperCase()
+                if (
+                  titleUpper.includes('PRO+') ||
+                  titleUpper.includes('PRO_PLUS') ||
+                  titleUpper.includes('PROPLUS')
+                ) {
+                  subscriptionType = 'Pro_Plus'
+                } else if (titleUpper.includes('POWER')) {
+                  subscriptionType = 'Enterprise'
+                } else if (titleUpper.includes('PRO')) {
+                  subscriptionType = 'Pro'
+                } else if (titleUpper.includes('ENTERPRISE')) {
+                  subscriptionType = 'Enterprise'
+                } else if (titleUpper.includes('TEAMS')) {
+                  subscriptionType = 'Teams'
+                }
+
+                // 计算剩余天数和到期时间
+                let daysRemaining: number | undefined
+                let expiresAt: number | undefined
+                if (rawUsage.nextDateReset) {
+                  expiresAt = new Date(rawUsage.nextDateReset).getTime()
+                  daysRemaining = Math.max(
+                    0,
+                    Math.ceil((expiresAt - Date.now()) / (1000 * 60 * 60 * 24))
+                  )
+                }
+
+                subscriptionData = {
+                  type: subscriptionType,
+                  title: subscriptionTitle,
+                  daysRemaining,
+                  expiresAt,
+                  overageCapability: rawUsage.subscriptionInfo?.overageCapability,
+                  upgradeCapability: rawUsage.subscriptionInfo?.upgradeCapability,
+                  subscriptionManagementTarget:
+                    rawUsage.subscriptionInfo?.subscriptionManagementTarget
+                }
+              } else if (usageRes.status === 'rejected') {
+                // API 调用失败（可能是封禁或 Token 过期）
+                const errorMsg = usageRes.reason?.message || String(usageRes.reason)
+                console.log(`[BackgroundCheck] Usage API failed for ${account.email}:`, errorMsg)
+                if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
+                  status = 'error'
+                  errorMessage = errorMsg
+                } else if (errorMsg.includes('401')) {
+                  status = 'expired'
+                  errorMessage = 'Token 已过期，请刷新'
+                } else {
+                  status = 'error'
+                  errorMessage = errorMsg
+                }
+              }
+
+              // 处理用户信息响应
+              if (userInfoRes.status === 'fulfilled' && userInfoRes.value) {
+                const rawUserInfo = userInfoRes.value
+                userInfoData = {
+                  email: rawUserInfo.email,
+                  userId: rawUserInfo.userId,
+                  status: rawUserInfo.status
+                }
+                // 检查用户状态（Stale 视为正常，仅 Suspended/Disabled 等视为异常）
+                if (
+                  rawUserInfo.status &&
+                  rawUserInfo.status !== 'Active' &&
+                  rawUserInfo.status !== 'Stale' &&
+                  status !== 'error'
+                ) {
+                  status = 'error'
+                  errorMessage = `用户状态异常: ${rawUserInfo.status}`
+                }
+              } else if (userInfoRes.status === 'rejected') {
+                // GetUserInfo 失败（封禁错误会到这里）
+                const errMsg = userInfoRes.reason?.message || String(userInfoRes.reason)
+                if (errMsg.includes('423') || errMsg.includes('AccountSuspended')) {
+                  status = 'error'
+                  errorMessage = errMsg
+                }
+              }
+
+              success++
+              completed++
+
+              // 通知渲染进程更新账号
+              mainWindow?.webContents.send('background-check-result', {
+                id: account.id,
+                success: true,
+                data: {
+                  usage: usageData ? { ...usageData, resourceDetail } : null,
+                  subscription: subscriptionData,
+                  userInfo: userInfoData,
+                  status,
+                  errorMessage
+                }
+              })
+            } catch (e) {
+              failed++
+              completed++
+              mainWindow?.webContents.send('background-check-result', {
+                id: account.id,
+                success: false,
+                error: e instanceof Error ? e.message : 'Unknown error'
+              })
+            }
+          } finally {
+            reportProgress()
           }
         })
-      )
+        mainWindow?.webContents.send('background-check-progress', {
+          completed,
+          total: accounts.length,
+          success,
+          failed
+        })
 
-      // 通知进度
-      mainWindow?.webContents.send('background-check-progress', {
-        completed,
-        total: accounts.length,
-        success,
-        failed
+        console.log(`[BackgroundCheck] Completed: ${success} success, ${failed} failed`)
+        return { success: true, completed, successCount: success, failedCount: failed }
       })
-
-      // 批次间延迟
-      if (i + concurrency < accounts.length) {
-        await new Promise(resolve => setTimeout(resolve, 100))
-      }
     }
-
-    console.log(`[BackgroundCheck] Completed: ${success} success, ${failed} failed`)
-    return { success: true, completed, successCount: success, failedCount: failed }
-  })
+  )
 
   // IPC: 导出到文件
   ipcMain.handle('export-to-file', async (_event, data: string, filename: string) => {
@@ -4250,6 +4287,9 @@ app.whenReady().then(async () => {
 
   // IPC: 验证凭证并获取账号信息（用于添加账号）
   ipcMain.handle('verify-account-credentials', async (_event, credentials: {
+    accountId?: string
+    accessToken?: string
+    expiresIn?: number
     refreshToken: string
     clientId: string
     clientSecret: string
@@ -4259,6 +4299,7 @@ app.whenReady().then(async () => {
   }) => {
     console.log('[IPC] verify-account-credentials called')
     
+    let refreshedCredentials: { accessToken: string; refreshToken: string; expiresAt: number } | undefined
     try {
       const { refreshToken, clientId, clientSecret, region = 'us-east-1', authMethod, provider } = credentials
       // 确定 idp：社交登录使用 provider，IdC 也需要根据 provider 区分 BuilderId 和 Enterprise
@@ -4276,66 +4317,29 @@ app.whenReady().then(async () => {
       
       // Step 1: 使用合适的方式刷新获取 accessToken
       console.log(`[Verify] Step 1: Refreshing token (authMethod: ${authMethod || 'IdC'})...`)
-      const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
+      const refreshResult: OidcRefreshResult = credentials.accessToken && credentials.expiresIn && credentials.expiresIn > 0
+        ? { success: true, accessToken: credentials.accessToken, refreshToken, expiresIn: credentials.expiresIn }
+        : await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
       
       if (!refreshResult.success || !refreshResult.accessToken) {
         return { success: false, error: `Token 刷新失败: ${refreshResult.error}` }
       }
       
+      refreshedCredentials = { accessToken: refreshResult.accessToken, refreshToken: refreshResult.refreshToken || refreshToken, expiresAt: Date.now() + (refreshResult.expiresIn ?? 3600) * 1000 }
+      // 先发布凭证轮换，再查询可失败的账号信息；取消编辑也不能丢失新 Token。
+      if (credentials.accountId) {
+        mainWindow?.webContents.send('kiro-ide-token-changed', {
+          accountId: credentials.accountId, reason: 'credential-verification',
+          expectedRefreshToken: refreshToken,
+          credentials: { accessToken: refreshResult.accessToken,
+            refreshToken: refreshResult.refreshToken || refreshToken,
+            expiresAt: Date.now() + (refreshResult.expiresIn ?? 3600) * 1000 }
+        })
+      }
       console.log('[Verify] Step 2: Getting user info...')
       
-      // Step 2: 调用 GetUserUsageAndLimits 获取用户信息
-      interface Bonus {
-        bonusCode?: string
-        displayName?: string
-        usageLimit?: number
-        usageLimitWithPrecision?: number
-        currentUsage?: number
-        currentUsageWithPrecision?: number
-        status?: string
-        expiresAt?: string  // API 返回的是 expiresAt
-      }
-      
-      interface FreeTrialInfo {
-        usageLimit?: number
-        usageLimitWithPrecision?: number
-        currentUsage?: number
-        currentUsageWithPrecision?: number
-        freeTrialStatus?: string
-        freeTrialExpiry?: string
-      }
-      
-      interface UsageBreakdown {
-        usageLimit?: number
-        usageLimitWithPrecision?: number
-        currentUsage?: number
-        currentUsageWithPrecision?: number
-        resourceType?: string
-        displayName?: string
-        displayNamePlural?: string
-        currency?: string
-        unit?: string
-        overageRate?: number
-        overageCap?: number
-        bonuses?: Bonus[]
-        freeTrialInfo?: FreeTrialInfo
-      }
-      
-      interface UsageResponse {
-        nextDateReset?: string
-        usageBreakdownList?: UsageBreakdown[]
-        subscriptionInfo?: { 
-          subscriptionTitle?: string
-          type?: string
-          subscriptionManagementTarget?: string
-          upgradeCapability?: string
-          overageCapability?: string
-        }
-        overageConfiguration?: { overageEnabled?: boolean; overageStatus?: string }
-        userInfo?: { email?: string; userId?: string }
-      }
-      
-      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, undefined, undefined, region) as UsageResponse
+      // Step 2: 查询已规范化的用量响应。
+      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, undefined, undefined, region) as UnifiedUsageResponse
       
       // 解析用户信息
       const email = usageResult.userInfo?.email || ''
@@ -4469,7 +4473,7 @@ app.whenReady().then(async () => {
       }
     } catch (error) {
       console.error('[Verify] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '验证失败' }
+      return { success: false, error: error instanceof Error ? error.message : '验证失败', refreshedCredentials }
     }
   })
 
@@ -4621,284 +4625,349 @@ app.whenReady().then(async () => {
   //   3. (bug D 修复) refresh 失败时直接报错并拒绝写入文件，避免埋雷
   //   4. (bug F 支持) 通过 refreshedCredentials 把新 refresh 回传 renderer，让反代 store 同步
   //   5. 记录 lastSwitchedAccountId，供 fs.watch 反向同步时用作账号匹配兜底
-  ipcMain.handle('switch-account', async (_event, credentials: {
-    accessToken: string
-    refreshToken: string
-    clientId: string
-    clientSecret: string
-    region?: string
-    startUrl?: string
-    authMethod?: 'IdC' | 'social'
-    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
-    profileArn?: string
-    accountId?: string
-  }) => {
-    try {
-      const {
-        refreshToken,
-        clientId,
-        clientSecret,
-        region = 'us-east-1',
-        startUrl,
-        authMethod = 'IdC',
-        provider = 'BuilderId',
-        profileArn,
-        accountId
-      } = credentials
-      let finalAccessToken = credentials.accessToken
-      let finalRefreshToken = refreshToken
-      let finalExpiresIn = 3600
+  ipcMain.handle(
+    'switch-account',
+    async (
+      _event,
+      credentials: {
+        accessToken: string
+        refreshToken: string
+        clientId: string
+        clientSecret: string
+        region?: string
+        startUrl?: string
+        authMethod?: 'IdC' | 'social'
+        provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
+        profileArn?: string
+        accountId?: string
+      }
+    ) => {
+      return accountWork.run(async () => {
+        const switchGeneration = ++ideSwitchGeneration
+        try {
+          const {
+            refreshToken,
+            clientId,
+            clientSecret,
+            region = 'us-east-1',
+            startUrl,
+            authMethod = 'IdC',
+            provider = 'BuilderId',
+            profileArn,
+            accountId
+          } = credentials
+          let finalAccessToken = credentials.accessToken
+          let finalRefreshToken = refreshToken
+          let finalExpiresIn = 3600
 
-      // 切号前先 refresh，确保磁盘里写的是最新 access + 最新 refresh（rotating）
-      if (refreshToken) {
-        console.log(`[Switch Account] Refreshing token before switch (authMethod: ${authMethod})...`)
-        const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
-        if (refreshResult.success && refreshResult.accessToken) {
-          finalAccessToken = refreshResult.accessToken
-          // bug A 修复：OIDC 返回新 refreshToken 时必须替换；否则下次 IDE/反代 refresh 会撞已作废的 v1
-          finalRefreshToken = refreshResult.refreshToken || refreshToken
-          finalExpiresIn = refreshResult.expiresIn ?? 3600
-          console.log('[Switch Account] Token refreshed successfully (rotated refreshToken updated)')
-        } else {
-          // bug D 修复：refresh 失败不写文件 + 直接报错，避免给 IDE 留下"半坏"token
-          const errMsg = refreshResult.error || 'Unknown refresh error'
-          console.warn(`[Switch Account] Token refresh failed, aborting switch: ${errMsg}`)
-          return {
-            success: false,
-            error: `刷新 Token 失败，未写入 Kiro IDE 磁盘文件，避免下次自动刷新失败导致 IDE 强制登出。原因：${errMsg}`
+          // 切号前先 refresh，确保磁盘里写的是最新 access + 最新 refresh（rotating）
+          if (refreshToken) {
+            console.log(
+              `[Switch Account] Refreshing token before switch (authMethod: ${authMethod})...`
+            )
+            const refreshResult = await refreshTokenByMethod(
+              refreshToken,
+              clientId,
+              clientSecret,
+              region,
+              authMethod
+            )
+            if (refreshResult.success && refreshResult.accessToken) {
+              finalAccessToken = refreshResult.accessToken
+              // bug A 修复：OIDC 返回新 refreshToken 时必须替换；否则下次 IDE/反代 refresh 会撞已作废的 v1
+              finalRefreshToken = refreshResult.refreshToken || refreshToken
+              finalExpiresIn = refreshResult.expiresIn ?? 3600
+              console.log(
+                '[Switch Account] Token refreshed successfully (rotated refreshToken updated)'
+              )
+            } else {
+              // bug D 修复：refresh 失败不写文件 + 直接报错，避免给 IDE 留下"半坏"token
+              const errMsg = refreshResult.error || 'Unknown refresh error'
+              console.warn(`[Switch Account] Token refresh failed, aborting switch: ${errMsg}`)
+              return {
+                success: false,
+                error: `刷新 Token 失败，未写入 Kiro IDE 磁盘文件，避免下次自动刷新失败导致 IDE 强制登出。原因：${errMsg}`
+              }
+            }
           }
-        }
-      }
 
-      // profileArn 决策统一由 helper：Enterprise 用区域化备用 ARN，BuilderId 用占位符
-      const resolvedProfileArn = resolveProfileArnForWrite({
-        profileArn,
-        authMethod,
-        provider,
-        region
+          if (accountId)
+            commitAccountCredentials(
+              accountId,
+              {
+                accessToken: finalAccessToken,
+                refreshToken: finalRefreshToken,
+                expiresAt: Date.now() + finalExpiresIn * 1000
+              },
+              refreshToken
+            )
+
+          if (switchGeneration !== ideSwitchGeneration)
+            return { success: false, error: '切换已被更新的操作替代' }
+
+          // profileArn 决策统一由 helper：Enterprise 用区域化备用 ARN，BuilderId 用占位符
+          const resolvedProfileArn = resolveProfileArnForWrite({
+            profileArn,
+            authMethod,
+            provider,
+            region
+          })
+
+          // bug C 修复：用真实 expiresIn 算 expiresAt
+          const expiresAtIso = new Date(Date.now() + finalExpiresIn * 1000).toISOString()
+
+          const { tokenPath, clientRegPath } = await writeKiroAuthTokenFile({
+            accessToken: finalAccessToken,
+            refreshToken: finalRefreshToken,
+            expiresAtIso,
+            authMethod,
+            provider,
+            region,
+            startUrl,
+            clientId,
+            clientSecret,
+            profileArn: resolvedProfileArn
+          })
+          console.log('[Switch Account] Token written to:', tokenPath)
+          if (clientRegPath) {
+            console.log('[Switch Account] Client registration written to:', clientRegPath)
+          }
+
+          // 记录 lastSwitchedAccountId（供 watcher 反向同步时识别 IDE 当前账号）
+          if (accountId) {
+            lastSwitchedAccountId = accountId
+            // 同步记录 access/refresh 的"信任源头"，避免 watcher 把刚写的同一份数据再回写一次
+            lastWrittenTokenSignature = `${finalAccessToken}|${finalRefreshToken}`
+            // 如启用了主动续期，立刻 schedule 下一次（基于刚写入的 expiresAt）
+            if (proactiveRenewalEnabled) {
+              scheduleProactiveRenewal(accountId, Date.now() + finalExpiresIn * 1000)
+            }
+          }
+
+          return {
+            success: true,
+            // bug F 支持：回传 refresh 后的最新 credentials 让 renderer 更新 store
+            refreshedCredentials: {
+              accessToken: finalAccessToken,
+              refreshToken: finalRefreshToken,
+              expiresIn: finalExpiresIn
+            }
+          }
+        } catch (error) {
+          console.error('[Switch Account] Error:', error)
+          return { success: false, error: error instanceof Error ? error.message : '切换失败' }
+        }
       })
-
-      // bug C 修复：用真实 expiresIn 算 expiresAt
-      const expiresAtIso = new Date(Date.now() + finalExpiresIn * 1000).toISOString()
-
-      const { tokenPath, clientRegPath } = await writeKiroAuthTokenFile({
-        accessToken: finalAccessToken,
-        refreshToken: finalRefreshToken,
-        expiresAtIso,
-        authMethod,
-        provider,
-        region,
-        startUrl,
-        clientId,
-        clientSecret,
-        profileArn: resolvedProfileArn
-      })
-      console.log('[Switch Account] Token written to:', tokenPath)
-      if (clientRegPath) {
-        console.log('[Switch Account] Client registration written to:', clientRegPath)
-      }
-
-      // 记录 lastSwitchedAccountId（供 watcher 反向同步时识别 IDE 当前账号）
-      if (accountId) {
-        lastSwitchedAccountId = accountId
-        // 同步记录 access/refresh 的"信任源头"，避免 watcher 把刚写的同一份数据再回写一次
-        lastWrittenTokenSignature = `${finalAccessToken}|${finalRefreshToken}`
-        // 如启用了主动续期，立刻 schedule 下一次（基于刚写入的 expiresAt）
-        if (proactiveRenewalEnabled) {
-          scheduleProactiveRenewal(accountId, Date.now() + finalExpiresIn * 1000)
-        }
-      }
-
-      return {
-        success: true,
-        // bug F 支持：回传 refresh 后的最新 credentials 让 renderer 更新 store
-        refreshedCredentials: {
-          accessToken: finalAccessToken,
-          refreshToken: finalRefreshToken,
-          expiresIn: finalExpiresIn
-        }
-      }
-    } catch (error) {
-      console.error('[Switch Account] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '切换失败' }
     }
-  })
+  )
 
   // IPC: 切换账号到 Kiro CLI - 写入凭证到 SQLite 数据库
   // kiro-cli 使用 ~/.local/share/kiro-cli/data.sqlite3 中的 auth_kv 表
-  ipcMain.handle('switch-account-cli', async (_event, credentials: {
-    accessToken: string
-    refreshToken: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    profileArn?: string
-    provider?: string
-    scopes?: string[]
-  }) => {
-    const os = await import('os')
-    const path = await import('path')
-    const { mkdir } = await import('fs/promises')
-
-    try {
-      const {
-        refreshToken,
-        clientId,
-        clientSecret,
-        region = 'us-east-1',
-        profileArn,
-        provider,
-        scopes
-      } = credentials
-      let { accessToken } = credentials
-
-      // 切号前先刷新 token（和 IDE 切号一致）
-      if (refreshToken) {
-        const authMethod = (provider === 'Google' || provider === 'Github') ? 'social' : undefined
-        console.log(`[Switch CLI] Refreshing token before switch (provider: ${provider})...`)
-        const refreshResult = await refreshTokenByMethod(refreshToken, clientId || '', clientSecret || '', region, authMethod)
-        if (refreshResult.success && refreshResult.accessToken) {
-          accessToken = refreshResult.accessToken
-          console.log('[Switch CLI] Token refreshed successfully')
-        } else {
-          console.warn(`[Switch CLI] Token refresh failed: ${refreshResult.error}, using existing token`)
-        }
+  ipcMain.handle(
+    'switch-account-cli',
+    async (
+      _event,
+      credentials: {
+        accessToken: string
+        refreshToken: string
+        clientId?: string
+        clientSecret?: string
+        region?: string
+        profileArn?: string
+        provider?: string
+        scopes?: string[]
+        skipRefresh?: boolean
+        expiresAt?: number
+        accountId?: string
       }
+    ) => {
+      return accountWork.run(async () => {
+        const os = await import('os')
+        const path = await import('path')
+        const { mkdir } = await import('fs/promises')
 
-      // kiro-cli SQLite 数据库路径
-      // Windows: %LOCALAPPDATA%\kiro-cli\data.sqlite3
-      // macOS/Linux: ~/.local/share/kiro-cli/data.sqlite3
-      const dataDir = process.platform === 'win32'
-        ? path.join(os.homedir(), 'AppData', 'Local', 'kiro-cli')
-        : path.join(os.homedir(), '.local', 'share', 'kiro-cli')
-      await mkdir(dataDir, { recursive: true })
-      const dbPath = path.join(dataDir, 'data.sqlite3')
-
-      // 判断 token key：social 登录用 social:token，IdC 登录用 odic:token
-      const isSocial = provider === 'Google' || provider === 'Github'
-      const preferredTokenKey = isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
-      const preferredRegKey = 'kirocli:odic:device-registration'
-
-      // profileArn 决策统一由 helper：BuilderId 不带 profileArn
-      // kiro-cli 同样不应该在 SQLite 里塞占位符 ARN（实测会触发 REST 端点 403）
-      const resolvedProfileArn = resolveProfileArnForWrite({
-        profileArn,
-        authMethod: isSocial ? 'social' : 'IdC',
-        provider,
-        region
-      })
-
-      // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
-      const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString()
-      const tokenData: Record<string, unknown> = {
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        expires_at: expiresAt,
-        region
-      }
-      // profileArn 仅在解析出有效值时附加，BuilderId 等不带（避免 kiro-cli 拿占位符 ARN 调 REST 触发 403）
-      if (resolvedProfileArn) {
-        tokenData.profile_arn = resolvedProfileArn
-      }
-      if (scopes) tokenData.scopes = scopes
-
-      // 使用 sqlite3 命令行操作（跨平台兼容，无需原生模块编译）
-      const { execFileSync } = await import('child_process')
-      const sqlite3Bin = process.platform === 'win32' ? 'sqlite3.exe' : 'sqlite3'
-
-      // 构建 SQL 语句
-      const sqlStatements: string[] = [
-        'CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);',
-        `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredTokenKey}', '${JSON.stringify(tokenData).replace(/'/g, "''")}');`
-      ]
-
-      // 写入 device-registration（仅 IdC 登录）
-      if (clientId && clientSecret && !isSocial) {
-        const regData = { client_id: clientId, client_secret: clientSecret, region }
-        sqlStatements.push(
-          `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredRegKey}', '${JSON.stringify(regData).replace(/'/g, "''")}');`
-        )
-      }
-
-      // 清除其他优先级的旧 key
-      const cliTokenKeys = ['kirocli:social:token', 'kirocli:odic:token', 'codewhisperer:odic:token']
-      for (const key of cliTokenKeys) {
-        if (key !== preferredTokenKey) {
-          sqlStatements.push(`DELETE FROM auth_kv WHERE key = '${key}';`)
-        }
-      }
-
-      try {
-        execFileSync(sqlite3Bin, [dbPath], {
-          input: sqlStatements.join('\n'),
-          timeout: 10000,
-          encoding: 'utf-8'
-        })
-      } catch (sqlite3Error) {
-        // sqlite3 命令不存在，尝试用 Node.js 22+ 的内置 SQLite
-        console.log('[Switch CLI] sqlite3 command not available, trying Node.js built-in SQLite...')
+        let refreshedCredentials:
+          | { accessToken: string; refreshToken: string; expiresIn: number }
+          | undefined
         try {
-          const { DatabaseSync } = await import('node:sqlite') as { DatabaseSync: new (path: string) => { exec: (sql: string) => void; close: () => void } }
-          const db = new DatabaseSync(dbPath)
-          try {
-            for (const sql of sqlStatements) {
-              db.exec(sql)
-            }
-          } finally {
-            db.close()
-          }
-        } catch {
-          throw new Error(`SQLite 操作失败: sqlite3 命令不可用 (${(sqlite3Error as Error).message})，且 Node.js 内置 SQLite 不支持。请确保系统安装了 sqlite3 命令行工具。`)
-        }
-      }
+          const {
+            refreshToken,
+            clientId,
+            clientSecret,
+            region = 'us-east-1',
+            profileArn,
+            provider,
+            scopes
+          } = credentials
+          let { accessToken } = credentials
+          let finalRefreshToken = refreshToken
+          let expiresIn = Math.max(
+            1,
+            ((credentials.expiresAt || Date.now() + 3600000) - Date.now()) / 1000
+          )
 
-      console.log(`[Switch CLI] Token saved to SQLite key: ${preferredTokenKey}`)
-      console.log(`[Switch CLI] Account switched successfully in ${dbPath}`)
-      return { success: true, dbPath }
-    } catch (error) {
-      console.error('[Switch CLI] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'CLI 切换失败' }
+          // 切号前先刷新 token（和 IDE 切号一致）
+          if (
+            refreshToken &&
+            !(credentials.skipRefresh && credentials.expiresAt && credentials.expiresAt > Date.now())
+          ) {
+            const authMethod = provider === 'Google' || provider === 'Github' ? 'social' : undefined
+            console.log(`[Switch CLI] Refreshing token before switch (provider: ${provider})...`)
+            const refreshResult = await refreshTokenByMethod(
+              refreshToken,
+              clientId || '',
+              clientSecret || '',
+              region,
+              authMethod
+            )
+            if (refreshResult.success && refreshResult.accessToken) {
+              accessToken = refreshResult.accessToken
+              finalRefreshToken = refreshResult.refreshToken || refreshToken
+              expiresIn = refreshResult.expiresIn ?? 3600
+              console.log('[Switch CLI] Token refreshed successfully')
+            } else {
+              return { success: false, error: refreshResult.error || 'CLI Token 刷新失败' }
+            }
+          }
+
+          refreshedCredentials = { accessToken, refreshToken: finalRefreshToken, expiresIn }
+          if (credentials.accountId)
+            commitAccountCredentials(
+              credentials.accountId,
+              {
+                accessToken,
+                refreshToken: finalRefreshToken,
+                expiresAt: Date.now() + expiresIn * 1000
+              },
+              refreshToken
+            )
+
+          // kiro-cli SQLite 数据库路径
+          // Windows: %LOCALAPPDATA%\kiro-cli\data.sqlite3
+          // macOS/Linux: ~/.local/share/kiro-cli/data.sqlite3
+          const dataDir =
+            process.platform === 'win32'
+              ? path.join(os.homedir(), 'AppData', 'Local', 'kiro-cli')
+              : path.join(os.homedir(), '.local', 'share', 'kiro-cli')
+          await mkdir(dataDir, { recursive: true })
+          const dbPath = path.join(dataDir, 'data.sqlite3')
+
+          // 判断 token key：social 登录用 social:token，IdC 登录用 odic:token
+          const isSocial = provider === 'Google' || provider === 'Github'
+          const preferredTokenKey = isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
+          const preferredRegKey = 'kirocli:odic:device-registration'
+
+          // profileArn 决策统一由 helper：BuilderId 不带 profileArn
+          // kiro-cli 同样不应该在 SQLite 里塞占位符 ARN（实测会触发 REST 端点 403）
+          const resolvedProfileArn = resolveProfileArnForWrite({
+            profileArn,
+            authMethod: isSocial ? 'social' : 'IdC',
+            provider,
+            region
+          })
+
+          // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
+          const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString()
+          const tokenData: Record<string, unknown> = {
+            access_token: accessToken,
+            refresh_token: finalRefreshToken,
+            expires_at: expiresAt,
+            region
+          }
+          // profileArn 仅在解析出有效值时附加，BuilderId 等不带（避免 kiro-cli 拿占位符 ARN 调 REST 触发 403）
+          if (resolvedProfileArn) {
+            tokenData.profile_arn = resolvedProfileArn
+          }
+          if (scopes) tokenData.scopes = scopes
+
+          // 构建 SQL 语句
+          const sqlStatements: string[] = [
+            'CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);',
+            `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredTokenKey}', '${JSON.stringify(tokenData).replace(/'/g, "''")}');`
+          ]
+
+          // 写入 device-registration（仅 IdC 登录）
+          if (clientId && clientSecret && !isSocial) {
+            const regData = { client_id: clientId, client_secret: clientSecret, region }
+            sqlStatements.push(
+              `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredRegKey}', '${JSON.stringify(regData).replace(/'/g, "''")}');`
+            )
+          }
+
+          // 清除其他优先级的旧 key
+          const cliTokenKeys = [
+            'kirocli:social:token',
+            'kirocli:odic:token',
+            'codewhisperer:odic:token'
+          ]
+          for (const key of cliTokenKeys) {
+            if (key !== preferredTokenKey) {
+              sqlStatements.push(`DELETE FROM auth_kv WHERE key = '${key}';`)
+            }
+          }
+
+          await writeCliCredentials(dbPath, sqlStatements)
+
+          console.log(`[Switch CLI] Token saved to SQLite key: ${preferredTokenKey}`)
+          console.log(`[Switch CLI] Account switched successfully in ${dbPath}`)
+          return {
+            success: true,
+            dbPath,
+            refreshedCredentials: { accessToken, refreshToken: finalRefreshToken, expiresIn }
+          }
+        } catch (error) {
+          console.error('[Switch CLI] Error:', error)
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : 'CLI 切换失败',
+            refreshedCredentials
+          }
+        }
+      })
     }
-  })
+  )
 
 
   // IPC: 退出登录 - 清除本地 SSO 缓存
   ipcMain.handle('logout-account', async () => {
-    const os = await import('os')
-    const path = await import('path')
-    const { readdir, unlink } = await import('fs/promises')
+    return accountWork.run(async () => {
+      const os = await import('os')
+      const path = await import('path')
+      const { readdir, unlink } = await import('fs/promises')
 
-    // 立刻清掉主动续期 timer 和"激活账号"记忆，避免 watcher / timer 误同步
-    clearProactiveRenewal('logout-account')
-    lastSwitchedAccountId = null
-    lastWrittenTokenSignature = null
+      // 立刻清掉主动续期 timer 和"激活账号"记忆，避免 watcher / timer 误同步
+      clearProactiveRenewal('logout-account')
+      lastSwitchedAccountId = null
+      lastWrittenTokenSignature = null
 
-    try {
-      const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
-      console.log('[Logout] Clearing SSO cache:', ssoCache)
-      
-      // 读取目录下所有文件
-      const files = await readdir(ssoCache).catch(() => [])
-      
-      // 删除所有文件
-      for (const file of files) {
-        const filePath = path.join(ssoCache, file)
-        await unlink(filePath).catch((e) => {
-          console.warn('[Logout] Failed to delete file:', filePath, e)
-        })
+      try {
+        const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
+        console.log('[Logout] Clearing SSO cache:', ssoCache)
+
+        // 读取目录下所有文件
+        const files = await readdir(ssoCache).catch(() => [])
+
+        // 删除所有文件
+        for (const file of files) {
+          const filePath = path.join(ssoCache, file)
+          await unlink(filePath).catch((e) => {
+            console.warn('[Logout] Failed to delete file:', filePath, e)
+          })
+        }
+
+        console.log('[Logout] SSO cache cleared, deleted', files.length, 'files')
+        return { success: true, deletedCount: files.length }
+      } catch (error) {
+        console.error('[Logout] Error:', error)
+        return { success: false, error: error instanceof Error ? error.message : '退出失败' }
       }
-      
-      console.log('[Logout] SSO cache cleared, deleted', files.length, 'files')
-      return { success: true, deletedCount: files.length }
-    } catch (error) {
-      console.error('[Logout] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '退出失败' }
-    }
+    })
   })
 
   // ============ 手动登录相关 IPC ============
 
   // 存储当前登录状态
+  let loginGeneration = 0
   let currentLoginState: {
     type: 'builderid' | 'social' | 'iamsso'
     // BuilderId / IAM SSO 相关
@@ -4921,6 +4990,8 @@ app.whenReady().then(async () => {
 
   // IPC: 启动 Builder ID 手动登录
   ipcMain.handle('start-builder-id-login', async (_event, region: string = 'us-east-1') => {
+    const generation = ++loginGeneration
+    currentLoginState = null
     console.log('[Login] Starting Builder ID login...')
     
     const oidcBase = `https://oidc.${region}.amazonaws.com`
@@ -4976,6 +5047,7 @@ app.whenReady().then(async () => {
       console.log('[Login] Device code obtained, user_code:', userCode)
 
       // 保存登录状态
+      if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
       currentLoginState = {
         type: 'builderid',
         clientId,
@@ -5002,6 +5074,7 @@ app.whenReady().then(async () => {
 
   // IPC: 轮询 Builder ID 授权状态
   ipcMain.handle('poll-builder-id-auth', async (_event, region: string = 'us-east-1') => {
+    const generation = loginGeneration
     console.log('[Login] Polling for authorization...')
 
     if (!currentLoginState || currentLoginState.type !== 'builderid') {
@@ -5028,8 +5101,10 @@ app.whenReady().then(async () => {
         })
       })
 
+      if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
       if (tokenRes.status === 200) {
         const tokenData = await tokenRes.json()
+        if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
         console.log('[Login] Authorization successful!')
         
         const result = {
@@ -5077,6 +5152,7 @@ app.whenReady().then(async () => {
 
   // IPC: 取消 Builder ID 登录
   ipcMain.handle('cancel-builder-id-login', async () => {
+    loginGeneration++
     console.log('[Login] Cancelling Builder ID login...')
     currentLoginState = null
     return { success: true }
@@ -5098,6 +5174,8 @@ app.whenReady().then(async () => {
 
   // IPC: 启动 IAM Identity Center SSO 登录 (使用 Authorization Code Grant with PKCE)
   ipcMain.handle('start-iam-sso-login', async (_event, startUrl: string, region: string = 'us-east-1') => {
+    const generation = ++loginGeneration
+    currentLoginState = null
     console.log('[Login] Starting IAM Identity Center SSO login (Authorization Code flow)...')
     console.log('[Login] Start URL:', startUrl)
     
@@ -5188,7 +5266,9 @@ app.whenReady().then(async () => {
       iamSsoResult = null
 
       // 创建回调服务器
+      if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
       iamSsoServer = http.createServer(async (req, res) => {
+        if (generation !== loginGeneration) { res.writeHead(409); res.end('Cancelled'); return }
         const url = new URL(req.url || '', `http://127.0.0.1:${port}`)
         
         if (url.pathname === '/oauth/callback') {
@@ -5235,6 +5315,7 @@ app.whenReady().then(async () => {
                 iamSsoResult = { completed: true, success: false, error: `获取 Token 失败: ${errText}` }
               } else {
                 const tokenData = await tokenRes.json()
+              if (generation !== loginGeneration) return
                 console.log('[Login] IAM SSO Authorization successful!')
                 iamSsoResult = {
                   completed: true,
@@ -5248,6 +5329,7 @@ app.whenReady().then(async () => {
                 }
               }
             } catch (tokenError) {
+              if (generation !== loginGeneration) return
               console.error('[Login] Token exchange error:', tokenError)
               iamSsoResult = { 
                 completed: true, 
@@ -5284,6 +5366,7 @@ app.whenReady().then(async () => {
       console.log('[Login] Opening browser for authorization...')
 
       // 保存登录状态
+      if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
       currentLoginState = {
         type: 'iamsso',
         clientId,
@@ -5344,6 +5427,7 @@ app.whenReady().then(async () => {
 
   // IPC: 取消 IAM SSO 登录
   ipcMain.handle('cancel-iam-sso-login', async () => {
+    loginGeneration++
     console.log('[Login] Cancelling IAM SSO login...')
     if (iamSsoServer) {
       iamSsoServer.close()
@@ -5356,6 +5440,8 @@ app.whenReady().then(async () => {
 
   // IPC: 启动 Social Auth 登录 (Google/GitHub)
   ipcMain.handle('start-social-login', async (_event, provider: 'Google' | 'Github', usePrivateMode?: boolean) => {
+    const generation = ++loginGeneration
+    currentLoginState = null
     console.log(`[Login] Starting ${provider} Social Auth login... (privateMode: ${usePrivateMode})`)
     
     const crypto = await import('crypto')
@@ -5375,6 +5461,7 @@ app.whenReady().then(async () => {
     loginUrl.searchParams.set('state', oauthState)
 
     // 保存登录状态
+    if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
     currentLoginState = {
       type: 'social',
       codeVerifier,
@@ -5388,7 +5475,7 @@ app.whenReady().then(async () => {
 
     // 根据是否使用隐私模式选择打开方式
     if (usePrivateMode) {
-      openBrowserInPrivateMode(urlStr)
+      await openBrowserInPrivateMode(urlStr)
     } else {
       shell.openExternal(urlStr)
     }
@@ -5402,6 +5489,7 @@ app.whenReady().then(async () => {
 
   // IPC: 交换 Social Auth token
   ipcMain.handle('exchange-social-token', async (_event, code: string, state: string) => {
+    const generation = loginGeneration
     console.log('[Login] Exchanging Social Auth token...')
 
     if (!currentLoginState || currentLoginState.type !== 'social') {
@@ -5428,6 +5516,7 @@ app.whenReady().then(async () => {
         })
       })
 
+      if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
       if (!tokenRes.ok) {
         const errText = await tokenRes.text()
         currentLoginState = null
@@ -5435,6 +5524,7 @@ app.whenReady().then(async () => {
       }
 
       const tokenData = await tokenRes.json()
+      if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
       console.log('[Login] Token exchange successful!')
 
       const result = {
@@ -5450,6 +5540,7 @@ app.whenReady().then(async () => {
       currentLoginState = null
       return result
     } catch (error) {
+      if (generation !== loginGeneration) return { success: false, error: '登录已取消' }
       console.error('[Login] Token exchange error:', error)
       currentLoginState = null
       return { success: false, error: error instanceof Error ? error.message : 'Token 交换失败' }
@@ -5458,6 +5549,7 @@ app.whenReady().then(async () => {
 
   // IPC: 取消 Social Auth 登录
   ipcMain.handle('cancel-social-login', async () => {
+    loginGeneration++
     console.log('[Login] Cancelling Social Auth login...')
     currentLoginState = null
     return { success: true }
@@ -5490,400 +5582,6 @@ app.whenReady().then(async () => {
   // ============ Kiro 设置管理 IPC ============
 
   // IPC: 获取 Kiro 设置
-  ipcMain.handle('get-kiro-settings', async () => {
-    try {
-      const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      
-      const homeDir = os.homedir()
-      const kiroSettingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
-      const kiroSteeringPath = path.join(homeDir, '.kiro', 'steering')
-      const kiroMcpUserPath = path.join(homeDir, '.kiro', 'settings', 'mcp.json')
-      
-      let settings = {}
-      let mcpConfig = { mcpServers: {} }
-      let steeringFiles: string[] = []
-      
-      // 读取 Kiro settings.json (VS Code 风格 JSON，可能有尾随逗号)
-      if (fs.existsSync(kiroSettingsPath)) {
-        const content = fs.readFileSync(kiroSettingsPath, 'utf-8')
-        // 移除尾随逗号和注释以兼容标准 JSON
-        const cleanedContent = content
-          .replace(/\/\/.*$/gm, '') // 移除单行注释
-          .replace(/\/\*[\s\S]*?\*\//g, '') // 移除多行注释
-          .replace(/,(\s*[}\]])/g, '$1') // 移除尾随逗号
-        const parsed = JSON.parse(cleanedContent)
-        settings = {
-          modelSelection: parsed['kiroAgent.modelSelection'],
-          agentAutonomy: parsed['kiroAgent.agentAutonomy'],
-          enableDebugLogs: parsed['kiroAgent.enableDebugLogs'],
-          enableTabAutocomplete: parsed['kiroAgent.enableTabAutocomplete'],
-          enableCodebaseIndexing: parsed['kiroAgent.enableCodebaseIndexing'],
-          usageSummary: parsed['kiroAgent.usageSummary'],
-          codeReferences: parsed['kiroAgent.codeReferences.referenceTracker'],
-          configureMCP: parsed['kiroAgent.configureMCP'],
-          trustedCommands: parsed['kiroAgent.trustedCommands'] || [],
-          trustedTools: parsed['kiroAgent.trustedTools'] || {},
-          commandDenylist: parsed['kiroAgent.commandDenylist'] || [],
-          ignoreFiles: parsed['kiroAgent.ignoreFiles'] || [],
-          mcpApprovedEnvVars: parsed['kiroAgent.mcpApprovedEnvVars'] || [],
-          notificationsActionRequired: parsed['kiroAgent.notifications.agent.actionRequired'],
-          notificationsFailure: parsed['kiroAgent.notifications.agent.failure'],
-          notificationsSuccess: parsed['kiroAgent.notifications.agent.success'],
-          notificationsBilling: parsed['kiroAgent.notifications.billing']
-        }
-      }
-      
-      // 读取 MCP 配置
-      if (fs.existsSync(kiroMcpUserPath)) {
-        const mcpContent = fs.readFileSync(kiroMcpUserPath, 'utf-8')
-        mcpConfig = JSON.parse(mcpContent)
-      }
-      
-      // 读取 Steering 文件列表
-      if (fs.existsSync(kiroSteeringPath)) {
-        const files = fs.readdirSync(kiroSteeringPath)
-        steeringFiles = files.filter(f => f.endsWith('.md'))
-        console.log('[KiroSettings] Steering path:', kiroSteeringPath)
-        console.log('[KiroSettings] Found steering files:', steeringFiles)
-      } else {
-        console.log('[KiroSettings] Steering path does not exist:', kiroSteeringPath)
-      }
-      
-      return { settings, mcpConfig, steeringFiles }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to get settings:', error)
-      return { error: error instanceof Error ? error.message : 'Failed to get settings' }
-    }
-  })
-
-  // IPC: 获取 Kiro 可用模型列表（使用当前账号调用官方 API）
-  ipcMain.handle('get-kiro-available-models', async () => {
-    try {
-      if (!store) return { models: [] }
-      const accountData = store.get('accountData') as { accounts?: Record<string, any> } | undefined
-      if (!accountData?.accounts) return { models: [] }
-
-      // 优先使用当前激活账号（isActive），其次使用第一个 active 且有 accessToken 的账号
-      const allAccounts = Object.values(accountData.accounts) as any[]
-      const account = allAccounts.find((acc: any) => acc.isActive && acc.credentials?.accessToken)
-        || allAccounts.find((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
-      if (!account) return { models: [] }
-
-      const proxyAccount = {
-        id: account.id,
-        email: account.email,
-        accessToken: account.credentials.accessToken,
-        refreshToken: account.credentials?.refreshToken,
-        profileArn: account.profileArn,
-        expiresAt: account.credentials?.expiresAt,
-        clientId: account.credentials?.clientId,
-        clientSecret: account.credentials?.clientSecret,
-        region: account.credentials?.region || 'us-east-1',
-        authMethod: account.credentials?.authMethod
-      }
-
-      const models = await fetchKiroModels(proxyAccount)
-      return {
-        models: models.map(m => ({
-          id: m.modelId,
-          name: m.modelName,
-          description: m.description
-        }))
-      }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to fetch models:', error)
-      return { models: [], error: error instanceof Error ? error.message : 'Failed to fetch models' }
-    }
-  })
-
-  // IPC: 保存 Kiro 设置
-  ipcMain.handle('save-kiro-settings', async (_event, settings: Record<string, unknown>) => {
-    try {
-      const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      
-      const homeDir = os.homedir()
-      const kiroSettingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
-      
-      let existingSettings = {}
-      if (fs.existsSync(kiroSettingsPath)) {
-        const content = fs.readFileSync(kiroSettingsPath, 'utf-8')
-        // 移除尾随逗号和注释以兼容标准 JSON
-        const cleanedContent = content
-          .replace(/\/\/.*$/gm, '') // 移除单行注释
-          .replace(/\/\*[\s\S]*?\*\//g, '') // 移除多行注释
-          .replace(/,(\s*[}\]])/g, '$1') // 移除尾随逗号
-        existingSettings = JSON.parse(cleanedContent)
-      }
-      
-      // 映射设置到 Kiro 的格式
-      const kiroSettings = {
-        ...existingSettings,
-        'kiroAgent.modelSelection': settings.modelSelection,
-        'kiroAgent.agentAutonomy': settings.agentAutonomy,
-        'kiroAgent.enableDebugLogs': settings.enableDebugLogs,
-        'kiroAgent.enableTabAutocomplete': settings.enableTabAutocomplete,
-        'kiroAgent.enableCodebaseIndexing': settings.enableCodebaseIndexing,
-        'kiroAgent.usageSummary': settings.usageSummary,
-        'kiroAgent.codeReferences.referenceTracker': settings.codeReferences,
-        'kiroAgent.configureMCP': settings.configureMCP,
-        'kiroAgent.trustedCommands': settings.trustedCommands,
-        'kiroAgent.trustedTools': settings.trustedTools,
-        'kiroAgent.commandDenylist': settings.commandDenylist,
-        'kiroAgent.ignoreFiles': settings.ignoreFiles,
-        'kiroAgent.mcpApprovedEnvVars': settings.mcpApprovedEnvVars,
-        'kiroAgent.notifications.agent.actionRequired': settings.notificationsActionRequired,
-        'kiroAgent.notifications.agent.failure': settings.notificationsFailure,
-        'kiroAgent.notifications.agent.success': settings.notificationsSuccess,
-        'kiroAgent.notifications.billing': settings.notificationsBilling
-      }
-      
-      // 确保目录存在
-      const dir = path.dirname(kiroSettingsPath)
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true })
-      }
-      
-      fs.writeFileSync(kiroSettingsPath, JSON.stringify(kiroSettings, null, 4))
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to save settings:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to save settings' }
-    }
-  })
-
-  // IPC: 打开 Kiro MCP 配置文件
-  ipcMain.handle('open-kiro-mcp-config', async (_event, type: 'user' | 'workspace') => {
-    try {
-      const os = await import('os')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      
-      let configPath: string
-      if (type === 'user') {
-        configPath = path.join(homeDir, '.kiro', 'settings', 'mcp.json')
-      } else {
-        // 工作区配置，打开当前工作区的 .kiro/settings/mcp.json
-        configPath = path.join(process.cwd(), '.kiro', 'settings', 'mcp.json')
-      }
-      
-      // 如果文件不存在，创建空配置
-      const fs = await import('fs')
-      if (!fs.existsSync(configPath)) {
-        const dir = path.dirname(configPath)
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true })
-        }
-        fs.writeFileSync(configPath, JSON.stringify({ mcpServers: {} }, null, 2))
-      }
-      
-      shell.openPath(configPath)
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to open MCP config:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open MCP config' }
-    }
-  })
-
-  // IPC: 打开 Kiro Steering 目录
-  ipcMain.handle('open-kiro-steering-folder', async () => {
-    try {
-      const os = await import('os')
-      const path = await import('path')
-      const fs = await import('fs')
-      const homeDir = os.homedir()
-      const steeringPath = path.join(homeDir, '.kiro', 'steering')
-      
-      // 如果目录不存在，创建它
-      if (!fs.existsSync(steeringPath)) {
-        fs.mkdirSync(steeringPath, { recursive: true })
-      }
-      
-      shell.openPath(steeringPath)
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to open steering folder:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open steering folder' }
-    }
-  })
-
-  // IPC: 打开 Kiro settings.json 文件
-  ipcMain.handle('open-kiro-settings-file', async () => {
-    try {
-      const os = await import('os')
-      const path = await import('path')
-      const fs = await import('fs')
-      const homeDir = os.homedir()
-      const settingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
-      
-      // 如果文件不存在，创建默认配置
-      if (!fs.existsSync(settingsPath)) {
-        const dir = path.dirname(settingsPath)
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true })
-        }
-        const defaultSettings = {
-          'workbench.colorTheme': 'Kiro Light',
-          'kiroAgent.modelSelection': 'claude-haiku-4.5'
-        }
-        fs.writeFileSync(settingsPath, JSON.stringify(defaultSettings, null, 4))
-      }
-      
-      shell.openPath(settingsPath)
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to open settings file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open settings file' }
-    }
-  })
-
-  // IPC: 打开指定的 Steering 文件
-  ipcMain.handle('open-kiro-steering-file', async (_event, filename: string) => {
-    try {
-      const os = await import('os')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
-      
-      shell.openPath(filePath)
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to open steering file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open steering file' }
-    }
-  })
-
-  // IPC: 创建默认的 rules.md 文件
-  ipcMain.handle('create-kiro-default-rules', async () => {
-    try {
-      const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const steeringPath = path.join(homeDir, '.kiro', 'steering')
-      const rulesPath = path.join(steeringPath, 'rules.md')
-      
-      // 确保目录存在
-      if (!fs.existsSync(steeringPath)) {
-        fs.mkdirSync(steeringPath, { recursive: true })
-      }
-      
-      // 默认规则内容
-      const defaultContent = `# Role: 高级软件开发助手
-一、系统为Windows10
-二、调式文件、测试脚本、test相关文件都放在test文件夹里面，md文件放在docs文件夹里面
-# 核心原则
-
-
-## 1. 沟通与协作
-- **诚实优先**：在任何情况下都严禁猜测或伪装。当需求不明确、存在技术风险或遇到知识盲区时，必须停止工作，并立即向用户澄清。
-- **技术攻坚**：面对技术难题时，首要目标是寻找并提出高质量的解决方案。只有在所有可行方案均被评估后，才能与用户探讨降级或替换方案。
-- **批判性思维**：在执行任务时，如果发现当前需求存在技术限制、潜在风险或有更优的实现路径，必须主动向用户提出你的见解和改进建议。
-- **语言要求**：思考和回答时总是使用中文进行回复。
-
-
-## 2. 架构设计
-- **模块化设计**：所有设计都必须遵循功能解耦、职责单一的原则。严格遵守SOLID和DRY原则。
-- **前瞻性思维**：在设计时必须考虑未来的可扩展性和可维护性，确保解决方案能够融入项目的整体架构。
-- **技术债务优先**：在进行重构或优化时，优先处理对系统稳定性和可维护性影响最大的技术债务和基础架构问题。
-
-
-## 3. 代码与交付物质量标准
-### 编写规范
-- **架构视角**：始终从整体项目架构出发编写代码，确保代码片段能够无缝集成，而不是孤立的功能。
-- **零技术债务**：严禁创建任何形式的技术债务，包括但不限于：临时文件、硬编码值、职责不清的模块或函数。
-- **问题暴露**：禁止添加任何用于掩盖或绕过错误的fallback机制。代码应设计为快速失败（Fail-Fast），确保问题在第一时间被发现。
-
-
-### 质量要求
-- **可读性**：使用清晰、有意义的变量名和函数名。代码逻辑必须清晰易懂，并辅以必要的注释。
-- **规范遵循**：严格遵循目标编程语言的社区最佳实践和官方编码规范。
-- **健壮性**：必须包含充分的错误处理逻辑和边界条件检查。
-- **性能意识**：在保证代码质量和可读性的前提下，对性能敏感部分进行合理优化，避免不必要的计算复杂度和资源消耗。
-
-
-### 交付物规范
-- **无文档**：除非用户明确要求，否则不要创建任何Markdown文档或其他形式的说明文档。
-- **无测试**：除非用户明确要求，否则不要编写单元测试或集成测试代码。
-- **无编译/运行**：禁止编译或执行任何代码。你的任务是生成高质量的代码和设计方案。
-
-
-# 注意事项
-- 除非特别说明否则不要创建新的文档、不要测试、不要编译、不要运行、不需要总结，除非用户主动要求
-
-
-- 需求不明确时使向用户询问澄清，提供预定义选项
-- 在有多个方案的时候，需要向用户询问，而不是自作主张
-- 在有方案/策略需要更新时，需要向用户询问，而不是自作主张
-
-
-- ACE为augmentContextEngine工具的缩写
-- 如果要求查看文档请使用 Context7 MCP
-- 如果需要进行WEB前端页面测试请使用 Playwright MCP
-- 如果用户回复'继续' 则请按照最佳实践继续完成任务
-`
-      
-      fs.writeFileSync(rulesPath, defaultContent, 'utf-8')
-      console.log('[KiroSettings] Created default rules.md at:', rulesPath)
-      
-      // 打开文件
-      shell.openPath(rulesPath)
-      
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to create default rules:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to create default rules' }
-    }
-  })
-
-  // IPC: 读取 Steering 文件内容
-  ipcMain.handle('read-kiro-steering-file', async (_event, filename: string) => {
-    try {
-      const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
-      
-      if (!fs.existsSync(filePath)) {
-        return { success: false, error: '文件不存在' }
-      }
-      
-      const content = fs.readFileSync(filePath, 'utf-8')
-      return { success: true, content }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to read steering file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to read file' }
-    }
-  })
-
-  // IPC: 保存 Steering 文件内容
-  ipcMain.handle('save-kiro-steering-file', async (_event, filename: string, content: string) => {
-    try {
-      const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const steeringPath = path.join(homeDir, '.kiro', 'steering')
-      const filePath = path.join(steeringPath, filename)
-      
-      // 确保目录存在
-      if (!fs.existsSync(steeringPath)) {
-        fs.mkdirSync(steeringPath, { recursive: true })
-      }
-      
-      fs.writeFileSync(filePath, content, 'utf-8')
-      console.log('[KiroSettings] Saved steering file:', filePath)
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to save steering file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to save file' }
-    }
-  })
-
   // ============ Kiro API 反代服务器 IPC ============
 
   // IPC: 启动反代服务器
@@ -5929,7 +5627,8 @@ app.whenReady().then(async () => {
       running: proxyServer.isRunning(),
       config: proxyServer.getConfig(),
       stats: proxyServer.getStats(),
-      sessionStats: proxyServer.getSessionStats()
+      sessionStats: proxyServer.getSessionStats(),
+      pool: { total: proxyServer.getAccountPool().size, available: proxyServer.getAccountPool().availableCount }
     }
   })
 
@@ -5977,6 +5676,10 @@ app.whenReady().then(async () => {
     return proxyLogStore.getAll()
   })
 
+  ipcMain.handle('proxy-get-log-batch', (_event, cursor?: number, limit?: number) => {
+    return proxyLogStore.getBatch(cursor, limit)
+  })
+
   // IPC: 清除反代日志
   ipcMain.handle('proxy-clear-logs', () => {
     proxyLogStore.clear()
@@ -5989,33 +5692,48 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 获取 Usage API 类型
-  ipcMain.handle('get-usage-api-type', () => {
+  ipcMain.handle('get-usage-api-type', async () => {
+    await initStore()
     return currentUsageApiType
   })
 
-  // IPC: 设置 Usage API 类型
-  ipcMain.handle('set-usage-api-type', (_event, type: 'rest' | 'cbor') => {
-    setUsageApiType(type)
-    // 保存到 store
-    if (store) {
+  ipcMain.handle('set-usage-api-type', async (_event, type: unknown) => {
+    try {
+      if (type !== 'rest' && type !== 'cbor') throw new Error('用量 API 类型无效')
+      await initStore()
+      if (!store) throw new Error('设置存储不可用')
       store.set('usageApiType', type)
+      setUsageApiType(type)
+      return { success: true, type }
+    } catch (error) {
+      return {
+        success: false,
+        type: currentUsageApiType,
+        error: error instanceof Error ? error.message : String(error)
+      }
     }
-    return { success: true, type }
   })
 
-  // IPC: 获取是否使用 K-Proxy 代理
-  ipcMain.handle('get-use-kproxy-for-api', () => {
+  ipcMain.handle('get-use-kproxy-for-api', async () => {
+    await initStore()
     return getUseKProxyForApi()
   })
 
-  // IPC: 设置是否使用 K-Proxy 代理
-  ipcMain.handle('set-use-kproxy-for-api', (_event, enabled: boolean) => {
-    setUseKProxyForApi(enabled)
-    // 保存到 store
-    if (store) {
+  ipcMain.handle('set-use-kproxy-for-api', async (_event, enabled: unknown) => {
+    try {
+      if (typeof enabled !== 'boolean') throw new Error('K-Proxy 开关无效')
+      await initStore()
+      if (!store) throw new Error('设置存储不可用')
       store.set('useKProxyForApi', enabled)
+      setUseKProxyForApi(enabled)
+      return { success: true, enabled }
+    } catch (error) {
+      return {
+        success: false,
+        enabled: getUseKProxyForApi(),
+        error: error instanceof Error ? error.message : String(error)
+      }
     }
-    return { success: true, enabled }
   })
 
   // IPC: 更新反代服务器配置
@@ -6024,29 +5742,6 @@ app.whenReady().then(async () => {
       const server = initProxyServer()
       server.updateConfig(config)
       const newConfig = server.getConfig()
-      // 同步流式日志开关
-      if (config.logStreamEvents !== undefined) {
-        setLogStreamEvents(config.logStreamEvents)
-      }
-      // 同步 payload 大小限制
-      if (config.payloadSizeLimitKB !== undefined) {
-        setPayloadSizeLimitKB(config.payloadSizeLimitKB)
-      }
-      // 同步 Token buffer reserve（开关 + 数值）
-      if (config.enableTokenBufferReserve !== undefined) {
-        setEnableTokenBufferReserve(config.enableTokenBufferReserve)
-      }
-      if (config.tokenBufferReserve !== undefined) {
-        setTokenBufferReserve(config.tokenBufferReserve)
-      }
-      // 同步 Agent 模式
-      if (config.agentMode) {
-        setAgentMode(config.agentMode)
-      }
-      // 工作区路径变化时重新加载 steering
-      if (config.workspacePath !== undefined) {
-        server.loadSteering()
-      }
       // 保存配置到 store（用于自启动）
       if (store) {
         store.set('proxyConfig', newConfig)
@@ -6061,10 +5756,10 @@ app.whenReady().then(async () => {
   // ============ 反代安全 / 可观测 IPC（v1.8 新增） ============
 
   // 获取自签证书信息（PEM、指纹、有效期、SAN）
-  ipcMain.handle('proxy-self-signed-cert-info', () => {
+  ipcMain.handle('proxy-self-signed-cert-info', async () => {
     try {
       if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
-      const info = proxyServer.getSelfSignedCertInfo()
+      const info = await proxyServer.getSelfSignedCertInfo()
       if (!info) return { success: false, error: 'Failed to get self-signed cert info' }
       return { success: true, ...info }
     } catch (err) {
@@ -6073,10 +5768,10 @@ app.whenReady().then(async () => {
   })
 
   // 重新生成自签证书（用户主动触发）
-  ipcMain.handle('proxy-self-signed-cert-regenerate', () => {
+  ipcMain.handle('proxy-self-signed-cert-regenerate', async () => {
     try {
       if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
-      const info = proxyServer.regenerateSelfSignedCert()
+      const info = await proxyServer.regenerateSelfSignedCert()
       if (!info) return { success: false, error: 'Failed to regenerate self-signed cert' }
       return { success: true, ...info }
     } catch (err) {
@@ -6300,10 +5995,16 @@ app.whenReady().then(async () => {
     try {
       const server = initProxyServer()
       const pool = server.getAccountPool()
-      pool.clear()
-      for (const account of accounts) {
-        pool.addAccount(account)
-      }
+      const data = (lastSavedData || store?.get('accountData')) as {
+        accountProxyBindings?: Record<string, string>
+        proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+      } | undefined
+      const poolHasHealthyProxy = Object.values(data?.proxyPool || {}).some((proxy) => proxy.enabled && proxy.status !== 'dead')
+      pool.syncAccounts(accounts.map((account) => {
+        const proxyId = data?.accountProxyBindings?.[account.id]
+        const proxy = proxyId ? data?.proxyPool?.[proxyId] : undefined
+        return { ...account, proxyUrl: proxy?.enabled && (proxy.status !== 'dead' || !poolHasHealthyProxy) ? proxy.url : account.proxyUrl }
+      }))
       return { success: true, accountCount: pool.size }
     } catch (error) {
       console.error('[ProxyServer] Sync accounts failed:', error)
@@ -6410,58 +6111,82 @@ app.whenReady().then(async () => {
     }
   })
 
-  // IPC: 获取可用订阅列表
-  ipcMain.handle('account-get-subscriptions', async (_event, accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
-    try {
-      const result = await fetchAvailableSubscriptions({ id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount)
-      if (result.subscriptionPlans) {
-        return { 
-          success: true, 
-          plans: result.subscriptionPlans,
-          disclaimer: result.disclaimer 
+  registerWebhookIPC(fetchWithAppProxy)
+  const resolveSettingsAccount = (
+    input: import('./ipc/subscriptions').SubscriptionAccountInput
+  ): ProxyAccount => {
+    const data = (lastSavedData || store?.get('accountData')) as
+      | {
+          accounts?: Record<
+            string,
+            {
+              email?: string
+              idp?: string
+              machineId?: string
+              profileArn?: string
+              credentials?: Partial<ProxyAccount>
+            }
+          >
+          accountProxyBindings?: Record<string, string>
+          proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
         }
-      }
-      return { success: false, error: 'No subscription plans returned', plans: [] }
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to get subscriptions', plans: [] }
+      | undefined
+    const saved = data?.accounts?.[input.id]
+    const pooled = proxyServer?.getAccountPool().getAccount(input.id)
+    const bound = data?.proxyPool?.[data?.accountProxyBindings?.[input.id] || '']
+    const authMethod = saved?.credentials?.authMethod || pooled?.authMethod || input.authMethod
+    return {
+      ...input,
+      ...pooled,
+      ...saved?.credentials,
+      id: input.id,
+      email: saved?.email || pooled?.email,
+      machineId: saved?.machineId || pooled?.machineId || input.machineId,
+      profileArn: saved?.profileArn || pooled?.profileArn || input.profileArn,
+      provider: saved?.credentials?.provider || saved?.idp || pooled?.provider || input.provider,
+      authMethod:
+        authMethod === 'social' ||
+        authMethod === 'idc' ||
+        authMethod === 'IdC' ||
+        authMethod === 'external_idp'
+          ? authMethod
+          : undefined,
+      proxyUrl: bound
+        ? bound.enabled && bound.status !== 'dead'
+          ? bound.url
+          : undefined
+        : pooled?.proxyUrl
     }
-  })
-
-  // IPC: 获取订阅管理/支付链接
-  ipcMain.handle('account-get-subscription-url', async (_event, accessToken: string, subscriptionType?: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
-    try {
-      const result = await fetchSubscriptionToken({ id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount, subscriptionType)
-      if (result.encodedVerificationUrl) {
-        return { success: true, url: result.encodedVerificationUrl, status: result.status }
-      }
-      return { success: false, error: result.message || 'No subscription URL returned' }
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to get subscription URL' }
-    }
-  })
-
-  // IPC: 设置用户偏好（超额开启/关闭）
-  ipcMain.handle('account-set-overage', async (_event, accessToken: string, overageStatus: 'ENABLED' | 'DISABLED', region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
-    try {
-      const result = await setUserPreference(
-        { id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount,
-        overageStatus
-      )
-      return result
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to set overage' }
-    }
-  })
-
-  // IPC: 在系统默认浏览器无痕模式中打开订阅链接
-  ipcMain.handle('open-subscription-window', async (_event, url: string) => {
-    try {
-      openBrowserInPrivateMode(url)
-      return { success: true }
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open URL' }
-    }
-  })
+  }
+  registerSubscriptionIPC((input) => resolveSettingsAccount(input))
+  registerKiroSettingsIPC(
+    () => {
+      const data = (lastSavedData || store?.get('accountData')) as
+        | {
+            accounts?: Record<
+              string,
+              {
+                id: string
+                isActive?: boolean
+                status?: string
+                credentials?: { accessToken?: string }
+              }
+            >
+          }
+        | undefined
+      const accounts = Object.values(data?.accounts || {})
+      const account =
+        accounts.find((item) => item.isActive && item.credentials?.accessToken) ||
+        accounts.find((item) => item.status === 'active' && item.credentials?.accessToken)
+      return account
+        ? resolveSettingsAccount({
+            id: account.id,
+            accessToken: account.credentials?.accessToken || ''
+          })
+        : undefined
+    },
+    () => proxyServer?.getConfig().workspacePath
+  )
 
   // 代理日志持久化（请求日志，与详细日志分开存储）
   const getProxyLogsPath = (): string => join(app.getPath('userData'), 'proxy-request-logs.json')
@@ -6526,8 +6251,7 @@ app.whenReady().then(async () => {
             lastError: undefined,
             lastCheckedAt: Date.now()
           }
-          store.set('accountData', accountData)
-          lastSavedData = accountData
+          persistAccountData(accountData)
         }
       }
       console.log(`[ProxyServer] Cleared suspended flag for account ${accountId}`)
@@ -6543,25 +6267,9 @@ app.whenReady().then(async () => {
   // IPC: 初始化 K-Proxy 服务
   ipcMain.handle('kproxy-init', async () => {
     try {
+      await initStore()
       const savedConfig = store?.get('kproxyConfig') as Partial<KProxyConfig> | undefined
-      const service = initKProxyService(savedConfig || {}, {
-        onRequest: (info) => {
-          mainWindow?.webContents.send('kproxy-request', info)
-        },
-        onResponse: (info) => {
-          mainWindow?.webContents.send('kproxy-response', info)
-        },
-        onError: (error) => {
-          console.error('[KProxy] Error:', error)
-          mainWindow?.webContents.send('kproxy-error', error.message)
-        },
-        onStatusChange: (running, port) => {
-          mainWindow?.webContents.send('kproxy-status-change', { running, port })
-        },
-        onMitmIntercept: (host, modified) => {
-          mainWindow?.webContents.send('kproxy-mitm', { host, modified })
-        }
-      })
+      const service = configuredKProxyService(savedConfig || {})
       const caInfo = await service.initialize()
       return { 
         success: true, 
@@ -6659,6 +6367,7 @@ app.whenReady().then(async () => {
         return { success: false, error: 'K-Proxy not initialized' }
       }
       service.setDeviceId(deviceId)
+      store?.set('kproxyConfig', service.getConfig())
       return { success: true }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to set device ID' }
@@ -6678,11 +6387,6 @@ app.whenReady().then(async () => {
         return { success: false, error: 'K-Proxy not initialized' }
       }
       service.addDeviceIdMapping(mapping)
-      // 保存映射
-      const mappings = service.getAllDeviceIdMappings()
-      if (store) {
-        store.set('kproxyDeviceMappings', mappings)
-      }
       return { success: true }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to add mapping' }
@@ -6781,13 +6485,13 @@ app.whenReady().then(async () => {
         return { success: false, installed: false, error: 'K-Proxy not initialized' }
       }
 
-      const { execSync } = await import('child_process')
+
       const platform = process.platform
 
       if (platform === 'win32') {
         // Windows: 使用 certutil 检查证书
         try {
-          const output = execSync('certutil -store -user Root "K-Proxy CA"', { encoding: 'utf-8' })
+          const { stdout: output } = await runCertificateCommand('certutil', ['-store', '-user', 'Root', 'K-Proxy CA'])
           return { success: true, installed: output.includes('K-Proxy CA') }
         } catch {
           return { success: true, installed: false }
@@ -6795,7 +6499,7 @@ app.whenReady().then(async () => {
       } else if (platform === 'darwin') {
         // macOS: 使用 security 命令检查
         try {
-          execSync('security find-certificate -c "K-Proxy CA" ~/Library/Keychains/login.keychain-db', { encoding: 'utf-8' })
+          await runCertificateCommand('security', ['find-certificate', '-c', 'K-Proxy CA', join(app.getPath('home'), 'Library/Keychains/login.keychain-db')])
           return { success: true, installed: true }
         } catch {
           return { success: true, installed: false }
@@ -6824,13 +6528,13 @@ app.whenReady().then(async () => {
         return { success: false, error: 'CA certificate not available' }
       }
 
-      const { execSync } = await import('child_process')
+
       const platform = process.platform
 
       if (platform === 'win32') {
         // Windows: 使用 certutil 安装到根证书存储
         try {
-          execSync(`certutil -addstore -user Root "${caInfo.certPath}"`, { encoding: 'utf-8' })
+          await runCertificateCommand('certutil', ['-addstore', '-user', 'Root', caInfo.certPath])
           return { success: true, message: 'CA certificate installed to Windows certificate store' }
         } catch (error) {
           const errMsg = error instanceof Error ? error.message : String(error)
@@ -6841,14 +6545,14 @@ app.whenReady().then(async () => {
         }
       } else if (platform === 'darwin') {
         // macOS: 使用 security 命令安装到钥匙串
-        execSync(`security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db "${caInfo.certPath}"`)
+        await runCertificateCommand('security', ['add-trusted-cert', '-r', 'trustRoot', '-k', join(app.getPath('home'), 'Library/Keychains/login.keychain-db'), caInfo.certPath])
         return { success: true, message: 'CA certificate installed to macOS Keychain' }
       } else {
         // Linux: 复制到系统 CA 目录
         const fs = await import('fs')
         const targetPath = '/usr/local/share/ca-certificates/kproxy-ca.crt'
-        fs.copyFileSync(caInfo.certPath, targetPath)
-        execSync('sudo update-ca-certificates')
+        await fs.promises.copyFile(caInfo.certPath, targetPath)
+        await runCertificateCommand('sudo', ['update-ca-certificates'])
         return { success: true, message: 'CA certificate installed to Linux CA store' }
       }
     } catch (error) {
@@ -6860,13 +6564,13 @@ app.whenReady().then(async () => {
   // IPC: 卸载 CA 证书从系统信任存储
   ipcMain.handle('kproxy-uninstall-ca-cert', async () => {
     try {
-      const { execSync } = await import('child_process')
+
       const platform = process.platform
 
       if (platform === 'win32') {
         // Windows: 使用 certutil 删除证书
         try {
-          execSync('certutil -delstore -user Root "K-Proxy CA"', { encoding: 'utf-8' })
+          await runCertificateCommand('certutil', ['-delstore', '-user', 'Root', 'K-Proxy CA'])
           return { success: true, message: 'CA certificate removed from Windows certificate store' }
         } catch (error) {
           const errMsg = error instanceof Error ? error.message : String(error)
@@ -6877,15 +6581,15 @@ app.whenReady().then(async () => {
         }
       } else if (platform === 'darwin') {
         // macOS: 使用 security 命令删除
-        execSync('security delete-certificate -c "K-Proxy CA" ~/Library/Keychains/login.keychain-db')
+        await runCertificateCommand('security', ['delete-certificate', '-c', 'K-Proxy CA', join(app.getPath('home'), 'Library/Keychains/login.keychain-db')])
         return { success: true, message: 'CA certificate removed from macOS Keychain' }
       } else {
         // Linux: 删除证书并更新
         const fs = await import('fs')
         const targetPath = '/usr/local/share/ca-certificates/kproxy-ca.crt'
         if (fs.existsSync(targetPath)) {
-          fs.unlinkSync(targetPath)
-          execSync('sudo update-ca-certificates --fresh')
+          await fs.promises.unlink(targetPath)
+          await runCertificateCommand('sudo', ['update-ca-certificates', '--fresh'])
         }
         return { success: true, message: 'CA certificate removed from Linux CA store' }
       }
@@ -6895,176 +6599,7 @@ app.whenReady().then(async () => {
     }
   })
 
-  // ============ MCP 服务器管理 IPC ============
-
-  // IPC: 保存 MCP 服务器配置
-  ipcMain.handle('save-mcp-server', async (_event, name: string, config: { command: string; args?: string[]; env?: Record<string, string> }, oldName?: string) => {
-    try {
-      const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const mcpPath = path.join(homeDir, '.kiro', 'settings', 'mcp.json')
-      
-      // 读取现有配置
-      let mcpConfig: { mcpServers: Record<string, unknown> } = { mcpServers: {} }
-      if (fs.existsSync(mcpPath)) {
-        const content = fs.readFileSync(mcpPath, 'utf-8')
-        mcpConfig = JSON.parse(content)
-      }
-      
-      // 如果是重命名，先删除旧的
-      if (oldName && oldName !== name) {
-        delete mcpConfig.mcpServers[oldName]
-      }
-      
-      // 添加/更新服务器
-      mcpConfig.mcpServers[name] = config
-      
-      // 确保目录存在
-      const dir = path.dirname(mcpPath)
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true })
-      }
-      
-      fs.writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2))
-      console.log('[KiroSettings] Saved MCP server:', name)
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to save MCP server:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to save MCP server' }
-    }
-  })
-
-  // IPC: 删除 MCP 服务器
-  ipcMain.handle('delete-mcp-server', async (_event, name: string) => {
-    try {
-      const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const mcpPath = path.join(homeDir, '.kiro', 'settings', 'mcp.json')
-      
-      if (!fs.existsSync(mcpPath)) {
-        return { success: false, error: '配置文件不存在' }
-      }
-      
-      const content = fs.readFileSync(mcpPath, 'utf-8')
-      const mcpConfig = JSON.parse(content)
-      
-      if (!mcpConfig.mcpServers || !mcpConfig.mcpServers[name]) {
-        return { success: false, error: '服务器不存在' }
-      }
-      
-      delete mcpConfig.mcpServers[name]
-      fs.writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2))
-      console.log('[KiroSettings] Deleted MCP server:', name)
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to delete MCP server:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to delete MCP server' }
-    }
-  })
-
-  // IPC: 删除 Steering 文件
-  ipcMain.handle('delete-kiro-steering-file', async (_event, filename: string) => {
-    try {
-      const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
-      
-      if (!fs.existsSync(filePath)) {
-        return { success: false, error: '文件不存在' }
-      }
-      
-      fs.unlinkSync(filePath)
-      console.log('[KiroSettings] Deleted steering file:', filePath)
-      return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to delete steering file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to delete file' }
-    }
-  })
-
-  // ============ 机器码管理 IPC ============
-  
-  // IPC: 获取操作系统类型
-  ipcMain.handle('machine-id:get-os-type', () => {
-    return machineIdModule.getOSType()
-  })
-
-  // IPC: 获取当前机器码
-  ipcMain.handle('machine-id:get-current', async () => {
-    console.log('[MachineId] Getting current machine ID...')
-    return await machineIdModule.getCurrentMachineId()
-  })
-
-  // IPC: 设置新机器码
-  ipcMain.handle('machine-id:set', async (_event, newMachineId: string) => {
-    console.log('[MachineId] Setting new machine ID:', newMachineId.substring(0, 8) + '...')
-    const result = await machineIdModule.setMachineId(newMachineId)
-    
-    if (!result.success && result.requiresAdmin) {
-      // 弹窗询问用户是否以管理员权限重启
-      const shouldRestart = await machineIdModule.showAdminRequiredDialog()
-      if (shouldRestart) {
-        await machineIdModule.requestAdminRestart()
-      }
-    }
-    
-    return result
-  })
-
-  // IPC: 生成随机机器码
-  ipcMain.handle('machine-id:generate-random', () => {
-    return machineIdModule.generateRandomMachineId()
-  })
-
-  // IPC: 检查管理员权限
-  ipcMain.handle('machine-id:check-admin', async () => {
-    return await machineIdModule.checkAdminPrivilege()
-  })
-
-  // IPC: 请求管理员权限重启
-  ipcMain.handle('machine-id:request-admin-restart', async () => {
-    const shouldRestart = await machineIdModule.showAdminRequiredDialog()
-    if (shouldRestart) {
-      return await machineIdModule.requestAdminRestart()
-    }
-    return false
-  })
-
-  // IPC: 备份机器码到文件
-  ipcMain.handle('machine-id:backup-to-file', async (_event, machineId: string) => {
-    const result = await dialog.showSaveDialog(mainWindow!, {
-      title: '备份机器码',
-      defaultPath: 'machine-id-backup.json',
-      filters: [{ name: 'JSON', extensions: ['json'] }]
-    })
-    
-    if (result.canceled || !result.filePath) {
-      return false
-    }
-    
-    return await machineIdModule.backupMachineIdToFile(machineId, result.filePath)
-  })
-
-  // IPC: 从文件恢复机器码
-  ipcMain.handle('machine-id:restore-from-file', async () => {
-    const result = await dialog.showOpenDialog(mainWindow!, {
-      title: '恢复机器码',
-      filters: [{ name: 'JSON', extensions: ['json'] }],
-      properties: ['openFile']
-    })
-    
-    if (result.canceled || !result.filePaths[0]) {
-      return { success: false, error: '用户取消' }
-    }
-    
-    return await machineIdModule.restoreMachineIdFromFile(result.filePaths[0])
-  })
+  registerMachineIdIPC(() => mainWindow)
 
   // 更新协议处理函数以支持 Social Auth 回调
   const originalHandleProtocolUrl = handleProtocolUrl
@@ -7107,32 +6642,20 @@ app.whenReady().then(async () => {
 
   createWindow()
 
-  app.on('activate', function () {
-    // On macOS it's common to re-create a window in the app when the
-    // dock icon is clicked and there are no other windows open.
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow()
-    } else if (mainWindow) {
-      // macOS: 点击 Dock 图标时显示主窗口
-      if (process.platform === 'darwin' && app.dock) {
-        app.dock.show()
-      }
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.show()
-      mainWindow.focus()
-    }
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    else revealMainWindow()
   })
 
   // 加载并注册全局快捷键
   await loadShortcutSettings()
-  registerShowWindowShortcut()
 })
 
 // Windows/Linux: 处理第二个实例和协议 URL
 const gotTheLock = app.requestSingleInstanceLock()
 
 if (!gotTheLock) {
-  app.quit()
+  app.exit(0)
 } else {
   app.on('second-instance', (_event, commandLine) => {
     // Windows: 协议 URL 会作为命令行参数传入
@@ -7141,11 +6664,7 @@ if (!gotTheLock) {
       handleProtocolUrl(url)
     }
 
-    // 聚焦主窗口
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
-    }
+    revealMainWindow()
   })
 }
 
@@ -7163,60 +6682,9 @@ app.on('window-all-closed', () => {
   }
 })
 
-// 应用退出前注销 URI 协议处理器并保存数据
-app.on('will-quit', async (event) => {
-  // 防止重复处理
+// Intercept OS/application quits before windows close, so pending renderer edits can be saved.
+app.on('before-quit', event => {
   if (isQuitting) return
-  
-  // 停止主进程池 token 刷新调度器
-  stopMainPoolTokenRefresh()
-
-  // 防止应用立即退出，先保存数据
-  if (lastSavedData && store) {
-    event.preventDefault()
-    isQuitting = true
-    
-    // 设置超时，确保 3 秒后强制退出（防止关机阻塞）
-    const forceQuitTimer = setTimeout(() => {
-      console.log('[Exit] Force quit due to timeout')
-      unregisterProtocol()
-      app.exit(0)
-    }, 3000)
-    
-    try {
-      console.log('[Exit] Saving data before quit...')
-      // 刷新待写入的防抖数据
-      flushStoreWrites()
-      store.set('accountData', lastSavedData)
-      // 退出场景跳过节流，确保备份立即落盘
-      await createBackup(lastSavedData)
-      await flushBackupNow()
-      // 强制落盘代理日志（异步节流中的尾巴数据）
-      try {
-        const { proxyLogStore } = await import('./proxy/logger')
-        await proxyLogStore.flushSaveNow()
-      } catch (err) {
-        console.error('[Exit] Failed to flush proxy logs:', err)
-      }
-      // 释放共享的 TLS ModuleClient（worker pool + DLL）
-      try {
-        const { shutdownTlsClientPool } = await import('./registration/tlsClientPool')
-        await shutdownTlsClientPool()
-      } catch (err) {
-        console.error('[Exit] Failed to shutdown TLS client pool:', err)
-      }
-      console.log('[Exit] Data saved successfully')
-    } catch (error) {
-      console.error('[Exit] Failed to save data:', error)
-    }
-    
-    clearTimeout(forceQuitTimer)
-    unregisterProtocol()
-    app.exit(0)
-  } else {
-    unregisterProtocol()
-  }
+  event.preventDefault()
+  if (!appUpdates?.snapshot().installing) void appQuit.request()
 })
-
-// In this file you can include the rest of your app's specific main process
-// code. You can also put them in separate files and require them here.

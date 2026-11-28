@@ -71,7 +71,7 @@ interface ApiKey {
 }
 
 export function ApiKeyManager() {
-  const { language } = useAccountsStore()
+  const language = useAccountsStore(state => state.language)
   const isEn = language === 'en'
 
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([])

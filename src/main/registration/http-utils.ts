@@ -1,10 +1,5 @@
 import crypto from 'crypto'
 
-export const DEFAULT_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
-export const DEFAULT_SEC_UA =
-  '"Chromium";v="146", "Not/A)Brand";v="24", "Google Chrome";v="146"'
-
 /** 生成 4 位随机十六进制 */
 function hex4(): string {
   const chars = '0123456789abcdef'
@@ -36,23 +31,6 @@ export function ubidGen(): string {
   const d7 = Array.from({ length: 7 }, () => Math.floor(Math.random() * 10)).join('')
   const d6 = Array.from({ length: 6 }, () => Math.floor(Math.random() * 10)).join('')
   return `186-${d7}-${d6}`
-}
-
-/** 生成 Kiro visitor ID */
-export function kiroVisitorId(): string {
-  const chars = '0123456789abcdefghijklmnopqrstuvwxyz'
-  let s = ''
-  for (let i = 0; i < 11; i++) s += chars[Math.floor(Math.random() * chars.length)]
-  return `${Date.now()}-${s}`
-}
-
-/** 生成 PKCE code_verifier 和 code_challenge */
-export function pkce(): { verifier: string; challenge: string } {
-  const raw = crypto.randomBytes(32)
-  const verifier = raw.toString('base64url')
-  const hash = crypto.createHash('sha256').update(verifier).digest()
-  const challenge = hash.toString('base64url')
-  return { verifier, challenge }
 }
 
 /** 生成 UUID */

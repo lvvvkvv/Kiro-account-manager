@@ -3,6 +3,7 @@
  * 保证两种视图（卡片 / 列表）视觉系统一致
  */
 import type { Account, AccountFilter } from '@/types/account'
+export { isBannedAccountError as isBannedError } from '@/lib/account'
 
 // 高级筛选面板与工具栏共用，搜索关键词由独立搜索框展示。
 export function hasActiveAccountFilters(filter: AccountFilter): boolean {
@@ -10,13 +11,13 @@ export function hasActiveAccountFilters(filter: AccountFilter): boolean {
     filter.subscriptionTypes?.length ||
     filter.statuses?.length ||
     filter.idps?.length ||
-    filter.groupIds?.length ||
     filter.tagIds?.length ||
     filter.emailDomains?.length ||
     filter.usageMin !== undefined ||
     filter.usageMax !== undefined ||
     filter.daysRemainingMin !== undefined ||
     filter.daysRemainingMax !== undefined ||
+    filter.risk ||
     filter.bannedOnly
   )
 }
@@ -38,17 +39,6 @@ export function toRgba(argbColor: string): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha / 255})`
 }
 
-// ============ 订阅徽章配色 ============
-
-export function getSubscriptionColor(type: string, title?: string): string {
-  const text = (title || type).toUpperCase()
-  if (text.includes('PRO+') || text.includes('PRO_PLUS') || text.includes('PROPLUS'))
-    return 'bg-purple-500'
-  if (text.includes('POWER')) return 'bg-amber-500'
-  if (text.includes('PRO')) return 'bg-blue-500'
-  return 'bg-gray-500'
-}
-
 // ============ 状态文本 ============
 
 export const StatusLabelsZh: Record<string, string> = {
@@ -65,23 +55,6 @@ export const StatusLabelsEn: Record<string, string> = {
   error: 'Error',
   refreshing: 'Refreshing',
   unknown: 'Unknown'
-}
-
-// 状态徽章 Tailwind class
-export function getStatusBadgeClass(status: string, isUnauthorized: boolean): string {
-  if (isUnauthorized) return 'text-destructive bg-destructive/10'
-  switch (status) {
-    case 'active':
-      return 'text-success bg-success/10'
-    case 'error':
-      return 'text-destructive bg-destructive/10'
-    case 'expired':
-      return 'text-warning bg-warning/10'
-    case 'refreshing':
-      return 'text-primary bg-primary/10'
-    default:
-      return 'text-muted-foreground bg-muted'
-  }
 }
 
 // ============ 显示名 ============
@@ -123,23 +96,6 @@ export function formatTokenExpiry(expiresAt: number, isEn: boolean): string {
         ? `${days} 天 ${remainingHours} 小时`
         : `${days} 天`
   }
-}
-
-// ============ 封禁错误识别 ============
-
-export function isBannedError(error: string | undefined): boolean {
-  if (!error) return false
-  const lower = error.toLowerCase()
-  return (
-    lower.includes('accountsuspendedexception') ||
-    lower.includes('account suspended') ||
-    lower.includes('temporarily_suspended') ||
-    lower.includes('temporarily suspended') ||
-    (lower.includes('user id is') && lower.includes('suspended')) ||
-    lower.includes('账户已封禁') ||
-    lower.includes('已封禁') ||
-    /\b423\b/.test(lower)
-  )
 }
 
 // ============ 日期格式化 ============

@@ -1,3 +1,4 @@
+import { validateAccountData } from '../shared/accountData'
 // 自动备份使用用户数据目录中的随机密钥，不依赖钥匙串或应用签名。
 // Electron safeStorage 仅用于主数据缺失时恢复旧版备份，原 .enc 始终保留。
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
@@ -144,16 +145,8 @@ function decrypt(data: Buffer, key: Buffer): string {
 
 function parseBackup(json: string): unknown {
   try {
-    const data = JSON.parse(json) as { accounts?: unknown } | null
-    if (
-      !data ||
-      typeof data !== 'object' ||
-      !data.accounts ||
-      typeof data.accounts !== 'object' ||
-      Array.isArray(data.accounts)
-    ) {
-      throw new Error('Invalid account data')
-    }
+    const data: unknown = JSON.parse(json)
+    validateAccountData(data)
     return data
   } catch {
     throw new Error('备份缺少有效的账号数据，原文件已保留。')
@@ -182,9 +175,9 @@ async function writeLocalBackup(dir: string, json: string): Promise<void> {
 /** 主数据可用时直接写本地备份，无需读取旧钥匙串。失败时不回退明文。 */
 export async function writeSecureBackup(dir: string, data: unknown): Promise<void> {
   // 排队前序列化，保存调用时的数据快照。
+  validateAccountData(data)
   const json = JSON.stringify(data)
   if (json === undefined) throw new Error('备份数据不能为空。')
-  parseBackup(json)
   await serialized(dir, () => writeLocalBackup(dir, json))
 }
 
@@ -220,14 +213,17 @@ export async function readSecureBackup(dir: string): Promise<unknown | null> {
 /** 正常升级优先使用主数据，只有主数据缺失时才恢复/迁移备份。 */
 export async function initializeAccountBackup(
   dir: string,
-  mainData: unknown
+  mainData: unknown,
+  failed?: (error: unknown) => void
 ): Promise<unknown | null> {
   if (mainData == null) return readSecureBackup(dir)
+  validateAccountData(mainData)
   try {
     await writeSecureBackup(dir, mainData)
   } catch (error) {
     // 备份不可写不应阻止读取仍然完好的主数据。
     console.error('[Store] Failed to create local backup; main data retained:', error)
+    failed?.(error)
   }
   return mainData
 }

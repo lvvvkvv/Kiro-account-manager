@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account } from '@/types/account'
+import { withoutAccountCredentials } from '@/lib/account'
 
 type ExportFormat = 'json' | 'oidc' | 'txt' | 'csv' | 'kami' | 'clipboard'
 
@@ -16,11 +17,16 @@ interface ExportDialogProps {
   selectedCount: number
 }
 
-export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportDialogProps) {
+export function ExportDialog({
+  open,
+  onClose,
+  accounts,
+  selectedCount
+}: ExportDialogProps): React.ReactNode {
   const [selectedFormat, setSelectedFormat] = useState<ExportFormat>('json')
   const [includeCredentials, setIncludeCredentials] = useState(true)
   const [copied, setCopied] = useState(false)
-  const { exportAccounts } = useAccountsStore()
+  const exportAccounts = useAccountsStore((state) => state.exportAccounts)
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
@@ -82,22 +88,15 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
   // 生成导出内容
   const generateContent = (format: ExportFormat): string => {
     switch (format) {
-      case 'json':
+      case 'json': {
         // 使用 store 的 exportAccounts 函数导出完整数据
         const exportData = exportAccounts(accounts.map((a) => a.id))
         // 如果不包含凭证，移除敏感信息
         if (!includeCredentials) {
-          exportData.accounts = exportData.accounts.map((acc) => ({
-            ...acc,
-            credentials: {
-              ...acc.credentials,
-              accessToken: '',
-              refreshToken: '',
-              csrfToken: ''
-            }
-          }))
+          exportData.accounts = exportData.accounts.map(withoutAccountCredentials)
         }
         return JSON.stringify(exportData, null, 2)
+      }
 
       case 'oidc': {
         // 精简 JSON：只含关键凭证（邮箱/密码/refreshToken/clientId/clientSecret/provider）
@@ -144,7 +143,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           })
           .join('\n\n---\n\n')
 
-      case 'csv':
+      case 'csv': {
         // CSV 格式：包含凭证时可用于导入
         const headers = includeCredentials
           ? ['邮箱', '昵称', '登录方式', 'RefreshToken', 'ClientId', 'ClientSecret', 'Region']
@@ -177,6 +176,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
             .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
             .join('\n')
         )
+      }
 
       case 'kami':
         // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret----登录方式
@@ -216,7 +216,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
   }
 
   // 导出处理
-  const handleExport = async () => {
+  const handleExport = async (): Promise<void> => {
     const content = generateContent(selectedFormat)
     const count = accounts.length
 

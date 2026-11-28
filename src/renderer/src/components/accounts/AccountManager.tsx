@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useShallow } from 'zustand/react/shallow'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { AccountToolbar, type AccountViewMode } from './AccountToolbar'
@@ -28,7 +29,17 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
     selectedIds,
     activeGroupTab,
     groups
-  } = useAccountsStore()
+  } = useAccountsStore(
+    useShallow((state) => ({
+      isLoading: state.isLoading,
+      accounts: state.accounts,
+      importFromExportData: state.importFromExportData,
+      importAccounts: state.importAccounts,
+      selectedIds: state.selectedIds,
+      activeGroupTab: state.activeGroupTab,
+      groups: state.groups
+    }))
+  )
 
   const [showAddDialog, setShowAddDialog] = useState(false)
   const [editingAccount, setEditingAccount] = useState<Account | null>(null)
@@ -48,13 +59,14 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   const isEn = t('common.unknown') === 'Unknown'
 
   // 获取要导出的账号列表
-  const getExportAccounts = (): Account[] => {
+  const exportAccounts = useMemo(() => {
+    if (!showExportDialog) return []
     const accountList = Array.from(accounts.values())
     if (selectedIds.size > 0) {
       return accountList.filter((acc) => selectedIds.has(acc.id))
     }
     return accountList
-  }
+  }, [showExportDialog, accounts, selectedIds])
 
   // 导出
   const handleExport = (): void => {
@@ -236,9 +248,9 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   }
 
   // 编辑账号
-  const handleEditAccount = (account: Account): void => {
+  const handleEditAccount = useCallback((account: Account): void => {
     setEditingAccount(account)
-  }
+  }, [])
 
   if (isLoading) {
     return (
@@ -328,7 +340,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
       <ExportDialog
         open={showExportDialog}
         onClose={() => setShowExportDialog(false)}
-        accounts={getExportAccounts()}
+        accounts={exportAccounts}
         selectedCount={selectedIds.size}
       />
     </div>

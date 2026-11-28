@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
+import { useShallow } from 'zustand/react/shallow'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { Button, Badge } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -76,8 +77,35 @@ export function AccountToolbar({
     proxyPool,
     accountProxyBindings,
     bindAccountsToProxy,
-    unbindAccountFromProxy
-  } = useAccountsStore()
+    unbindAccountsFromProxy
+  } = useAccountsStore(
+    useShallow((state) => ({
+      filter: state.filter,
+      setFilter: state.setFilter,
+      selectedIds: state.selectedIds,
+      selectAll: state.selectAll,
+      deselectAll: state.deselectAll,
+      removeAccounts: state.removeAccounts,
+      batchRefreshTokens: state.batchRefreshTokens,
+      batchCheckStatus: state.batchCheckStatus,
+      getFilteredAccounts: state.getFilteredAccounts,
+      getStats: state.getStats,
+      privacyMode: state.privacyMode,
+      setPrivacyMode: state.setPrivacyMode,
+      groups: state.groups,
+      tags: state.tags,
+      accounts: state.accounts,
+      moveAccountsToGroup: state.moveAccountsToGroup,
+      addTagToAccounts: state.addTagToAccounts,
+      removeTagFromAccounts: state.removeTagFromAccounts,
+      activeGroupTab: state.activeGroupTab,
+      setActiveGroupTab: state.setActiveGroupTab,
+      proxyPool: state.proxyPool,
+      accountProxyBindings: state.accountProxyBindings,
+      bindAccountsToProxy: state.bindAccountsToProxy,
+      unbindAccountsFromProxy: state.unbindAccountsFromProxy
+    }))
+  )
 
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [isChecking, setIsChecking] = useState(false)
@@ -119,20 +147,21 @@ export function AccountToolbar({
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
+  const selectedAccounts = useMemo(
+    () => Array.from(selectedIds, (id) => accounts.get(id)).filter((account) => account !== undefined),
+    [accounts, selectedIds]
+  )
+
   // 选中账号已绑定到每个代理的统计
-  const getSelectedProxyBindingStatus = useCallback(() => {
-    const selectedAccs = Array.from(selectedIds)
-      .map((id) => accounts.get(id))
-      .filter(Boolean)
-    const proxyCounts = new Map<string | 'none', number>()
-    selectedAccs.forEach((acc) => {
-      if (!acc) return
+  const getSelectedProxyBindingStatus = (): { proxyCounts: Map<string, number>; total: number } => {
+    const proxyCounts = new Map<string, number>()
+    selectedAccounts.forEach((acc) => {
       const pid = accountProxyBindings[acc.id]
       const key = pid || 'none'
       proxyCounts.set(key, (proxyCounts.get(key) || 0) + 1)
     })
-    return { selectedAccs, proxyCounts, total: selectedAccs.length }
-  }, [selectedIds, accounts, accountProxyBindings])
+    return { proxyCounts, total: selectedAccounts.length }
+  }
 
   const handleBindToProxy = (proxyId: string): void => {
     if (selectedIds.size === 0) return
@@ -142,48 +171,29 @@ export function AccountToolbar({
 
   const handleUnbindAllSelected = (): void => {
     if (selectedIds.size === 0) return
-    for (const id of selectedIds) {
-      unbindAccountFromProxy(id)
-    }
+    unbindAccountsFromProxy(Array.from(selectedIds))
     setShowProxyMenu(false)
   }
 
   // 获取选中账户的分组状态（useMemo 缓存，避免每次渲染重算 O(N)）
   const selectedGroupStatus = useMemo(() => {
-    const selectedAccounts = Array.from(selectedIds)
-      .map((id) => accounts.get(id))
-      .filter(Boolean)
     const groupCounts = new Map<string | undefined, number>()
     selectedAccounts.forEach((acc) => {
-      if (acc) {
-        const gid = acc.groupId
-        groupCounts.set(gid, (groupCounts.get(gid) || 0) + 1)
-      }
+      const gid = acc.groupId
+      groupCounts.set(gid, (groupCounts.get(gid) || 0) + 1)
     })
     return { selectedAccounts, groupCounts }
-  }, [selectedIds, accounts])
+  }, [selectedAccounts])
 
   const selectedTagStatus = useMemo(() => {
-    const selectedAccounts = Array.from(selectedIds)
-      .map((id) => accounts.get(id))
-      .filter(Boolean)
     const tagCounts = new Map<string, number>()
     selectedAccounts.forEach((acc) => {
-      if (acc?.tags) {
-        acc.tags.forEach((tagId) => {
-          tagCounts.set(tagId, (tagCounts.get(tagId) || 0) + 1)
-        })
-      }
+      acc.tags?.forEach((tagId) => {
+        tagCounts.set(tagId, (tagCounts.get(tagId) || 0) + 1)
+      })
     })
-    return { selectedAccounts, tagCounts, total: selectedAccounts.length }
-  }, [selectedIds, accounts])
-
-  // 兼容入口：保持现有调用签名
-  const getSelectedAccountsGroupStatus = useCallback(
-    () => selectedGroupStatus,
-    [selectedGroupStatus]
-  )
-  const getSelectedAccountsTagStatus = useCallback(() => selectedTagStatus, [selectedTagStatus])
+    return { tagCounts, total: selectedAccounts.length }
+  }, [selectedAccounts])
 
   // 处理分组操作
   const handleMoveToGroup = (groupId: string | undefined): void => {
@@ -204,7 +214,7 @@ export function AccountToolbar({
   }
 
   const handleToggleTag = (tagId: string): void => {
-    const { tagCounts, total } = getSelectedAccountsTagStatus()
+    const { tagCounts, total } = selectedTagStatus
     const count = tagCounts.get(tagId) || 0
 
     if (count === total) {
@@ -248,7 +258,7 @@ export function AccountToolbar({
     if (activeGroupTab === 'all') {
       return {
         label: isEn ? 'All' : '全部',
-        color: undefined as string | undefined,
+        color: undefined,
         icon: <Users className="h-4 w-4 " />,
         count: tabCounts.all
       }
@@ -256,7 +266,7 @@ export function AccountToolbar({
     if (activeGroupTab === 'ungrouped') {
       return {
         label: isEn ? 'Ungrouped' : '未分组',
-        color: undefined as string | undefined,
+        color: undefined,
         icon: <Inbox className="h-4 w-4 " />,
         count: tabCounts.ungrouped
       }
@@ -273,7 +283,7 @@ export function AccountToolbar({
     // 兜底：activeGroupTab 是失效的 groupId（分组被删了）→ 回退到全部
     return {
       label: isEn ? 'All' : '全部',
-      color: undefined as string | undefined,
+      color: undefined,
       icon: <Users className="h-4 w-4 " />,
       count: tabCounts.all
     }
@@ -466,13 +476,7 @@ export function AccountToolbar({
 
             {showGroupMenu &&
               (() => {
-                const { groupCounts: selGroupCounts, selectedAccounts: selAccs } =
-                  selectedCount > 0
-                    ? getSelectedAccountsGroupStatus()
-                    : {
-                        groupCounts: new Map<string | undefined, number>(),
-                        selectedAccounts: [] as unknown[]
-                      }
+                const { groupCounts: selGroupCounts, selectedAccounts: selAccs } = selectedGroupStatus
                 const renderTile = (
                   key: string,
                   isActive: boolean,
@@ -710,7 +714,7 @@ export function AccountToolbar({
                 {/* 标签列表 */}
                 <div className="max-h-[300px] overflow-y-auto">
                   {Array.from(tags.values()).map((tag) => {
-                    const { tagCounts, total } = getSelectedAccountsTagStatus()
+                    const { tagCounts, total } = selectedTagStatus
                     const count = tagCounts.get(tag.id) || 0
                     const isAll = count === total
                     const isPartial = count > 0 && count < total

@@ -1,6 +1,6 @@
 {
   "name": "kiro-account-manager",
-  "version": "1.7.20",
+  "version": "1.7.21",
   "description": "Kiro Account Manager - Manage your Kiro accounts, usage and subscriptions",
   "main": "./out/main/index.js",
   "author": "Kiro",
@@ -22,10 +22,20 @@
     "build:linux": "electron-vite build && electron-builder --linux",
     "test:e2e": "node test/e2e-fullsuite/run.mjs",
     "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only",
-    "test:updater": "node --test test/updater/manifest.test.mjs test/updater/service.test.mjs test/updater/mac.test.mjs",
+    "test:updater": "node --test test/updater/manifest.test.mjs test/updater/service.test.mjs test/updater/mac.test.mjs test/updater/network.test.mjs test/updater/cleanup.test.mjs test/updater/native-service.test.mjs",
     "test:updater:mac": "node test/updater/native.mjs",
     "test:token-refresh": "node --test test/token-refresh.test.mjs",
-    "test:secure-backup": "node --test test/secure-backup.test.mjs"
+    "test:proxy": "node --test test/proxy.test.mjs test/network-proxy.test.mjs",
+    "test:accounts": "node --test test/accounts.test.mjs test/account-operations.test.mjs",
+    "test:registration": "node --test test/registration.test.mjs test/registration-backend.test.mjs",
+    "test:subscription": "node --test test/subscription.test.mjs",
+    "test:secure-backup": "node --test test/secure-backup.test.mjs",
+    "test:configuration": "node --test test/configuration.test.mjs",
+    "test:machine-system": "node --test test/machine-system.test.mjs",
+    "test:app-settings": "node --test test/app-settings.test.mjs",
+    "test:finalization": "node --test test/finalization.test.mjs",
+    "test:bundle": "npm run build && node test/bundle-smoke.mjs",
+    "test:persistence": "node --test test/persistence.test.mjs"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
@@ -39,6 +49,7 @@
     "electron-updater": "^6.3.9",
     "framer-motion": "^12.40.0",
     "js-tiktoken": "^1.0.21",
+    "jsonc-parser": "3.3.1",
     "lucide-react": "^0.555.0",
     "node-forge": "^1.3.3",
     "socks": "^2.8.9",

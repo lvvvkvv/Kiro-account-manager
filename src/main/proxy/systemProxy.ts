@@ -3,6 +3,40 @@
 
 import { ProxyAgent, Agent, type Dispatcher } from 'undici'
 import * as tls from 'tls'
+import * as net from 'net'
+import { SocksClient } from 'socks'
+
+const cachedAgents = new Map<string, Dispatcher>()
+const MAX_CACHED_AGENTS = 128
+
+/** API 请求复用连接；验活等需要自行关闭的调用仍使用 safeCreateProxyAgent。 */
+export function getCachedProxyAgent(proxyUrl: string | null | undefined): Dispatcher | undefined {
+  if (!proxyUrl) return undefined
+  const existing = cachedAgents.get(proxyUrl)
+  if (existing) {
+    cachedAgents.delete(proxyUrl)
+    cachedAgents.set(proxyUrl, existing)
+    return existing
+  }
+  const agent = safeCreateProxyAgent(proxyUrl)
+  if (!agent) return undefined
+  cachedAgents.set(proxyUrl, agent)
+  if (cachedAgents.size > MAX_CACHED_AGENTS) {
+    const oldest = cachedAgents.keys().next().value!
+    const retired = cachedAgents.get(oldest)!
+    cachedAgents.delete(oldest)
+    void retired.close().catch(() => {
+      /* 退出/网络断开时连接可能已关闭。 */
+    })
+  }
+  return agent
+}
+
+export async function closeCachedProxyAgents(force = false): Promise<void> {
+  const agents = [...cachedAgents.values()]
+  cachedAgents.clear()
+  await Promise.allSettled(agents.map((agent) => (force ? agent.destroy() : agent.close())))
+}
 
 let _cachedSystemProxy: string | null = null
 let _systemProxyCacheTime = 0
@@ -115,7 +149,9 @@ export function getSystemProxy(): string | null {
       }
       // macOS 仅配 SOCKS 时 undici 不支持，静默回退直连（safeCreateProxyAgent 也会兜底）
     }
-  } catch { /* 检测失败静默回退直连 */ }
+  } catch {
+    /* 检测失败静默回退直连 */
+  }
   _cachedSystemProxy = null
   _systemProxyCacheTime = now
   return null
@@ -131,9 +167,7 @@ export function getSystemProxy(): string | null {
  * URL 无效或协议无法支持时返回 undefined，让调用方回退直连，
  * 而不会让异常向上传播阻塞业务流程。
  */
-export function safeCreateProxyAgent(
-  proxyUrl: string | null | undefined
-): Dispatcher | undefined {
+export function safeCreateProxyAgent(proxyUrl: string | null | undefined): Dispatcher | undefined {
   if (!proxyUrl) return undefined
 
   // 校验 URL
@@ -158,7 +192,12 @@ export function safeCreateProxyAgent(
   }
 
   // SOCKS 走自定义 connect
-  if (protocol === 'socks5:' || protocol === 'socks5h:' || protocol === 'socks4:' || protocol === 'socks4a:') {
+  if (
+    protocol === 'socks5:' ||
+    protocol === 'socks5h:' ||
+    protocol === 'socks4:' ||
+    protocol === 'socks4a:'
+  ) {
     try {
       return createSocksDispatcher(u)
     } catch (err) {
@@ -176,51 +215,102 @@ export function safeCreateProxyAgent(
  * 流程：socks.createConnection 建立 TCP 隧道 → 如目标是 https 再 TLS 升级 → 把 socket 交给 undici
  */
 function createSocksDispatcher(u: URL): Agent {
-  const isSocks5 = u.protocol === 'socks5:' || u.protocol === 'socks5h:'
-  const type: 4 | 5 = isSocks5 ? 5 : 4
-  const proxyHost = u.hostname
-  const proxyPort = Number(u.port) || 1080
-  const userId = u.username ? decodeURIComponent(u.username) : undefined
-  const password = u.password ? decodeURIComponent(u.password) : undefined
+  return new SocksProxyAgent(u)
+}
 
-  // undici Agent.connect callback 的类型签名是 (err: Error, socket: null) | (err: null, socket: Socket)
-  // 用宽松 any 包装避免严格类型不匹配，运行时行为完全正确
-  return new Agent({
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    connect: ((options: any, callback: any): void => {
-      const targetHost = options.hostname || options.host || ''
-      const targetPort = Number(options.port) || (options.protocol === 'https:' ? 443 : 80)
+/** Own sockets before SOCKS/TLS handshakes finish, when Undici cannot yet see them. */
+class SocksProxyAgent extends Agent {
+  private readonly pendingSockets: Set<net.Socket>
 
-      // 动态导入 socks 库
-      let SocksClient: typeof import('socks').SocksClient
-      try {
-        SocksClient = require('socks').SocksClient
-      } catch (err) {
-        callback(err as Error, null)
-        return
-      }
-
-      void SocksClient.createConnection({
-        proxy: { host: proxyHost, port: proxyPort, type, userId, password },
-        command: 'connect',
-        destination: { host: targetHost, port: targetPort }
-      })
-        .then(({ socket }) => {
-          // HTTPS 需要 TLS 升级
-          if (options.protocol === 'https:') {
-            const tlsSocket = tls.connect({
-              socket,
-              servername: options.servername || targetHost,
-              rejectUnauthorized: options.rejectUnauthorized ?? false
-            })
-            tlsSocket.once('secureConnect', () => callback(null, tlsSocket))
-            tlsSocket.once('error', (err) => callback(err, null))
-          } else {
-            callback(null, socket)
+  constructor(url: URL) {
+    const pending = new Set<net.Socket>()
+    const type: 4 | 5 = url.protocol === 'socks5:' || url.protocol === 'socks5h:' ? 5 : 4
+    const proxy = {
+      host: url.hostname,
+      port: Number(url.port) || 1080,
+      type,
+      userId: url.username ? decodeURIComponent(url.username) : undefined,
+      password: url.password ? decodeURIComponent(url.password) : undefined
+    }
+    super({
+      connect: (options, callback): void => {
+        const host = options.hostname || options.host || ''
+        const port = Number(options.port) || (options.protocol === 'https:' ? 443 : 80)
+        const socket = net.connect(proxy.port, proxy.host)
+        pending.add(socket)
+        let encrypted: tls.TLSSocket | undefined
+        let finished = false
+        const timer = setTimeout(() => fail(new Error('SOCKS connection timed out')), 30000)
+        const finish = (error?: Error, connected?: net.Socket): void => {
+          if (finished) return
+          finished = true
+          clearTimeout(timer)
+          pending.delete(socket)
+          socket.removeListener('error', fail)
+          socket.removeListener('close', closed)
+          if (encrypted) {
+            pending.delete(encrypted)
+            encrypted.removeListener('error', fail)
+            encrypted.removeListener('close', closed)
           }
+          if (error || !connected) {
+            socket.destroy()
+            encrypted?.destroy()
+            callback(error || new Error('SOCKS connection closed'), null)
+          } else callback(null, connected)
+        }
+        const fail = (error: Error): void => finish(error)
+        const closed = (): void => fail(new Error('SOCKS connection closed'))
+        socket.once('error', fail)
+        socket.once('close', closed)
+        socket.once('connect', () => {
+          void SocksClient.createConnection({
+            existing_socket: socket,
+            proxy,
+            command: 'connect',
+            destination: { host, port },
+            timeout: 30000
+          })
+            .then(({ socket: tunnel }) => {
+              if (finished) {
+                tunnel.destroy()
+                return
+              }
+              tunnel.setTimeout(0)
+              if (options.protocol !== 'https:') {
+                finish(undefined, tunnel)
+                return
+              }
+              encrypted = tls.connect({
+                socket: tunnel,
+                servername: net.isIP(options.servername || host)
+                  ? undefined
+                  : options.servername || host,
+                rejectUnauthorized: false
+              })
+              pending.add(encrypted)
+              encrypted.once('error', fail)
+              encrypted.once('close', closed)
+              encrypted.once('secureConnect', () => finish(undefined, encrypted))
+            })
+            .catch(fail)
         })
-        .catch((err: Error) => callback(err, null))
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    }) as any
-  })
+      }
+    })
+    this.pendingSockets = pending
+  }
+
+  destroy(error: Error | null, callback: () => void): void
+  destroy(callback: () => void): void
+  destroy(error?: Error | null): Promise<void>
+  destroy(
+    errorOrCallback?: Error | null | (() => void),
+    callback?: () => void
+  ): Promise<void> | void {
+    for (const socket of this.pendingSockets) socket.destroy()
+    this.pendingSockets.clear()
+    if (typeof errorOrCallback === 'function') return super.destroy(errorOrCallback)
+    if (callback) return super.destroy(errorOrCallback || null, callback)
+    return super.destroy(errorOrCallback || null)
+  }
 }

@@ -1,5 +1,13 @@
+import {
+  DEFAULT_KIRO_SETTINGS as defaultSettings,
+  type KiroSettings,
+  type McpServer,
+  type McpConfig,
+  type KiroFileResult,
+  type KiroModelOption
+} from '../../../../shared/kiroSettings'
 import { PageHeader } from '../layout/PageHeader'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Button, Toggle, Select } from '../ui'
 import { useTranslation } from '@/hooks/useTranslation'
 import { SteeringEditor, McpServerEditor } from '../kiro'
@@ -22,37 +30,6 @@ import {
   Terminal
 } from 'lucide-react'
 
-interface KiroSettings {
-  agentAutonomy: string
-  modelSelection: string
-  enableDebugLogs: boolean
-  enableTabAutocomplete: boolean
-  enableCodebaseIndexing: boolean
-  usageSummary: boolean
-  codeReferences: boolean
-  configureMCP: string
-  trustedCommands: string[]
-  trustedTools: Record<string, boolean>
-  commandDenylist: string[]
-  ignoreFiles: string[]
-  mcpApprovedEnvVars: string[]
-  // 通知设置
-  notificationsActionRequired: boolean
-  notificationsFailure: boolean
-  notificationsSuccess: boolean
-  notificationsBilling: boolean
-}
-
-interface McpServer {
-  command: string
-  args?: string[]
-  env?: Record<string, string>
-}
-
-interface McpConfig {
-  mcpServers: Record<string, McpServer>
-}
-
 // 默认禁止的危险命令
 const defaultDenyCommands = [
   'rm -rf *',
@@ -73,27 +50,6 @@ const defaultDenyCommands = [
   'init 0',
   'init 6'
 ]
-
-// Kiro 默认设置（与 Kiro IDE 内置默认值一致）
-const defaultSettings: KiroSettings = {
-  agentAutonomy: 'Autopilot',
-  modelSelection: 'auto',
-  enableDebugLogs: false,
-  enableTabAutocomplete: false,
-  enableCodebaseIndexing: false,
-  usageSummary: true,
-  codeReferences: false,
-  configureMCP: 'Enabled',
-  trustedCommands: [],
-  trustedTools: {},
-  commandDenylist: [],
-  ignoreFiles: [],
-  mcpApprovedEnvVars: [],
-  notificationsActionRequired: true,
-  notificationsFailure: false,
-  notificationsSuccess: false,
-  notificationsBilling: true
-}
 
 const autonomyOptionsZh = [
   { value: 'Autopilot', label: 'Autopilot (自动执行)', description: 'Agent 自动执行任务' },
@@ -130,9 +86,7 @@ export function KiroSettingsPage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [availableModels, setAvailableModels] = useState<
-    Array<{ id: string; name: string; description: string }>
-  >([])
+  const [availableModels, setAvailableModels] = useState<KiroModelOption[]>([])
   const [loadingModels, setLoadingModels] = useState(false)
 
   const [expandedSections, setExpandedSections] = useState({
@@ -147,66 +101,99 @@ export function KiroSettingsPage() {
   const [newDenyCommand, setNewDenyCommand] = useState('')
   const [editingFile, setEditingFile] = useState<string | null>(null)
   const [editingMcp, setEditingMcp] = useState<{ name?: string; server?: McpServer } | null>(null)
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
   const autonomyOptions = isEn ? autonomyOptionsEn : autonomyOptionsZh
   const mcpOptions = isEn ? mcpOptionsEn : mcpOptionsZh
 
+  const mounted = useRef(false)
+  const versions = useRef({ settings: 0, mcp: 0, steering: 0, models: 0 })
+  const savedSettings = useRef(defaultSettings)
+  const latestSettings = useRef(settings)
+  latestSettings.current = settings
+  const savePending = useRef(false)
+  const [settingsReady, setSettingsReady] = useState(false)
+
   useEffect(() => {
-    loadKiroSettings()
-    loadAvailableModels()
+    mounted.current = true
+    void loadKiroSettings()
+    void loadAvailableModels()
+    return () => {
+      mounted.current = false
+    }
   }, [])
 
-  const loadAvailableModels = async () => {
+  const loadAvailableModels = async (force = false) => {
+    const version = ++versions.current.models
     setLoadingModels(true)
     try {
-      const result = await window.api.getKiroAvailableModels()
-      if (result.models && result.models.length > 0) {
-        setAvailableModels(result.models)
-      }
+      const result = await window.api.getKiroAvailableModels(force)
+      if (!mounted.current || version !== versions.current.models) return
+      if (result.error) setError(result.error)
+      if (!result.error) setAvailableModels(result.models)
     } catch (err) {
-      console.error('Failed to load models:', err)
+      if (mounted.current && version === versions.current.models)
+        setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLoadingModels(false)
+      if (mounted.current && version === versions.current.models) setLoadingModels(false)
     }
   }
 
-  const loadKiroSettings = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const result = await window.api.getKiroSettings()
-      if (result.settings) {
-        // 过滤掉 undefined 值，避免覆盖默认值
-        const filteredSettings = Object.fromEntries(
-          Object.entries(result.settings).filter(([, v]) => v !== undefined)
-        ) as Partial<KiroSettings>
-        setSettings({ ...defaultSettings, ...filteredSettings })
-      }
-      if (result.mcpConfig) {
-        setMcpConfig(result.mcpConfig as McpConfig)
-      }
-      if (result.steeringFiles) {
-        setSteeringFiles(result.steeringFiles)
-      }
-    } catch (err) {
-      setError(isEn ? 'Failed to load Kiro settings' : '加载 Kiro 设置失败')
-      console.error(err)
-    } finally {
-      setLoading(false)
+  const loadKiroSettings = async (section?: 'settings' | 'mcp' | 'steering') => {
+    const resources = section ? [section] : (['settings', 'mcp', 'steering'] as const)
+    const requestVersions = new Map(resources.map((key) => [key, ++versions.current[key]] as const))
+    if (!section) {
+      setLoading(true)
+      setSettingsReady(false)
     }
+    setError(null)
+    const current = (key: 'settings' | 'mcp' | 'steering') =>
+      mounted.current && requestVersions.get(key) === versions.current[key]
+    try {
+      const result = await window.api.getKiroSettings(section)
+      if (result.settings && current('settings')) {
+        const loaded = { ...defaultSettings, ...result.settings }
+        savedSettings.current = loaded
+        setSettings(loaded)
+        setSettingsReady(true)
+      }
+      if (result.mcpConfig && current('mcp')) setMcpConfig(result.mcpConfig)
+      if (result.steeringFiles && current('steering')) setSteeringFiles(result.steeringFiles)
+      if (result.error && resources.some((key) => current(key))) setError(result.error)
+    } catch (err) {
+      if (resources.some((key) => current(key)))
+        setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (!section && current('settings')) setLoading(false)
+    }
+  }
+
+  const refreshSettings = async () => {
+    if (savePending.current) return
+    if (
+      JSON.stringify(latestSettings.current) !== JSON.stringify(savedSettings.current) &&
+      !confirm(isEn ? 'Discard unsaved settings and reload?' : '放弃未保存的设置并重新加载？')
+    )
+      return
+    await loadKiroSettings()
   }
 
   const saveSettings = async () => {
+    if (savePending.current || !settingsReady) return
+    savePending.current = true
     setSaving(true)
     setError(null)
+    const snapshot = latestSettings.current
     try {
-      await window.api.saveKiroSettings(settings as unknown as Record<string, unknown>)
+      const result = await window.api.saveKiroSettings(snapshot)
+      if (!result.success)
+        throw new Error(result.error || (isEn ? 'Failed to save settings' : '保存设置失败'))
+      if (mounted.current) savedSettings.current = snapshot
     } catch (err) {
-      setError(isEn ? 'Failed to save settings' : '保存设置失败')
-      console.error(err)
+      if (mounted.current) setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setSaving(false)
+      savePending.current = false
+      if (mounted.current) setSaving(false)
     }
   }
 
@@ -214,53 +201,27 @@ export function KiroSettingsPage() {
     setExpandedSections((prev) => ({ ...prev, [section]: !prev[section] }))
   }
 
-  const openKiroSettingsFile = async () => {
-    // 打开 Kiro settings.json 文件
+  const runFileAction = async (action: () => Promise<KiroFileResult>) => {
     try {
-      await window.api.openKiroSettingsFile()
+      const result = await action()
+      if (!result.success && !result.cancelled)
+        throw new Error(result.error || (isEn ? 'Operation failed' : '操作失败'))
+      return result.success
     } catch (err) {
-      console.error(err)
+      if (mounted.current) setError(err instanceof Error ? err.message : String(err))
+      return false
     }
   }
-
-  const openMcpConfig = async (type: 'user' | 'workspace') => {
-    try {
-      await window.api.openKiroMcpConfig(type)
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  const openSteeringFolder = async () => {
-    try {
-      await window.api.openKiroSteeringFolder()
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  const openSteeringFile = (filename: string) => {
-    setEditingFile(filename)
-  }
-
-  const openSteeringFileExternal = async (filename: string) => {
-    try {
-      await window.api.openKiroSteeringFile(filename)
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
+  const openKiroSettingsFile = () => runFileAction(() => window.api.openKiroSettingsFile())
+  const openMcpConfig = (type: 'user' | 'workspace') =>
+    runFileAction(() => window.api.openKiroMcpConfig(type))
+  const openSteeringFolder = () => runFileAction(() => window.api.openKiroSteeringFolder())
+  const openSteeringFile = (filename: string) => setEditingFile(filename)
+  const openSteeringFileExternal = (filename: string) =>
+    runFileAction(() => window.api.openKiroSteeringFile(filename))
   const createDefaultRules = async () => {
-    try {
-      const result = await window.api.createKiroDefaultRules()
-      if (result.success) {
-        // 重新加载设置以获取新创建的文件
-        await loadKiroSettings()
-      }
-    } catch (err) {
-      console.error(err)
-    }
+    if (await runFileAction(() => window.api.createKiroDefaultRules()))
+      await loadKiroSettings('steering')
   }
 
   const deleteSteeringFile = async (filename: string) => {
@@ -276,7 +237,7 @@ export function KiroSettingsPage() {
     try {
       const result = await window.api.deleteKiroSteeringFile(filename)
       if (result.success) {
-        await loadKiroSettings()
+        await loadKiroSettings('steering')
       } else {
         setError(result.error || (isEn ? 'Failed to delete file' : '删除文件失败'))
       }
@@ -293,7 +254,7 @@ export function KiroSettingsPage() {
     try {
       const result = await window.api.deleteMcpServer(name)
       if (result.success) {
-        await loadKiroSettings()
+        await loadKiroSettings('mcp')
       } else {
         setError(result.error || (isEn ? 'Failed to delete server' : '删除服务器失败'))
       }
@@ -320,7 +281,7 @@ export function KiroSettingsPage() {
     }))
   }
 
-  const addDenyCommand = () => {
+  const addDenyCommand = (): void => {
     if (newDenyCommand.trim()) {
       setSettings((prev) => ({
         ...prev,
@@ -330,7 +291,7 @@ export function KiroSettingsPage() {
     }
   }
 
-  const addDefaultDenyCommands = () => {
+  const addDefaultDenyCommands = (): void => {
     setSettings((prev) => {
       // 过滤掉已存在的命令
       const newCommands = defaultDenyCommands.filter((cmd) => !prev.commandDenylist.includes(cmd))
@@ -341,11 +302,18 @@ export function KiroSettingsPage() {
     })
   }
 
-  const removeDenyCommand = (index: number) => {
+  const removeDenyCommand = (index: number): void => {
     setSettings((prev) => ({
       ...prev,
       commandDenylist: prev.commandDenylist.filter((_, i) => i !== index)
     }))
+  }
+
+  const addTrustedTool = (): void => {
+    const name = newTrustedToolName.trim()
+    if (!name) return
+    setSettings((prev) => ({ ...prev, trustedTools: { ...prev.trustedTools, [name]: true } }))
+    setNewTrustedToolName('')
   }
 
   if (loading) {
@@ -371,7 +339,13 @@ export function KiroSettingsPage() {
         }
         actions={
           <div className="ui-toolbar">
-            <Button variant="outline" size="sm" onClick={loadKiroSettings} className="bg-card">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={refreshSettings}
+              disabled={saving}
+              className="bg-card"
+            >
               <RefreshCw className="h-4 w-4 mr-0" />
               {isEn ? 'Refresh' : '刷新'}
             </Button>
@@ -379,7 +353,7 @@ export function KiroSettingsPage() {
               <ExternalLink className="h-4 w-4 mr-0" />
               {isEn ? 'Open File' : '打开设置文件'}
             </Button>
-            <Button size="sm" onClick={saveSettings} disabled={saving}>
+            <Button size="sm" onClick={saveSettings} disabled={saving || !settingsReady}>
               <Save className="h-4 w-4 mr-0" />
               {saving ? (isEn ? 'Saving...' : '保存中...') : isEn ? 'Save' : '保存设置'}
             </Button>
@@ -470,7 +444,7 @@ export function KiroSettingsPage() {
                   <Button
                     variant="ghost"
                     size="icon"
-                    onClick={loadAvailableModels}
+                    onClick={() => loadAvailableModels(true)}
                     disabled={loadingModels}
                     title={isEn ? 'Refresh models' : '刷新模型列表'}
                   >
@@ -706,13 +680,17 @@ export function KiroSettingsPage() {
                         <div className="min-w-0 flex-1 break-all">
                           <p className="font-medium text-body">{name}</p>
                           <p className="text-caption text-muted-foreground font-mono">
-                            {server.command}
+                            {server.command || server.url || ''}
                           </p>
                         </div>
                         <div className="flex shrink-0 gap-2">
                           <button
                             className="flex shrink-0 items-center justify-center hover:bg-muted transition-colors h-control w-control p-0 rounded-control [&_svg]:size-4"
-                            onClick={() => setEditingMcp({ name, server })}
+                            onClick={() =>
+                              server.command
+                                ? setEditingMcp({ name, server })
+                                : openMcpConfig('user')
+                            }
                             title={isEn ? 'Edit' : '编辑'}
                           >
                             <Edit className="h-4 w-4 text-primary" />
@@ -948,34 +926,12 @@ export function KiroSettingsPage() {
                       onChange={(e) => setNewTrustedToolName(e.target.value)}
                       placeholder={isEn ? 'Tool name' : '工具名称'}
                       className="flex-1 border bg-background text-body min-w-0 rounded-control border-input bg-card px-2.5 focus:outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/20 h-control py-1"
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' && newTrustedToolName.trim()) {
-                          setSettings((prev) => ({
-                            ...prev,
-                            trustedTools: {
-                              ...prev.trustedTools,
-                              [newTrustedToolName.trim()]: true
-                            }
-                          }))
-                          setNewTrustedToolName('')
-                        }
-                      }}
+                      onKeyDown={(e) => e.key === 'Enter' && addTrustedTool()}
                     />
                     <Button
                       variant="outline"
                       size="icon"
-                      onClick={() => {
-                        if (newTrustedToolName.trim()) {
-                          setSettings((prev) => ({
-                            ...prev,
-                            trustedTools: {
-                              ...prev.trustedTools,
-                              [newTrustedToolName.trim()]: true
-                            }
-                          }))
-                          setNewTrustedToolName('')
-                        }
-                      }}
+                      onClick={addTrustedTool}
                       title={isEn ? 'Add' : '添加'}
                     >
                       <Plus className="h-4 w-4" />
@@ -1049,9 +1005,9 @@ export function KiroSettingsPage() {
         {/* Steering 文件编辑器 */}
         {editingFile && (
           <SteeringEditor
+            key={editingFile}
             filename={editingFile}
             onClose={() => setEditingFile(null)}
-            onSaved={loadKiroSettings}
           />
         )}
 
@@ -1061,7 +1017,9 @@ export function KiroSettingsPage() {
             serverName={editingMcp.name}
             server={editingMcp.server}
             onClose={() => setEditingMcp(null)}
-            onSaved={loadKiroSettings}
+            onSaved={() => {
+              void loadKiroSettings('mcp')
+            }}
           />
         )}
       </div>

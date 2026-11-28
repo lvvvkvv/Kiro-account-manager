@@ -1,4 +1,5 @@
-import { useRef, useState } from 'react'
+import { useShallow } from 'zustand/react/shallow'
+import { useRef, useState, useMemo } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -69,17 +70,29 @@ export function AccountList({ onAddAccount, onEditAccount }: AccountListProps): 
     deselectAll,
     setFilter,
     setActiveGroupTab
-  } = useAccountsStore()
+  } = useAccountsStore(
+    useShallow((state) => ({
+      accounts: state.accounts,
+      getFilteredAccounts: state.getFilteredAccounts,
+      tags: state.tags,
+      groups: state.groups,
+      selectedIds: state.selectedIds,
+      checkAccountStatus: state.checkAccountStatus,
+      selectAll: state.selectAll,
+      deselectAll: state.deselectAll,
+      setFilter: state.setFilter,
+      setActiveGroupTab: state.setActiveGroupTab
+    }))
+  )
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
-  const accounts = getFilteredAccounts()
-  const selectedInView = accounts.filter((account) => selectedIds.has(account.id)).length
+  const accounts = useAccountsStore((state) => state.getFilteredAccounts())
+  const selectedInView = useMemo(
+    () => accounts.reduce((count, account) => count + Number(selectedIds.has(account.id)), 0),
+    [accounts, selectedIds]
+  )
   const allSelected = accounts.length > 0 && selectedInView === accounts.length
-
-  const handleShowDetail = (account: Account): void => {
-    setDetailAccount(account)
-  }
 
   const handleRefreshDetail = async (): Promise<void> => {
     if (!detailAccount) return
@@ -172,8 +185,8 @@ export function AccountList({ onAddAccount, onEditAccount }: AccountListProps): 
                     isSelected={selectedIds.has(account.id)}
                     position={virtualRow.index + 1}
                     total={accounts.length}
-                    onEdit={() => onEditAccount(account)}
-                    onShowDetail={() => handleShowDetail(account)}
+                    onEdit={onEditAccount}
+                    onShowDetail={setDetailAccount}
                   />
                 </div>
               )

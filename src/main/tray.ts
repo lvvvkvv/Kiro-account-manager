@@ -1,6 +1,14 @@
 import type { AppUpdateState } from '../shared/update'
 // 系统托盘模块
-import { Tray, Menu, nativeImage, app, BrowserWindow, dialog, MenuItemConstructorOptions, NativeImage } from 'electron'
+import {
+  Tray,
+  Menu,
+  nativeImage,
+  app,
+  dialog,
+  MenuItemConstructorOptions,
+  NativeImage
+} from 'electron'
 import { join } from 'path'
 
 // 托盘实例
@@ -22,36 +30,36 @@ function getTrayIconDir(): string {
 // 图标名称到文件名的映射
 const ICON_FILE_MAP: Record<string, string> = {
   // 应用图标
-  'app': 'icon.png',
+  app: 'icon.png',
   // 状态图标
   'status-running': '运行状态.png',
   'status-stopped': '停止状态.png',
   // 菜单图标
-  'mail': '当前账户.png',
-  'refresh': '刷新.png',
-  'switchAccount': '切换.png',
-  'copy': '复制.png',
-  'window': '弹出窗口.png',
-  'logout': '退出.png',
-  'play': '播放.png',
-  'stop': '停止状态.png',
-  'check': '已勾选.png',
-  'warning': '警告.png',
-  'usage': '用量.png',
-  'requests': '请求.png'
+  mail: '当前账户.png',
+  refresh: '刷新.png',
+  switchAccount: '切换.png',
+  copy: '复制.png',
+  window: '弹出窗口.png',
+  logout: '退出.png',
+  play: '播放.png',
+  stop: '停止状态.png',
+  check: '已勾选.png',
+  warning: '警告.png',
+  usage: '用量.png',
+  requests: '请求.png'
 }
 
 // 从文件加载图标
 function loadIconFromFile(iconKey: string): NativeImage {
   const cached = menuIcons.get(iconKey)
   if (cached) return cached
-  
+
   const fileName = ICON_FILE_MAP[iconKey]
   if (!fileName) {
     console.warn(`[Tray] Unknown icon key: ${iconKey}`)
     return nativeImage.createEmpty()
   }
-  
+
   const iconPath = join(getTrayIconDir(), fileName)
   try {
     const icon = nativeImage.createFromPath(iconPath)
@@ -76,7 +84,7 @@ function getMenuIcon(name: string): NativeImage {
 }
 
 // 当前账户信息（用于托盘菜单显示）
-interface TrayAccountInfo {
+export interface TrayAccountInfo {
   id: string
   email: string
   idp: string
@@ -105,10 +113,13 @@ interface TrayCallbacks {
   onSwitchAccount: () => Promise<void>
   onToggleProxy: () => Promise<void>
   getProxyStatus: () => { running: boolean; port: number }
-  getCurrentAccount: () => TrayAccountInfo | null
-  getAccountList: () => TrayAccountInfo[]
   getProxyStats: () => { totalRequests: number; successRequests: number; failedRequests: number }
-  getSessionStats: () => { totalRequests: number; successRequests: number; failedRequests: number; startTime: number }
+  getSessionStats: () => {
+    totalRequests: number
+    successRequests: number
+    failedRequests: number
+    startTime: number
+  }
 }
 
 let callbacks: TrayCallbacks | null = null
@@ -142,7 +153,7 @@ function buildTrayMenu(): Menu {
   const menuTemplate: MenuItemConstructorOptions[] = []
 
   const isEn = currentLanguage === 'en'
-  
+
   // 应用标题
   menuTemplate.push({
     label: `Kiro ${isEn ? 'Account Manager' : '账号管理器'} v${app.getVersion()}`,
@@ -155,25 +166,34 @@ function buildTrayMenu(): Menu {
   if (callbacks) {
     const proxyStatus = callbacks.getProxyStatus()
     menuTemplate.push({
-      label: proxyStatus.running 
-        ? (isEn ? `Proxy Running (Port ${proxyStatus.port})` : `代理服务运行中 (端口 ${proxyStatus.port})`) 
-        : (isEn ? 'Proxy Stopped' : '代理服务已停止'),
+      label: proxyStatus.running
+        ? isEn
+          ? `Proxy Running (Port ${proxyStatus.port})`
+          : `代理服务运行中 (端口 ${proxyStatus.port})`
+        : isEn
+          ? 'Proxy Stopped'
+          : '代理服务已停止',
       icon: getStatusIcon(proxyStatus.running),
       enabled: false
     })
     menuTemplate.push({
-      label: proxyStatus.running ? (isEn ? 'Stop Proxy' : '停止代理服务') : (isEn ? 'Start Proxy' : '启动代理服务'),
+      label: proxyStatus.running
+        ? isEn
+          ? 'Stop Proxy'
+          : '停止代理服务'
+        : isEn
+          ? 'Start Proxy'
+          : '启动代理服务',
       icon: getMenuIcon(proxyStatus.running ? 'stop' : 'play'),
       click: async () => {
-        await callbacks?.onToggleProxy()
-        updateTrayMenu()
+        await runTrayAction(callbacks?.onToggleProxy)
       }
     })
     menuTemplate.push({ type: 'separator' })
   }
 
   // 当前账户信息
-  const account = callbacks?.getCurrentAccount() || currentAccount
+  const account = currentAccount
   if (account) {
     menuTemplate.push({
       label: isEn ? 'Current Account' : '当前账户',
@@ -185,16 +205,16 @@ function buildTrayMenu(): Menu {
       enabled: false
     })
     menuTemplate.push({
-      label: isEn 
+      label: isEn
         ? `   Identity: ${account.idp} | ${account.subscription || 'Unknown'} | ${account.status === 'active' ? 'Active' : account.status}`
         : `   身份: ${account.idp} | ${account.subscription || '未知'} | ${account.status === 'active' ? '活跃' : account.status}`,
       icon: getMenuIcon(account.status === 'active' ? 'check' : 'warning'),
       enabled: false
     })
-    
+
     if (account.usage) {
       menuTemplate.push({
-        label: isEn 
+        label: isEn
           ? `   Usage: ${account.usage.usedCredits} / ${account.usage.totalCredits} Credits`
           : `   用量: ${account.usage.usedCredits} / ${account.usage.totalCredits} Credits`,
         icon: getMenuIcon('usage'),
@@ -202,17 +222,26 @@ function buildTrayMenu(): Menu {
       })
     }
     // 从主进程获取实时统计数据（总计和会话）
-    const proxyStats = callbacks?.getProxyStats() || { totalRequests: 0, successRequests: 0, failedRequests: 0 }
-    const sessionStats = callbacks?.getSessionStats() || { totalRequests: 0, successRequests: 0, failedRequests: 0, startTime: 0 }
+    const proxyStats = callbacks?.getProxyStats() || {
+      totalRequests: 0,
+      successRequests: 0,
+      failedRequests: 0
+    }
+    const sessionStats = callbacks?.getSessionStats() || {
+      totalRequests: 0,
+      successRequests: 0,
+      failedRequests: 0,
+      startTime: 0
+    }
     menuTemplate.push({
-      label: isEn 
+      label: isEn
         ? `   Total: ${proxyStats.totalRequests} (✓${proxyStats.successRequests} ✗${proxyStats.failedRequests})`
         : `   总计: ${proxyStats.totalRequests} (成功${proxyStats.successRequests} 失败${proxyStats.failedRequests})`,
       icon: getMenuIcon('requests'),
       enabled: false
     })
     menuTemplate.push({
-      label: isEn 
+      label: isEn
         ? `   Session: ${sessionStats.totalRequests} (✓${sessionStats.successRequests} ✗${sessionStats.failedRequests})`
         : `   本次: ${sessionStats.totalRequests} (成功${sessionStats.successRequests} 失败${sessionStats.failedRequests})`,
       icon: getMenuIcon('requests'),
@@ -233,20 +262,20 @@ function buildTrayMenu(): Menu {
     label: isEn ? 'Refresh Account Info' : '刷新账户信息',
     icon: getMenuIcon('refresh'),
     click: async () => {
-      await callbacks?.onRefreshAccount()
-      updateTrayMenu()
+      await runTrayAction(callbacks?.onRefreshAccount)
     }
   })
 
-  const accounts = callbacks?.getAccountList() || accountList
-  const activeAccounts = accounts.filter(a => a.status === 'active')
+  const accounts = accountList
+  const activeAccounts = accounts.filter((a) => a.status === 'active')
   menuTemplate.push({
-    label: isEn ? `Switch to Next Account (${activeAccounts.length} available)` : `切换到下一个账户 (${activeAccounts.length} 个可用)`,
+    label: isEn
+      ? `Switch to Next Account (${activeAccounts.length} available)`
+      : `切换到下一个账户 (${activeAccounts.length} 个可用)`,
     icon: getMenuIcon('switchAccount'),
     enabled: activeAccounts.length > 1,
     click: async () => {
-      await callbacks?.onSwitchAccount()
-      updateTrayMenu()
+      await runTrayAction(callbacks?.onSwitchAccount)
     }
   })
 
@@ -280,11 +309,19 @@ function buildTrayMenu(): Menu {
   const update = callbacks?.getUpdateState()
   if (update?.ready) {
     menuTemplate.push({
-      label: isEn ? `Restart to update to v${update.ready.version}` : `重启并更新到 v${update.ready.version}`,
+      label: isEn
+        ? `Restart to update to v${update.ready.version}`
+        : `重启并更新到 v${update.ready.version}`,
       enabled: !update.installing,
-      click: () => { void callbacks?.onInstallUpdate() }
+      click: () => {
+        void callbacks?.onInstallUpdate()
+      }
     })
-    if (update.routingInUse) menuTemplate.push({ label: isEn ? 'Restart interrupts proxy requests' : '重启将中断反代请求', enabled: false })
+    if (update.routingInUse)
+      menuTemplate.push({
+        label: isEn ? 'Restart interrupts proxy requests' : '重启将中断反代请求',
+        enabled: false
+      })
   }
 
   // 退出应用
@@ -300,10 +337,25 @@ function buildTrayMenu(): Menu {
 }
 
 // 更新托盘菜单
+let menuTimer: ReturnType<typeof setTimeout> | undefined
 export function updateTrayMenu(): void {
-  if (tray) {
-    tray.setContextMenu(buildTrayMenu())
+  if (!tray || menuTimer) return
+  menuTimer = setTimeout(() => {
+    menuTimer = undefined
+    if (tray) tray.setContextMenu(buildTrayMenu())
+  }, 16)
+}
+async function runTrayAction(action: (() => Promise<void>) | undefined): Promise<void> {
+  try {
+    await action?.()
+  } catch (error) {
+    await dialog.showMessageBox({
+      type: 'error',
+      message: '操作失败 / Operation failed',
+      detail: String(error)
+    })
   }
+  updateTrayMenu()
 }
 
 // 更新当前账户信息
@@ -342,7 +394,7 @@ export function createTray(cbs: TrayCallbacks): Tray | null {
   try {
     const iconPath = getTrayIconPath()
     let icon = nativeImage.createFromPath(iconPath)
-    
+
     // macOS 需要设置为 Template 图标
     if (process.platform === 'darwin') {
       icon = icon.resize({ width: 16, height: 16 })
@@ -378,6 +430,8 @@ export function createTray(cbs: TrayCallbacks): Tray | null {
 
 // 销毁托盘
 export function destroyTray(): void {
+  clearTimeout(menuTimer)
+  menuTimer = undefined
   if (tray) {
     tray.destroy()
     tray = null
@@ -389,24 +443,6 @@ export function destroyTray(): void {
 // 获取托盘实例
 export function getTray(): Tray | null {
   return tray
-}
-
-// 显示关闭确认对话框
-export async function showCloseConfirmDialog(mainWindow: BrowserWindow): Promise<'minimize' | 'quit' | 'cancel'> {
-  const result = await dialog.showMessageBox(mainWindow, {
-    type: 'question',
-    buttons: ['最小化到托盘', '退出程序', '取消'],
-    defaultId: 0,
-    cancelId: 2,
-    title: '关闭窗口',
-    message: '您想要最小化到系统托盘还是退出程序？',
-    detail: '最小化到托盘后，程序将在后台继续运行，您可以通过点击托盘图标重新打开窗口。',
-    checkboxLabel: '记住我的选择',
-    checkboxChecked: false
-  })
-
-  const actions: ('minimize' | 'quit' | 'cancel')[] = ['minimize', 'quit', 'cancel']
-  return actions[result.response]
 }
 
 // 托盘设置类型

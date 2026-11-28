@@ -1,20 +1,103 @@
 import * as tls from 'tls'
-import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
 import type { SessionClient } from 'tlsclientwrapper'
-import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
+import { getSystemProxy } from '../proxy/systemProxy'
 import { randomEmailPrefix } from './names'
 import { waitProtonOtp } from './proton-mail-window'
+import { checkAborted, sleep as abortableSleep, waitFor, withDeadline } from './async'
+import { RegistrationHttpClient } from './http'
 
 function getRegistrationProxyUrl(): string | undefined {
-  return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
+  return (
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    getSystemProxy() ||
+    undefined
+  )
 }
 
-async function proxyFetch(url: string, options?: RequestInit): Promise<Response> {
-  const agent = safeCreateProxyAgent(getRegistrationProxyUrl())
-  if (agent) {
-    return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+const mailHttp = new RegistrationHttpClient()
+
+async function proxyJSON(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 15000
+): Promise<Record<string, unknown>> {
+  return mailHttp.read(
+    url,
+    getRegistrationProxyUrl(),
+    options,
+    async (response) => {
+      const value: unknown = await response.json()
+      if (!response.ok) throw new Error(`邮箱请求失败: HTTP ${response.status}`)
+      if (!value || typeof value !== 'object') throw new Error('邮箱响应格式无效')
+      return value as Record<string, unknown>
+    },
+    timeoutMs
+  )
+}
+
+// Only TempMail shares API credentials and transport between registrations. GPTmail tokens remain isolated.
+const sharedQueries = new Map<
+  string,
+  {
+    until: number
+    value: Promise<Record<string, unknown>>
+    controller: AbortController
+    waiters: number
+    settled: boolean
   }
-  return await fetch(url, options)
+>()
+function sharedMailJSON(
+  url: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal
+): Promise<Record<string, unknown>> {
+  checkAborted(signal)
+  const key = `${getRegistrationProxyUrl() || ''}\n${url}`
+  let entry = sharedQueries.get(key)
+  if (!entry || entry.until <= Date.now()) {
+    for (const [key, item] of sharedQueries) if (item.until <= Date.now()) sharedQueries.delete(key)
+    if (sharedQueries.size >= 1024) sharedQueries.delete(sharedQueries.keys().next().value!)
+    const controller = new AbortController()
+    entry = {
+      until: Infinity,
+      value: proxyJSON(url, { headers, signal: controller.signal }),
+      controller,
+      waiters: 0,
+      settled: false
+    }
+    sharedQueries.set(key, entry)
+    const current = entry
+    void entry.value.then(
+      () => {
+        current.settled = true
+        current.until = Date.now() + 1000
+        const timer = setTimeout(() => {
+          if (sharedQueries.get(key) === current) sharedQueries.delete(key)
+        }, 1000)
+        timer.unref?.()
+      },
+      () => {
+        current.settled = true
+        if (sharedQueries.get(key) === current) sharedQueries.delete(key)
+      }
+    )
+  }
+  const current = entry
+  current.waiters++
+  return waitFor(current.value, signal).finally(() => {
+    if (--current.waiters === 0 && !current.settled) {
+      if (sharedQueries.get(key) === current) sharedQueries.delete(key)
+      current.controller.abort()
+    }
+  })
+}
+
+function containsAddress(text: string, address: string): boolean {
+  const addresses = text.toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+/g) || []
+  return addresses.some((value) => value.replace(/[.,;]+$/, '') === address.toLowerCase())
 }
 
 // ============ 验证码提取 ============
@@ -30,26 +113,9 @@ export function extractCode(body: string): string {
 // ============ TempEmailService 接口 ============
 
 export interface TempEmailService {
-  create(): Promise<string>
+  create(signal?: AbortSignal): Promise<string>
   /** signal：注册被取消时中断轮询（停止/暂停后立即退出，而非等满 timeout） */
   waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string>
-  getAddress(): string
-}
-
-/** 可被 AbortSignal 中断的 sleep：停止注册时立刻 reject，不再傻等 */
-function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(new Error('注册已取消'))
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    const onAbort = (): void => {
-      clearTimeout(timer)
-      reject(new Error('注册已取消'))
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
 }
 
 // ============ MoEmail 临时邮箱 ============
@@ -88,13 +154,13 @@ export class MoEmailService implements TempEmailService {
     return withScheme
   }
 
-  async create(): Promise<string> {
+  async create(signal?: AbortSignal): Promise<string> {
+    checkAborted(signal)
     const url = `${this.baseURL}/api/mail/create`
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`
 
-    const resp = await proxyFetch(url, { method: 'POST', headers, signal: AbortSignal.timeout(30000) })
-    const data = (await resp.json()) as Record<string, unknown>
+    const data = await proxyJSON(url, { method: 'POST', headers, signal }, 30000)
 
     const addr =
       (data.address as string) ||
@@ -111,35 +177,44 @@ export class MoEmailService implements TempEmailService {
     return addr
   }
 
-  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+  async waitForCode(
+    timeoutSec: number,
+    intervalSec: number,
+    signal?: AbortSignal
+  ): Promise<string> {
     if (!this.address) throw new Error('邮箱地址为空')
 
-    const maxRetries = Math.floor(timeoutSec / intervalSec)
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      if (signal?.aborted) throw new Error('注册已取消')
-      await abortableSleep(intervalSec * 1000, signal)
-      try {
-        const code = await this.fetchCode()
-        if (code) return code
-      } catch (err) {
-        if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] 查询失败:`, err)
-      }
-      if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] 暂无验证码...`)
-    }
-    throw new Error(`等待验证码超时 (${timeoutSec}s)`)
+    return withDeadline(
+      async (signal) => {
+        for (let attempt = 1; ; attempt++) {
+          await abortableSleep(intervalSec * 1000, signal)
+          try {
+            const code = await this.fetchCode(signal)
+            checkAborted(signal)
+            if (code) return code
+          } catch (error) {
+            checkAborted(signal)
+            if (attempt % 5 === 0) console.log('[MoEmail] 查询失败:', error)
+          }
+        }
+      },
+      timeoutSec * 1000,
+      signal,
+      `等待验证码超时 (${timeoutSec}s)`
+    )
   }
 
-  getAddress(): string {
-    return this.address
-  }
-
-  private async fetchCode(): Promise<string> {
+  private async fetchCode(signal?: AbortSignal): Promise<string> {
     const url = `${this.baseURL}/api/mail/messages?address=${this.address}`
     const headers: Record<string, string> = {}
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`
 
-    const resp = await proxyFetch(url, { headers, signal: AbortSignal.timeout(15000) })
-    const raw = await resp.json()
+    const raw = await mailHttp.read(
+      url,
+      getRegistrationProxyUrl(),
+      { headers, signal },
+      (response) => response.json()
+    )
 
     let messages: Array<Record<string, unknown>> = []
     if (Array.isArray(raw)) {
@@ -167,7 +242,7 @@ export class MoEmailService implements TempEmailService {
 export class TempMailPlusService implements TempEmailService {
   private static readonly BASE_URL = 'https://tempmail.plus/api'
 
-  private readonly tmEmail: string   // tempmail.plus 用户名（不含 @mailto.plus）
+  private readonly tmEmail: string // tempmail.plus 用户名（不含 @mailto.plus）
   private readonly epin: string
   /** 支持多域名（用户填多行/逗号/空格分隔），每次 create 随机挑一个，降低单域名被风控关联 */
   private readonly domains: string[]
@@ -188,16 +263,18 @@ export class TempMailPlusService implements TempEmailService {
 
   private get headers(): Record<string, string> {
     return {
-      'accept': 'application/json, text/javascript, */*; q=0.01',
+      accept: 'application/json, text/javascript, */*; q=0.01',
       'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+      'user-agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
       'x-requested-with': 'XMLHttpRequest',
-      'Referer': 'https://tempmail.plus/zh/',
-      'cookie': `email=${encodeURIComponent(this.fullEmail)}`
+      Referer: 'https://tempmail.plus/zh/',
+      cookie: `email=${encodeURIComponent(this.fullEmail)}`
     }
   }
 
-  async create(): Promise<string> {
+  async create(signal?: AbortSignal): Promise<string> {
+    checkAborted(signal)
     const prefix = randomEmailPrefix()
     this.domain = this.domains[Math.floor(Math.random() * this.domains.length)]
     this.address = `${prefix}@${this.domain}`
@@ -209,81 +286,84 @@ export class TempMailPlusService implements TempEmailService {
     return this.address
   }
 
-  getAddress(): string {
-    return this.address
-  }
-
-  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+  async waitForCode(
+    timeoutSec: number,
+    intervalSec: number,
+    signal?: AbortSignal
+  ): Promise<string> {
     if (!this.address) throw new Error('邮箱地址为空')
-    const maxRetries = Math.floor(timeoutSec / intervalSec)
     const checkedIds = new Set<number>()
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      if (signal?.aborted) throw new Error('注册已取消')
-      await abortableSleep(intervalSec * 1000, signal)
-      try {
-        const mails = await this.fetchMailList()
-        if (attempt === 1 || attempt % 5 === 0) {
-          console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 邮件数: ${mails.length}`)
-        }
-        for (const mail of mails) {
-          const mailId = mail.mail_id as number
-          if (checkedIds.has(mailId)) continue
-          checkedIds.add(mailId)
-
-          const detail = await this.fetchMailDetail(mailId)
-          if (!detail) continue
-
-          // 验证收件人匹配
-          const toField = String(detail.to || '').toLowerCase()
-          if (!toField.includes(this.address.toLowerCase())) {
-            console.log(`[TempMailPlus] 收件人不匹配: ${toField} (期望包含: ${this.address})`)
-            continue
-          }
-
-          // 提取验证码
-          const code = this.extractOTP(detail)
-          if (code) {
-            console.log(`[TempMailPlus] 验证码: ${code}`)
-            await this.deleteMail(mailId)
-            return code
-          } else {
-            console.log(`[TempMailPlus] 邮件 ${mailId} 未提取到验证码`)
+    return withDeadline(
+      async (signal) => {
+        for (;;) {
+          await abortableSleep(intervalSec * 1000, signal)
+          try {
+            const mails = await this.fetchMailList(signal)
+            for (const mail of mails) {
+              checkAborted(signal)
+              const id = Number(mail.mail_id)
+              if (!Number.isFinite(id) || checkedIds.has(id)) continue
+              const detail = await this.fetchMailDetail(id, signal)
+              checkAborted(signal)
+              if (!detail) continue // A transient/incomplete response must be tried again.
+              if (!containsAddress(String(detail.to || ''), this.address)) {
+                checkedIds.add(id)
+                continue
+              }
+              const code = this.extractOTP(detail)
+              if (code) {
+                checkAborted(signal)
+                // Deletion is best effort and must not delay returning the already received OTP.
+                void this.deleteMail(id, signal)
+                return code
+              }
+            }
+          } catch (error) {
+            checkAborted(signal)
+            console.log('[TempMailPlus] 查询失败:', error)
           }
         }
-      } catch (err) {
-        console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 查询失败:`, err)
-      }
-      if (attempt % 5 === 0) console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 暂无验证码...`)
-    }
-    throw new Error(`等待验证码超时 (${timeoutSec}s)`)
+      },
+      timeoutSec * 1000,
+      signal,
+      `等待验证码超时 (${timeoutSec}s)`
+    )
   }
 
   private get fullEmail(): string {
     return `${this.tmEmail}@mailto.plus`
   }
 
-  private async fetchMailList(): Promise<Array<Record<string, unknown>>> {
+  private async fetchMailList(signal?: AbortSignal): Promise<Array<Record<string, unknown>>> {
     const url = `${TempMailPlusService.BASE_URL}/mails?email=${encodeURIComponent(this.fullEmail)}&first_id=0&epin=${encodeURIComponent(this.epin)}`
-    const resp = await proxyFetch(url, { headers: this.headers, signal: AbortSignal.timeout(15000) })
-    const data = (await resp.json()) as Record<string, unknown>
+    const data = await sharedMailJSON(url, this.headers, signal)
     if (!data.result) return []
     return (data.mail_list as Array<Record<string, unknown>>) || []
   }
 
-  private async fetchMailDetail(mailId: number): Promise<Record<string, unknown> | null> {
+  private async fetchMailDetail(
+    mailId: number,
+    signal?: AbortSignal
+  ): Promise<Record<string, unknown> | null> {
     const url = `${TempMailPlusService.BASE_URL}/mails/${mailId}?email=${encodeURIComponent(this.fullEmail)}&epin=${encodeURIComponent(this.epin)}`
-    const resp = await proxyFetch(url, { headers: this.headers, signal: AbortSignal.timeout(15000) })
-    const data = (await resp.json()) as Record<string, unknown>
+    const data = await sharedMailJSON(url, this.headers, signal)
     return data.result ? data : null
   }
 
-  private async deleteMail(mailId: number): Promise<void> {
+  private async deleteMail(mailId: number, signal?: AbortSignal): Promise<void> {
     const url = `${TempMailPlusService.BASE_URL}/mails/${mailId}`
     const headers = { ...this.headers, 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8' }
     const body = `email=${encodeURIComponent(this.fullEmail)}&epin=${encodeURIComponent(this.epin)}`
     try {
-      await proxyFetch(url, { method: 'DELETE', headers, body, signal: AbortSignal.timeout(10000) })
+      await mailHttp.read(
+        url,
+        getRegistrationProxyUrl(),
+        { method: 'DELETE', headers, body, signal },
+        async (response) => {
+          await response.arrayBuffer()
+        },
+        10000
+      )
       console.log(`[TempMailPlus] 已删除邮件: ${mailId}`)
     } catch (err) {
       console.log(`[TempMailPlus] 删除邮件失败:`, err)
@@ -396,7 +476,9 @@ export class GptMailService implements TempEmailService {
     getSession: () => SessionClient | null
   }) {
     if (typeof opts.getSession !== 'function') {
-      throw new Error('GPTmail 必须传入 getSession（用于每次取最新 TLS SessionClient 绕过 401 校验）')
+      throw new Error(
+        'GPTmail 必须传入 getSession（用于每次取最新 TLS SessionClient 绕过 401 校验）'
+      )
     }
     this.getSession = opts.getSession
     this.baseURL = GptMailService.normalizeBaseURL(opts.baseURL || GptMailService.DEFAULT_BASE_URL)
@@ -409,9 +491,14 @@ export class GptMailService implements TempEmailService {
       .map((d) => d.trim().replace(/^@/, ''))
       .filter(Boolean)
     if (this.domains.length === 0) {
-      throw new Error('GPTmail 自建域名池为空（私有模式: MX 已解析到 GPTmail 的域名；CF 模式: CF 配了 catch-all 的域名）')
+      throw new Error(
+        'GPTmail 自建域名池为空（私有模式: MX 已解析到 GPTmail 的域名；CF 模式: CF 配了 catch-all 的域名）'
+      )
     }
-    this.fixedPrefix = (opts.prefix || '').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '')
+    this.fixedPrefix = (opts.prefix || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]/g, '')
     this.privatePassword = (opts.privatePassword || '').trim()
   }
 
@@ -453,7 +540,7 @@ export class GptMailService implements TempEmailService {
         else if (ch === quote) inStr = false
         continue
       }
-      if (ch === '"' || ch === '\'') {
+      if (ch === '"' || ch === "'") {
         inStr = true
         quote = ch
       } else if (ch === '{') {
@@ -476,10 +563,18 @@ export class GptMailService implements TempEmailService {
    *
    * 自动注入 x-inbox-token，并从响应里滚动更新 token。
    */
-  private async request<T = Record<string, unknown>>(
+  private async request(
     path: string,
-    init: { method?: 'GET' | 'POST' | 'DELETE'; body?: string; withToken?: boolean; headers?: Record<string, string>; _retried?: boolean } = {}
-  ): Promise<T> {
+    init: {
+      method?: 'GET' | 'POST' | 'DELETE'
+      body?: string
+      withToken?: boolean
+      headers?: Record<string, string>
+      _retried?: boolean
+      signal?: AbortSignal
+    } = {}
+  ): Promise<Record<string, unknown>> {
+    checkAborted(init.signal)
     const url = `${this.baseURL}${path}`
     const origin = new URL(this.baseURL).origin
     // Referer 跟官方抓包对齐：`https://mail.chatgpt.org.uk/<inboxEmail>`（不带 /zh/）
@@ -487,11 +582,11 @@ export class GptMailService implements TempEmailService {
     const method: 'GET' | 'POST' | 'DELETE' = init.method ?? 'GET'
 
     const headers: Record<string, string> = {
-      'accept': 'application/json, text/plain, */*',
+      accept: 'application/json, text/plain, */*',
       'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
       'user-agent': GptMailService.UA,
-      'origin': origin,
-      'referer': referer,
+      origin: origin,
+      referer: referer,
       'sec-ch-ua': GptMailService.SEC_CH_UA,
       'sec-ch-ua-mobile': '?0',
       'sec-ch-ua-platform': '"Windows"',
@@ -512,23 +607,40 @@ export class GptMailService implements TempEmailService {
     if (!session) throw new Error('GPTmail TLS SessionClient 不可用（可能正在重建，稍后重试）')
     let raw: { status: number; body: string }
     if (method === 'POST') {
-      raw = await session.post(url, init.body ?? '', { headers })
+      raw = await waitFor(
+        session.post(url, init.body ?? '', { headers, retryIsEnabled: false }),
+        init.signal
+      )
     } else if (method === 'DELETE') {
-      raw = await session.delete(url, { headers })
+      raw = await waitFor(session.delete(url, { headers, retryIsEnabled: false }), init.signal)
     } else {
-      raw = await session.get(url, { headers })
+      raw = await waitFor(session.get(url, { headers, retryIsEnabled: false }), init.signal)
     }
 
+    checkAborted(init.signal)
     let data: unknown
-    try { data = JSON.parse(raw.body) } catch { data = raw.body }
+    try {
+      data = JSON.parse(raw.body)
+    } catch {
+      data = raw.body
+    }
 
     // 401/403 且带 token：可能是滚动 token 过期 —— 重新从页面拿一次 token 后重试一次。
     // （若是 TLS 指纹被识破的 "Browser session required"，重取也无害，最多再失败一次按原错误抛出）
-    if ((raw.status === 401 || raw.status === 403) && !init._retried && (init.withToken ?? true) && path !== '') {
+    if (
+      (raw.status === 401 || raw.status === 403) &&
+      !init._retried &&
+      (init.withToken ?? true) &&
+      path !== ''
+    ) {
       try {
-        await this.fetchInitialTokenFromPage()
-        return await this.request<T>(path, { ...init, _retried: true })
-      } catch { /* 重取失败则按原错误抛出 */ }
+        await this.fetchInitialTokenFromPage(init.signal)
+        if (this.privatePassword && !path.startsWith('/api/private-domains/unlock'))
+          await this.unlockPrivateInbox(init.signal)
+        return await this.request(path, { ...init, _retried: true })
+      } catch {
+        /* 重取失败则按原错误抛出 */
+      }
     }
 
     if (raw.status < 200 || raw.status >= 300) {
@@ -544,10 +656,13 @@ export class GptMailService implements TempEmailService {
         this.token = newToken
       }
     }
-    return data as T
+    if (!data || typeof data !== 'object' || Array.isArray(data))
+      throw new Error('GPTmail 响应格式无效')
+    return data as Record<string, unknown>
   }
 
-  async create(): Promise<string> {
+  async create(signal?: AbortSignal): Promise<string> {
+    checkAborted(signal)
     // step 1: 生成「prefix@用户自建域名」作为注册站点提交的邮箱
     const domain = this.domains[Math.floor(Math.random() * this.domains.length)]
     const prefix = this.fixedPrefix || randomEmailPrefix()
@@ -561,21 +676,21 @@ export class GptMailService implements TempEmailService {
     // step 3: GET 收件箱页面 https://mail.chatgpt.org.uk/<inboxEmail>，从 HTML 里解析
     //   服务端 SSR 嵌入的 window.__BROWSER_AUTH（含初始 token）。
     //   比 POST /api/inbox-token 更不容易触发反爬（那个 POST 端点会回 401 "Browser session required"）。
-    await this.fetchInitialTokenFromPage()
+    await this.fetchInitialTokenFromPage(signal)
     if (!this.token) {
       throw new Error('GPTmail 从页面 HTML 解析 __BROWSER_AUTH.token 失败')
     }
 
     // step 4: 私有域名密码解锁（如果设了密码）—— 私有域名 inbox 在未 unlock 前查 emails 会返回 403
     if (this.privatePassword) {
-      await this.unlockPrivateInbox()
+      await this.unlockPrivateInbox(signal)
     }
 
     // step 5: 记录 inbox 现有邮件 ID 作为基线，轮询时跳过这些旧邮件，避免历史验证码污染。
     //   不再做全量 clear —— CF 转发模式下多个并发注册共享同一 inbox，
     //   全量删除会误删别的任务待取的验证码。基线方案无副作用、并发安全。
     try {
-      const existing = await this.fetchMails()
+      const existing = await this.fetchMails(signal)
       for (const mail of existing) {
         const id = String(mail.id ?? '')
         if (id) this.baselineIds.add(id)
@@ -583,13 +698,19 @@ export class GptMailService implements TempEmailService {
       if (this.baselineIds.size > 0) {
         console.log(`[GPTmail] inbox 基线邮件数: ${this.baselineIds.size}（轮询时将跳过）`)
       }
-    } catch { /* 基线获取失败不影响后续轮询 */ }
+    } catch {
+      checkAborted(signal) /* Baseline failures must not swallow cancellation. */
+    }
 
     const mode = this.fixedInboxEmail
       ? `CF 转发 → ${this.inboxEmail}`
-      : this.privatePassword ? '私有域名直收（已解锁）' : '私有域名直收（MX→GPTmail）'
+      : this.privatePassword
+        ? '私有域名直收（已解锁）'
+        : '私有域名直收（MX→GPTmail）'
     if (this.domains.length > 1) {
-      console.log(`[GPTmail] 注册邮箱: ${this.address}  (域名池 ${this.domains.length} 个，模式: ${mode})`)
+      console.log(
+        `[GPTmail] 注册邮箱: ${this.address}  (域名池 ${this.domains.length} 个，模式: ${mode})`
+      )
     } else {
       console.log(`[GPTmail] 注册邮箱: ${this.address}  (模式: ${mode})`)
     }
@@ -601,12 +722,13 @@ export class GptMailService implements TempEmailService {
    * GPTmail 服务端会在 SSR 时把 `{token,email,expires_at}` 渲染到 HTML 的内联 script 里，
    * 这是浏览器拿到 token 的"零成本"路径，不会触发 /api/inbox-token 的反爬保护。
    */
-  private async fetchInitialTokenFromPage(): Promise<void> {
+  private async fetchInitialTokenFromPage(signal?: AbortSignal): Promise<void> {
     const origin = new URL(this.baseURL).origin
     const pageUrl = `${origin}/${this.inboxEmail}`
 
     const pageHeaders: Record<string, string> = {
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
       'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
       'user-agent': GptMailService.UA,
       'sec-ch-ua': GptMailService.SEC_CH_UA,
@@ -621,7 +743,12 @@ export class GptMailService implements TempEmailService {
 
     const session = this.getSession()
     if (!session) throw new Error('GPTmail TLS SessionClient 不可用（可能正在重建，稍后重试）')
-    const raw = await session.get(pageUrl, { headers: pageHeaders })
+    checkAborted(signal)
+    const raw = await waitFor(
+      session.get(pageUrl, { headers: pageHeaders, retryIsEnabled: false }),
+      signal
+    )
+    checkAborted(signal)
     if (raw.status < 200 || raw.status >= 300) {
       throw new Error(`GPTmail GET ${pageUrl} HTTP ${raw.status}: ${raw.body.slice(0, 200)}`)
     }
@@ -636,7 +763,9 @@ export class GptMailService implements TempEmailService {
     try {
       auth = JSON.parse(jsonText)
     } catch (err) {
-      throw new Error(`GPTmail __BROWSER_AUTH JSON 解析失败: ${err instanceof Error ? err.message : err}`)
+      throw new Error(
+        `GPTmail __BROWSER_AUTH JSON 解析失败: ${err instanceof Error ? err.message : err}`
+      )
     }
     const token = typeof auth.token === 'string' ? auth.token : ''
     if (!token) {
@@ -651,12 +780,14 @@ export class GptMailService implements TempEmailService {
    * GPTmail 私有域名 inbox 在未 unlock 前调用 /api/emails 会返回 403 "private domain password required"。
    * 必须先 POST /api/private-domains/unlock {email, password} 拿到 unlock 后的 token，再轮询邮件。
    */
-  private async unlockPrivateInbox(): Promise<void> {
+  private async unlockPrivateInbox(signal?: AbortSignal): Promise<void> {
     const lang = 'zh-CN' // 与 official frontend 默认一致
-    const resp = await this.request<Record<string, unknown>>(
+    const resp = await this.request(
       `/api/private-domains/unlock?lang=${encodeURIComponent(lang)}`,
       {
         method: 'POST',
+        signal,
+        _retried: true,
         body: JSON.stringify({ email: this.inboxEmail, password: this.privatePassword })
       }
     )
@@ -668,79 +799,56 @@ export class GptMailService implements TempEmailService {
     // token 已被 request() 内部从 auth.token 自动滚动更新
   }
 
-  getAddress(): string {
-    return this.address
-  }
-
-  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+  async waitForCode(
+    timeoutSec: number,
+    intervalSec: number,
+    signal?: AbortSignal
+  ): Promise<string> {
     if (!this.address) throw new Error('GPTmail 注册邮箱为空，需先调用 create()')
     if (!this.inboxEmail) throw new Error('GPTmail inbox 邮箱为空，需先调用 create()')
     if (!this.token) throw new Error('GPTmail token 为空，需先调用 create()')
 
-    const maxRetries = Math.max(1, Math.floor(timeoutSec / intervalSec))
-    // 用 create() 时记录的基线 ID 初始化：跳过注册前就存在于 inbox 的旧邮件
     const checkedIds = new Set<string>(this.baselineIds)
-    const userLocal = this.address.toLowerCase().split('@')[0]
-    // 私有域名直收模式下，inbox = address，所有邮件 to 必然是 address，严格匹配即可
-    const isPrivateDirect = !this.fixedInboxEmail
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      if (signal?.aborted) throw new Error('注册已取消')
-      await abortableSleep(intervalSec * 1000, signal)
-      try {
-        const mails = await this.fetchMails()
-        if (attempt === 1 || attempt % 5 === 0) {
-          console.log(`[GPTmail] [${attempt}/${maxRetries}] 收件箱(${this.inboxEmail}) 邮件数: ${mails.length}`)
-        }
-        for (const mail of mails) {
-          const id = String(mail.id ?? '')
-          if (!id || checkedIds.has(id)) continue
-          checkedIds.add(id)
-
-          const subject = String(mail.subject ?? '')
-          const content = String(mail.content ?? '')
-          const html = String(mail.html_content ?? mail.html ?? '')
-
-          if (isPrivateDirect) {
-            // 私有直收：inbox=address，email_address 必然匹配
-            const to = String(mail.email_address ?? '').toLowerCase()
-            if (to && to !== this.address.toLowerCase()) {
-              continue
+    return withDeadline(
+      async (signal) => {
+        for (let attempt = 1; ; attempt++) {
+          await abortableSleep(intervalSec * 1000, signal)
+          try {
+            const mails = await this.fetchMails(signal)
+            checkAborted(signal)
+            for (const mail of mails) {
+              const id = String(mail.id ?? '')
+              if (!id || checkedIds.has(id)) continue
+              const subject = String(mail.subject ?? '')
+              const content = String(mail.content ?? '')
+              const html = String(mail.html_content ?? mail.html ?? '')
+              if (!this.fixedInboxEmail) {
+                const to = String(mail.email_address ?? '')
+                if (to && !containsAddress(to, this.address)) {
+                  checkedIds.add(id)
+                  continue
+                }
+              } else if (!containsAddress(`${subject}\n${content}\n${html}`, this.address)) {
+                continue // Forwarded content may still be loading under the same ID.
+              }
+              const code = this.extractOTP(mail)
+              if (code) return code
             }
-          } else {
-            // CF 转发：email_address=inbox，需要从 subject/body 软匹配本次注册地址，
-            //         避免拿到同一 inbox 其他注册的旧验证码
-            const blob = `${subject}\n${content}\n${html}`.toLowerCase()
-            const matches = blob.includes(this.address.toLowerCase()) || blob.includes(userLocal)
-            if (!matches) {
-              // 注意：subject/body 可能不含注册地址（部分服务只发"您的验证码"无邮箱回显），
-              //       此时若 inbox 里恰好只有这一封新邮件也可能是本次的 —— 但我们保守跳过避免误用
-              continue
-            }
-          }
-
-          const code = this.extractOTP(mail)
-          if (code) {
-            console.log(`[GPTmail] 提取到验证码: ${code} (from=${mail.from_address ?? ''}, subject=${subject.slice(0, 60)})`)
-            // 不再全量 clear inbox：CF 转发模式下多任务共享同一 inbox，
-            // 清空会误删别的任务待取的验证码。本次邮件已记入 checkedIds，
-            // 后续实例靠 create() 重新捕获基线跳过，已足够避免重复取码。
-            return code
+          } catch (error) {
+            checkAborted(signal)
+            if (attempt % 5 === 0) console.log('[GPTmail] 查询失败:', error)
           }
         }
-      } catch (err) {
-        if (attempt % 5 === 0) {
-          console.log(`[GPTmail] [${attempt}/${maxRetries}] 查询失败:`, err instanceof Error ? err.message : err)
-        }
-      }
-      if (attempt % 5 === 0) console.log(`[GPTmail] [${attempt}/${maxRetries}] 暂无验证码...`)
-    }
-    throw new Error(`GPTmail 等待验证码超时 (${timeoutSec}s)`)
+      },
+      timeoutSec * 1000,
+      signal,
+      `GPTmail 等待验证码超时 (${timeoutSec}s)`
+    )
   }
 
-  private async fetchMails(): Promise<Array<Record<string, unknown>>> {
+  private async fetchMails(signal?: AbortSignal): Promise<Array<Record<string, unknown>>> {
     const url = `/api/emails?email=${encodeURIComponent(this.inboxEmail)}`
-    const resp = await this.request<Record<string, unknown>>(url)
+    const resp = await this.request(url, { signal })
     if (!resp.success) return []
     const data = resp.data as Record<string, unknown> | undefined
     const arr = data?.emails
@@ -815,203 +923,255 @@ export function parseOutlookLines(data: string): OutlookAccount[] {
   return accounts
 }
 
-export async function refreshOutlookToken(acc: OutlookAccount): Promise<string> {
+export async function refreshOutlookToken(
+  acc: OutlookAccount,
+  signal?: AbortSignal
+): Promise<string> {
   const form = new URLSearchParams({
     client_id: acc.clientId,
     refresh_token: acc.refreshToken,
     grant_type: 'refresh_token',
     scope: 'https://outlook.office.com/IMAP.AccessAsUser.All offline_access'
   })
-
-  const resp = await proxyFetch(
-    'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
-    { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString() }
-  )
-  const data = (await resp.json()) as Record<string, unknown>
-  if (resp.status !== 200) throw new Error(`刷新失败 ${resp.status}: ${JSON.stringify(data).slice(0, 300)}`)
-  const token = data.access_token as string
-  if (!token) throw new Error('响应中无 access_token')
-  return token
+  const data = await proxyJSON('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+    signal
+  })
+  if (typeof data.access_token !== 'string' || !data.access_token)
+    throw new Error('响应中无 access_token')
+  if (typeof data.refresh_token === 'string' && data.refresh_token)
+    acc.refreshToken = data.refresh_token
+  return data.access_token
 }
 
-function buildXOAuth2(email: string, accessToken: string): string {
-  const auth = `user=${email}\x01auth=Bearer ${accessToken}\x01\x01`
-  return Buffer.from(auth).toString('base64')
+function decodeMail(raw: string): { body: string; from: string; date: number } {
+  const split = raw.search(/\r?\n\r?\n/)
+  const headers = split < 0 ? '' : raw.slice(0, split).replace(/\r?\n[ \t]+/g, ' ')
+  const content = split < 0 ? raw : raw.slice(split).replace(/^\r?\n\r?\n/, '')
+  const header = (name: string): string =>
+    headers.match(new RegExp(`^${name}:\\s*(.*)$`, 'im'))?.[1]?.trim() || ''
+  const boundary = header('content-type').match(/boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i)
+  let body: string
+  if (boundary) {
+    body = content
+      .split(`--${boundary[1] || boundary[2]}`)
+      .slice(1)
+      .filter((part) => !part.startsWith('--'))
+      .map((part) => decodeMail(part.replace(/^\r?\n/, '')).body)
+      .join('\n')
+  } else {
+    const encoding = header('content-transfer-encoding').toLowerCase()
+    if (encoding === 'base64')
+      body = Buffer.from(content.replace(/\s/g, ''), 'base64').toString('utf8')
+    else if (encoding === 'quoted-printable') {
+      const bytes = content
+        .replace(/=\r?\n/g, '')
+        .replace(/=([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+      body = Buffer.from(bytes, 'latin1').toString('utf8')
+    } else body = Buffer.from(content, 'latin1').toString('utf8')
+  }
+  return { body, from: header('from').toLowerCase(), date: Date.parse(header('date')) }
+}
+
+interface OutlookCheckpoint {
+  uidNext: number
+  since: number
 }
 
 class IMAPClient {
   private socket: tls.TLSSocket | null = null
-  private buffer = ''
+  private buffer = Buffer.alloc(0)
   private tag = 0
+  private failure?: Error
+  private notify?: () => void
+
+  constructor(private signal?: AbortSignal) {}
 
   async connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const socket = tls.connect(993, 'outlook.office365.com', { servername: 'outlook.office365.com' })
-      const timer = setTimeout(() => {
-        socket.destroy()
-        reject(new Error('连接超时'))
-      }, 15000)
-
-      socket.once('error', (err) => { clearTimeout(timer); reject(err) })
-      socket.once('secureConnect', () => {
-        clearTimeout(timer)
-        this.socket = socket
-        this.readLine().then(() => resolve()).catch(reject)
-      })
-    })
-  }
-
-  private readLine(timeoutMs = 30000): Promise<string> {
-    return new Promise((resolve, reject) => {
-      if (!this.socket) return reject(new Error('未连接'))
-
-      let settled = false
-      const timer = setTimeout(() => {
-        if (settled) return
-        settled = true
-        this.socket?.removeListener('data', onData)
-        this.socket?.removeListener('error', onError)
-        reject(new Error('IMAP readLine 超时'))
-      }, timeoutMs)
-
-      const done = (line: string): void => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        this.socket?.removeListener('data', onData)
-        this.socket?.removeListener('error', onError)
-        resolve(line)
-      }
-
-      const onError = (err: Error): void => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        this.socket?.removeListener('data', onData)
-        reject(err)
-      }
-
-      const check = (): boolean => {
-        const idx = this.buffer.indexOf('\r\n')
-        if (idx >= 0) {
-          const line = this.buffer.slice(0, idx)
-          this.buffer = this.buffer.slice(idx + 2)
-          done(line)
-          return true
+    checkAborted(this.signal)
+    await withDeadline(
+      async (signal) => {
+        const socket = tls.connect(993, 'outlook.office365.com', { servername: 'outlook.office365.com' })
+        this.socket = socket // Own the socket even during the handshake.
+        socket.on('data', (chunk: Buffer) => {
+          this.buffer = Buffer.concat([this.buffer, chunk])
+          this.notify?.()
+        })
+        socket.on('error', (error) => {
+          this.failure = error
+          this.notify?.()
+        })
+        socket.on('end', () => {
+          this.failure = new Error('IMAP 连接已关闭')
+          this.notify?.()
+        })
+        socket.on('close', () => {
+          this.failure ??= new Error('IMAP 连接已关闭')
+          this.notify?.()
+        })
+        const abort = (): void => {
+          this.close()
         }
-        return false
-      }
-      if (check()) return
+        signal.addEventListener('abort', abort, { once: true })
+        try {
+          await waitFor(
+            new Promise<void>((resolve, reject) => {
+              socket.once('secureConnect', resolve)
+              socket.once('error', reject)
+              socket.once('close', () => reject(this.failure || new Error('IMAP 连接已关闭')))
+            }),
+            signal
+          )
+          await waitFor(this.readLine(), signal)
+        } finally {
+          signal.removeEventListener('abort', abort)
+        }
+      },
+      15000,
+      this.signal,
+      'IMAP 连接超时'
+    )
+  }
 
-      const onData = (chunk: Buffer): void => {
-        this.buffer += chunk.toString()
-        check()
-      }
-      this.socket.on('data', onData)
-      this.socket.once('error', onError)
+  private async read<T>(consume: () => T | undefined): Promise<T> {
+    return withDeadline(
+      (signal) =>
+        new Promise<T>((resolve, reject) => {
+          const check = (): void => {
+            try {
+              checkAborted(signal)
+              const value = consume()
+              if (value !== undefined) {
+                finish()
+                resolve(value)
+                return
+              }
+              if (this.failure) throw this.failure
+              if (!this.socket) throw new Error('IMAP 未连接')
+            } catch (error) {
+              finish()
+              reject(error)
+            }
+          }
+          const finish = (): void => {
+            if (this.notify === check) this.notify = undefined
+            signal.removeEventListener('abort', check)
+          }
+          this.notify = check
+          signal.addEventListener('abort', check, { once: true })
+          check()
+        }),
+      30000,
+      this.signal,
+      'IMAP 读取超时'
+    )
+  }
+
+  private readLine(): Promise<string> {
+    return this.read(() => {
+      const end = this.buffer.indexOf('\r\n')
+      if (end < 0) return undefined
+      const line = this.buffer.subarray(0, end).toString('latin1')
+      this.buffer = this.buffer.subarray(end + 2)
+      return line
     })
   }
 
-  private async sendCommand(cmd: string): Promise<string> {
-    if (!this.socket) throw new Error('未连接')
-    this.tag++
-    const tagStr = `A${String(this.tag).padStart(3, '0')}`
-    this.socket.write(`${tagStr} ${cmd}\r\n`)
-    return tagStr
-  }
-
-  private async readUntilTag(tag: string): Promise<{ lines: string[]; result: string }> {
-    const lines: string[] = []
-    while (true) {
+  private async command(
+    command: string
+  ): Promise<{ lines: string[]; literals: string[]; result: string }> {
+    checkAborted(this.signal)
+    if (!this.socket || this.failure) throw this.failure || new Error('IMAP 未连接')
+    const tag = `A${String(++this.tag).padStart(3, '0')}`
+    this.socket.write(`${tag} ${command}\r\n`)
+    const lines: string[] = [],
+      literals: string[] = []
+    for (;;) {
       const line = await this.readLine()
-      if (line.startsWith(`${tag} `)) return { lines, result: line }
+      if (line.startsWith(`${tag} `)) {
+        if (!new RegExp(`^${tag} OK\\b`, 'i').test(line))
+          throw new Error(`IMAP ${command.split(' ')[0]} 失败: ${line}`)
+        return { lines, literals, result: line }
+      }
+      if (line.startsWith('+') && command.startsWith('AUTHENTICATE')) this.socket.write('\r\n')
       lines.push(line)
+      const literal = line.match(/\{(\d+)\}$/)
+      if (literal) {
+        const size = Number(literal[1])
+        if (size > 5 * 1024 * 1024) throw new Error('IMAP 邮件超过读取上限')
+        literals.push(
+          await this.read(() => {
+            if (this.buffer.length < size) return undefined
+            const body = this.buffer.subarray(0, size).toString('latin1')
+            this.buffer = this.buffer.subarray(size)
+            return body
+          })
+        )
+      }
     }
   }
 
   async authenticate(email: string, accessToken: string): Promise<void> {
-    const xoauth2 = buildXOAuth2(email, accessToken)
-    const tag = await this.sendCommand(`AUTHENTICATE XOAUTH2 ${xoauth2}`)
-    const { result } = await this.readUntilTag(tag)
-    if (!result.includes('OK')) throw new Error(`认证失败: ${result}`)
-    console.log('[IMAP] 认证成功')
-    await sleep(800)
+    const token = Buffer.from(`user=${email}\x01auth=Bearer ${accessToken}\x01\x01`).toString(
+      'base64'
+    )
+    await this.command(`AUTHENTICATE XOAUTH2 ${token}`)
   }
 
   async selectInbox(): Promise<number> {
-    for (let retry = 0; retry < 3; retry++) {
-      const tag = await this.sendCommand('SELECT INBOX')
-      const { lines, result } = await this.readUntilTag(tag)
-      if (result.includes('OK')) {
-        for (const line of lines) {
-          const m = line.match(/\*\s+(\d+)\s+EXISTS/)
-          if (m) return parseInt(m[1], 10)
-        }
-        return 0
-      }
-      if (retry < 2) {
-        console.log(`[IMAP] SELECT INBOX 失败 (${result}), 重试 ${retry + 1}/3...`)
-        await sleep((1 + retry) * 1000)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await this.command('SELECT INBOX')
+        const match = [...response.lines, response.result].join('\n').match(/\[UIDNEXT (\d+)\]/i)
+        if (!match) throw new Error('IMAP 未返回 UIDNEXT')
+        return Number(match[1])
+      } catch (error) {
+        checkAborted(this.signal)
+        if (attempt === 2 || this.failure) throw error
+        await abortableSleep((attempt + 1) * 1000, this.signal)
       }
     }
     throw new Error('SELECT INBOX 重试耗尽')
   }
 
-  async fetchLatestBody(seq: number): Promise<string> {
-    if (seq <= 0) throw new Error('无效的邮件序号')
-    const tag = await this.sendCommand(`FETCH ${seq} (BODY.PEEK[TEXT])`)
-    const { lines, result } = await this.readUntilTag(tag)
-    if (!result.includes('OK')) throw new Error(`FETCH TEXT 失败: ${result}`)
+  async newUids(uidNext: number): Promise<number[]> {
+    const { lines } = await this.command(
+      `UID SEARCH ${uidNext > 0 ? `UID ${uidNext}:*` : 'SINCE ' + new Date().toUTCString().slice(5, 16).replace(/ /g, '-')}`
+    )
+    return lines
+      .filter((line) => /^\* SEARCH(?:\s|$)/i.test(line))
+      .flatMap((line) => line.slice(8).trim().split(/\s+/).map(Number))
+      .filter((uid) => uid > 0 && uid >= uidNext)
+      .sort((a, b) => b - a)
+  }
 
-    const rawLines: string[] = []
-    let inBody = false
-    for (const line of lines) {
-      if (line.includes('FETCH')) { inBody = true; continue }
-      if (line === ')') continue
-      if (inBody) rawLines.push(line)
-    }
-    const raw = rawLines.join('\n')
-
-    // 尝试解码 MIME base64
-    const parts = raw.split('------=_Part_')
-    let decoded = ''
-    for (const part of parts) {
-      if (part.includes('base64')) {
-        const idx = part.indexOf('base64')
-        const content = part.slice(idx + 6)
-        const b64 = content.replace(/[\s]/g, '')
-        try {
-          decoded += Buffer.from(b64, 'base64').toString() + ' '
-        } catch { /* ignore */ }
-      }
-    }
-    if (decoded) return decoded
-
-    // 整体 base64 解码
-    const cleaned = raw.replace(/[\s]/g, '')
-    try {
-      return Buffer.from(cleaned, 'base64').toString()
-    } catch {
-      return raw
-    }
+  async fetchMessage(uid: number): Promise<ReturnType<typeof decodeMail>> {
+    const { literals } = await this.command(`UID FETCH ${uid} (BODY.PEEK[])`)
+    if (!literals.length) throw new Error('IMAP 邮件正文为空')
+    return decodeMail(literals[0])
   }
 
   close(): void {
-    if (this.socket) {
-      try { this.socket.write('A999 LOGOUT\r\n') } catch { /* ignore */ }
-      this.socket.destroy()
-      this.socket = null
-    }
+    this.failure = new Error('IMAP 连接已关闭')
+    this.notify?.()
+    this.socket?.destroy()
+    this.socket = null
   }
 }
 
-export async function getInboxCount(acc: OutlookAccount): Promise<number> {
-  const accessToken = await refreshOutlookToken(acc)
-  const client = new IMAPClient()
+export async function getInboxCheckpoint(
+  acc: OutlookAccount,
+  signal?: AbortSignal
+): Promise<OutlookCheckpoint> {
+  const since = Date.now()
+  const accessToken = await refreshOutlookToken(acc, signal)
+  const client = new IMAPClient(signal)
   try {
     await client.connect()
     await client.authenticate(acc.email, accessToken)
-    return await client.selectInbox()
+    return { uidNext: await client.selectInbox(), since }
   } finally {
     client.close()
   }
@@ -1019,51 +1179,66 @@ export async function getInboxCount(acc: OutlookAccount): Promise<number> {
 
 export async function waitForOTP(
   acc: OutlookAccount,
-  beforeCount: number,
+  checkpoint: OutlookCheckpoint,
   timeout: number,
   interval: number,
-  signal?: AbortSignal
+  parent?: AbortSignal
 ): Promise<string> {
-  console.log(`[Outlook IMAP] 等待验证码, 邮箱=${acc.email}, 发送前邮件数=${beforeCount}`)
-  let accessToken = await refreshOutlookToken(acc)
-  const maxRetries = Math.floor(timeout / interval)
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    if (signal?.aborted) throw new Error('注册已取消')
-    let client: IMAPClient | null = null
-    try {
-      client = new IMAPClient()
-      await client.connect()
-      await client.authenticate(acc.email, accessToken)
-      const total = await client.selectInbox()
-
-      if (total <= beforeCount) {
-        if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] 暂无新邮件 (当前${total}封)...`)
-        await abortableSleep(interval * 1000, signal)
-        continue
-      }
-
-      for (let i = total; i > beforeCount; i--) {
-        try {
-          const body = await client.fetchLatestBody(i)
-          const code = extractCode(body)
-          if (code) {
-            console.log(`[Outlook IMAP] 获取到验证码: ${code}`)
-            return code
+  return withDeadline(
+    async (signal) => {
+      let accessToken = await refreshOutlookToken(acc, signal)
+      let client: IMAPClient | undefined
+      const checked = new Set<number>()
+      const abort = (): void => client?.close()
+      signal.addEventListener('abort', abort, { once: true })
+      try {
+        for (;;) {
+          checkAborted(signal)
+          try {
+            if (!client) {
+              client = new IMAPClient(signal)
+              await client.connect()
+              await client.authenticate(acc.email, accessToken)
+              await client.selectInbox()
+            }
+            for (const uid of await client.newUids(checkpoint.uidNext)) {
+              if (checked.has(uid)) continue
+              const mail = await client.fetchMessage(uid)
+              checkAborted(signal)
+              if (
+                checkpoint.uidNext === 0 &&
+                (!Number.isFinite(mail.date) || mail.date < checkpoint.since - 5000)
+              ) {
+                checked.add(uid)
+                continue
+              }
+              if (!containsAddress(mail.from, 'no-reply@signin.aws')) {
+                checked.add(uid)
+                continue
+              }
+              const code = extractCode(mail.body)
+              if (code) return code
+              if (mail.body) checked.add(uid)
+            }
+          } catch (error) {
+            checkAborted(signal)
+            client?.close()
+            client = undefined
+            console.log('[Outlook IMAP] 查询失败:', error)
+            if (error instanceof Error && /AUTHENTICATE|认证/i.test(error.message))
+              accessToken = await refreshOutlookToken(acc, signal)
           }
-        } catch { /* continue */ }
+          await abortableSleep(interval * 1000, signal)
+        }
+      } finally {
+        signal.removeEventListener('abort', abort)
+        client?.close()
       }
-
-      if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] 新邮件中未找到验证码...`)
-    } catch (err) {
-      if (attempt % 5 === 0) console.log(`[Outlook IMAP] 连接失败:`, err)
-      try { accessToken = await refreshOutlookToken(acc) } catch { /* ignore */ }
-    } finally {
-      client?.close()
-    }
-    await abortableSleep(interval * 1000, signal)
-  }
-  throw new Error(`等待验证码超时 (${timeout}s)`)
+    },
+    timeout * 1000,
+    parent,
+    `等待验证码超时 (${timeout}s)`
+  )
 }
 
 // ============ Proton 邮箱（webview 借壳官方网页，轻量读 DOM 取码） ============
@@ -1088,12 +1263,9 @@ export class ProtonWebviewService implements TempEmailService {
     this.log = log || ((m) => console.log(m))
   }
 
-  async create(): Promise<string> {
+  async create(signal?: AbortSignal): Promise<string> {
+    checkAborted(signal)
     this.log(`[Proton] 使用邮箱: ${this.address}`)
-    return this.address
-  }
-
-  getAddress(): string {
     return this.address
   }
 
@@ -1105,8 +1277,4 @@ export class ProtonWebviewService implements TempEmailService {
       log: this.log
     })
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms))
 }

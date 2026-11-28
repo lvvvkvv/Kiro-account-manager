@@ -1,4 +1,7 @@
-import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
+import type { ChainDiagnose } from '../../../../shared/proxyPool'
+import type { Account } from '@/types/account'
+import { useShallow } from 'zustand/react/shallow'
+import { useState, useMemo, useCallback, useRef } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import {
   Network,
@@ -73,26 +76,11 @@ const STRATEGY_OPTIONS: {
   }
 ]
 
-interface ChainDiag {
-  upstreamReachable: boolean
-  upstreamError?: string
-  upstreamRtMs?: number
-  targetReachable: boolean
-  targetError?: string
-  targetRtMs?: number
-  targetStatus?: number
-  targetStatusText?: string
-  targetBodySnippet?: string
-  endToEndOk?: boolean
-  endToEndError?: string
-  endToEndRtMs?: number
-}
-
 function ChainDiagnosisCard({
   diag,
   isEn
 }: {
-  diag: { targetUrl: string; success: boolean; error?: string; diagnose?: ChainDiag }
+  diag: { targetUrl: string; success: boolean; error?: string; diagnose?: ChainDiagnose }
   isEn: boolean
 }): React.ReactNode {
   if (!diag.success || !diag.diagnose) {
@@ -230,7 +218,6 @@ function computePoolHealth(proxies: ProxyEntry[]): PoolHealthStats {
   stats.successRate = stats.totalUsed > 0 ? stats.totalSuccess / stats.totalUsed : null
   stats.avgLatencyMs = latencyCount > 0 ? Math.round(latencySum / latencyCount) : null
   stats.topUsed = proxies
-    .slice()
     .filter((p) => p.usedCount > 0)
     .sort((a, b) => b.usedCount - a.usedCount)
     .slice(0, 5)
@@ -451,6 +438,96 @@ function StatusBadge({
   )
 }
 
+function ProxyBindingDetails({
+  proxies,
+  boundByProxy,
+  accounts,
+  unbindAccountFromProxy,
+  isEn
+}: {
+  proxies: ProxyEntry[]
+  boundByProxy: Map<string, string[]>
+  accounts: Map<string, Account>
+  unbindAccountFromProxy: (id: string) => void
+  isEn: boolean
+}): React.ReactNode {
+  const container = useRef<HTMLDivElement>(null)
+  const rows = useMemo(
+    () =>
+      proxies.flatMap((proxy) => {
+        if (!proxy.enabled || proxy.status === 'dead') return []
+        const ids = boundByProxy.get(proxy.id) || []
+        return Array.from({ length: Math.ceil(ids.length / 20) }, (_, index) => ({
+          key: `${proxy.id}:${index}`,
+          proxy,
+          ids: ids.slice(index * 20, (index + 1) * 20),
+          total: ids.length
+        }))
+      }),
+    [proxies, boundByProxy]
+  )
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => container.current,
+    estimateSize: () => 110,
+    overscan: 3,
+    getItemKey: (index) => rows[index].key
+  })
+  return (
+    <div ref={container} className="max-h-64 overflow-y-auto">
+      <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+        {virtualizer.getVirtualItems().map((item) => {
+          const row = rows[item.index]
+          const p = row.proxy
+          return (
+            <div
+              key={row.key}
+              ref={virtualizer.measureElement}
+              data-index={item.index}
+              className="absolute top-0 left-0 w-full p-2 border-b"
+              style={{ transform: `translateY(${item.start}px)` }}
+            >
+              <div className="flex items-center justify-between gap-2 text-caption mb-1">
+                <span className="font-mono truncate" title={p.url}>
+                  {p.host}:{p.port}
+                  {p.label && (
+                    <Badge variant="outline" className="ml-1.5">
+                      {p.label}
+                    </Badge>
+                  )}
+                </span>
+                <Badge variant="outline">
+                  {row.total} {isEn ? 'accounts' : '账号'}
+                </Badge>
+              </div>
+              <div className="flex flex-wrap gap-1 pl-2">
+                {row.ids.map((aid) => {
+                  const acc = accounts.get(aid)
+                  return (
+                    <span
+                      key={aid}
+                      className="inline-flex h-5 items-center gap-1 px-[7px] rounded-full bg-muted text-badge font-medium hover:bg-destructive/10 transition-colors group"
+                    >
+                      <span title={acc?.email}>{acc?.email || aid.slice(0, 8)}</span>
+                      <button
+                        onClick={() => unbindAccountFromProxy(aid)}
+                        className="inline-flex size-4 items-center justify-center rounded-control text-destructive hover:bg-danger-soft"
+                        title={isEn ? 'Unbind' : '解绑'}
+                      >
+                        <XCircle className="h-2.5 w-2.5" />
+                      </button>
+                    </span>
+                  )
+                })}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 export function ProxyPoolPage(): React.ReactNode {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -472,7 +549,27 @@ export function ProxyPoolPage(): React.ReactNode {
     unbindAccountFromProxy,
     clearAccountProxyBindings,
     autoDistributeAccountsToProxies
-  } = useAccountsStore()
+  } = useAccountsStore(
+    useShallow((state) => ({
+      proxyPool: state.proxyPool,
+      proxyPoolConfig: state.proxyPoolConfig,
+      addProxy: state.addProxy,
+      importProxies: state.importProxies,
+      removeProxy: state.removeProxy,
+      removeProxies: state.removeProxies,
+      toggleProxyEnabled: state.toggleProxyEnabled,
+      updateProxy: state.updateProxy,
+      validateProxy: state.validateProxy,
+      validateProxiesBatch: state.validateProxiesBatch,
+      clearProxyPool: state.clearProxyPool,
+      setProxyPoolConfig: state.setProxyPoolConfig,
+      accounts: state.accounts,
+      accountProxyBindings: state.accountProxyBindings,
+      unbindAccountFromProxy: state.unbindAccountFromProxy,
+      clearAccountProxyBindings: state.clearAccountProxyBindings,
+      autoDistributeAccountsToProxies: state.autoDistributeAccountsToProxies
+    }))
+  )
 
   const [singleInput, setSingleInput] = useState('')
   const [bulkInput, setBulkInput] = useState('')
@@ -501,20 +598,7 @@ export function ProxyPoolPage(): React.ReactNode {
     targetUrl: string
     success: boolean
     error?: string
-    diagnose?: {
-      upstreamReachable: boolean
-      upstreamError?: string
-      upstreamRtMs?: number
-      targetReachable: boolean
-      targetError?: string
-      targetRtMs?: number
-      targetStatus?: number
-      targetStatusText?: string
-      targetBodySnippet?: string
-      endToEndOk?: boolean
-      endToEndError?: string
-      endToEndRtMs?: number
-    }
+    diagnose?: ChainDiagnose
   } | null>(null)
 
   // 用池里第一条 enabled 代理作为诊断目标；如果没有则用任意第一条
@@ -546,11 +630,21 @@ export function ProxyPoolPage(): React.ReactNode {
   const proxies = useMemo(() => Array.from(proxyPool.values()), [proxyPool])
   const poolHealth = useMemo(() => computePoolHealth(proxies), [proxies])
 
+  const boundByProxy = useMemo(() => {
+    const index = new Map<string, string[]>()
+    for (const [accountId, proxyId] of Object.entries(accountProxyBindings)) {
+      const list = index.get(proxyId) || []
+      list.push(accountId)
+      index.set(proxyId, list)
+    }
+    return index
+  }, [accountProxyBindings])
+
   // 反代分桶：当前账号-代理绑定关系
   const bindingStats = useMemo(() => {
     const allAccounts = Array.from(accounts.values())
     const totalActive = allAccounts.filter((a) => a.status === 'active').length
-    const boundCount = Object.keys(accountProxyBindings).filter((aid) => accounts.has(aid)).length
+    const boundCount = Object.keys(accountProxyBindings).filter((aid) => accounts.get(aid)?.status === 'active').length
     const aliveProxies = proxies.filter((p) => p.enabled && p.status !== 'dead')
     // 每代理承载的账号数
     const perProxy: Record<string, number> = {}
@@ -571,34 +665,6 @@ export function ProxyPoolPage(): React.ReactNode {
       overloadedProxies
     }
   }, [accounts, accountProxyBindings, proxies, proxyPool])
-
-  // 后台定时验活
-  const lastAutoValidateRef = useRef(0)
-  useEffect(() => {
-    const intervalMin = proxyPoolConfig.autoValidateIntervalMin
-    if (!intervalMin || intervalMin <= 0) return
-
-    const tick = (): void => {
-      const now = Date.now()
-      if (now - lastAutoValidateRef.current < intervalMin * 60_000) return
-      const enabledIds = Array.from(proxyPool.values())
-        .filter((p) => p.enabled)
-        .map((p) => p.id)
-      if (enabledIds.length === 0) return
-      lastAutoValidateRef.current = now
-      console.log(`[ProxyPool] Auto-validate ${enabledIds.length} proxies`)
-      void validateProxiesBatch(enabledIds, proxyPoolConfig.autoValidateConcurrency || 5)
-    }
-
-    // 每分钟检查一次
-    const timer = setInterval(tick, 60_000)
-    return () => clearInterval(timer)
-  }, [
-    proxyPoolConfig.autoValidateIntervalMin,
-    proxyPoolConfig.autoValidateConcurrency,
-    proxyPool,
-    validateProxiesBatch
-  ])
 
   const handleAutoDistribute = useCallback(
     (onlyUnbound: boolean) => {
@@ -633,21 +699,7 @@ export function ProxyPoolPage(): React.ReactNode {
     ]
   )
 
-  const stats = useMemo(() => {
-    let alive = 0,
-      dead = 0,
-      slow = 0,
-      untested = 0,
-      enabled = 0
-    for (const p of proxies) {
-      if (p.enabled) enabled++
-      if (p.status === 'alive') alive++
-      else if (p.status === 'dead') dead++
-      else if (p.status === 'slow') slow++
-      else if (p.status === 'untested') untested++
-    }
-    return { total: proxies.length, alive, dead, slow, untested, enabled }
-  }, [proxies])
+  const stats = poolHealth
 
   // v1.8 升级版过滤：全文匹配（任意字段片段都能搜到）+ 多维度筛选
   const filtered = useMemo(() => {
@@ -1505,51 +1557,7 @@ export function ProxyPoolPage(): React.ReactNode {
 
             {bindingPanelExpanded && (
               <div className="space-y-2 max-h-64 overflow-y-auto border rounded-panel">
-                {proxies
-                  .filter((p) => p.enabled && p.status !== 'dead')
-                  .map((p) => {
-                    const boundAccountIds = Object.entries(accountProxyBindings)
-                      .filter(([, pid]) => pid === p.id)
-                      .map(([aid]) => aid)
-                    if (boundAccountIds.length === 0) return null
-                    return (
-                      <div key={p.id} className="p-2 border-b last:border-b-0">
-                        <div className="flex items-center justify-between gap-2 text-caption mb-1">
-                          <span className="font-mono truncate" title={p.url}>
-                            {p.host}:{p.port}
-                            {p.label && (
-                              <Badge variant="outline" className="ml-1.5">
-                                {p.label}
-                              </Badge>
-                            )}
-                          </span>
-                          <Badge variant="outline">
-                            {boundAccountIds.length} {isEn ? 'accounts' : '账号'}
-                          </Badge>
-                        </div>
-                        <div className="flex flex-wrap gap-1 pl-2">
-                          {boundAccountIds.map((aid) => {
-                            const acc = accounts.get(aid)
-                            return (
-                              <span
-                                key={aid}
-                                className="inline-flex h-5 items-center gap-1 px-[7px] rounded-full bg-muted text-badge font-medium hover:bg-destructive/10 transition-colors group"
-                              >
-                                <span title={acc?.email}>{acc?.email || aid.slice(0, 8)}</span>
-                                <button
-                                  onClick={() => unbindAccountFromProxy(aid)}
-                                  className="inline-flex size-4 items-center justify-center rounded-control text-destructive hover:bg-danger-soft"
-                                  title={isEn ? 'Unbind' : '解绑'}
-                                >
-                                  <XCircle className="h-2.5 w-2.5" />
-                                </button>
-                              </span>
-                            )
-                          })}
-                        </div>
-                      </div>
-                    )
-                  })}
+                <ProxyBindingDetails proxies={proxies} boundByProxy={boundByProxy} accounts={accounts} unbindAccountFromProxy={unbindAccountFromProxy} isEn={isEn} />
                 {bindingStats.unboundCount > 0 && (
                   <div className="p-2 bg-amber-50 dark:bg-amber-950/10 text-caption">
                     <span className="text-amber-700 dark:text-amber-300">

@@ -1,14 +1,9 @@
-import { useState } from 'react'
+import type { McpServer, McpServerEdit } from '../../../../shared/kiroSettings'
+import { useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Button } from '../ui'
 import { useTranslation } from '@/hooks/useTranslation'
 import { X, Save, Plus, Trash2 } from 'lucide-react'
-
-interface McpServer {
-  command: string
-  args?: string[]
-  env?: Record<string, string>
-}
 
 interface McpServerEditorProps {
   serverName?: string
@@ -29,10 +24,15 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
   const [newArg, setNewArg] = useState('')
 
   const isEdit = !!serverName
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
+  const savePending = useRef(false)
+  const close = () => {
+    if (!savePending.current) onClose()
+  }
 
   const handleSave = async () => {
+    if (savePending.current) return
     if (!name.trim()) {
       setError(isEn ? 'Please enter server name' : '请输入服务器名称')
       return
@@ -42,11 +42,12 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
       return
     }
 
+    savePending.current = true
     setSaving(true)
     setError(null)
 
     try {
-      const serverConfig: McpServer = {
+      const serverConfig: McpServerEdit = {
         command: command.trim(),
         args: args.filter((a) => a.trim()),
         env: envVars.reduce(
@@ -80,6 +81,7 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
       setError(isEn ? 'Save failed' : '保存失败')
       console.error(err)
     } finally {
+      savePending.current = false
       setSaving(false)
     }
   }
@@ -105,13 +107,13 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
     setEnvVars(updated)
   }
 
-  const removeEnvVar = (index: number) => {
+  const removeEnvVar = (index: number): void => {
     setEnvVars(envVars.filter((_, i) => i !== index))
   }
 
   return createPortal(
     <div className="ui-dialog-overlay">
-      <div className="absolute inset-0 bg-transparent" onClick={onClose} />
+      <div className="absolute inset-0 bg-transparent" onClick={close} />
 
       <div
         className="ui-dialog-panel w-[512px] max-w-[min(512px,calc(100vw-32px))]"
@@ -128,7 +130,7 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
                 ? 'Add MCP Server'
                 : '添加 MCP 服务器'}
           </h2>
-          <Button variant="ghost" size="icon" title={isEn ? 'Close' : '关闭'} onClick={onClose}>
+          <Button variant="ghost" size="icon" title={isEn ? 'Close' : '关闭'} onClick={close}>
             <X className="h-4 w-4" />
           </Button>
         </div>
@@ -137,7 +139,7 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
           <div className="px-4 py-2 bg-destructive/10 text-destructive text-body">{error}</div>
         )}
 
-        <div className="ui-dialog-body flex-auto min-h-0 py-3 space-y-4">
+        <fieldset disabled={saving} className="ui-dialog-body flex-auto min-h-0 py-3 space-y-4">
           {/* 服务器名称 */}
           <div>
             <label className="block text-body font-medium mb-1">
@@ -243,10 +245,10 @@ export function McpServerEditor({ serverName, server, onClose, onSaved }: McpSer
               </Button>
             </div>
           </div>
-        </div>
+        </fieldset>
 
         <div className="ui-dialog-footer border-t">
-          <Button variant="outline" onClick={onClose}>
+          <Button variant="outline" onClick={close}>
             {isEn ? 'Cancel' : '取消'}
           </Button>
           <Button onClick={handleSave} disabled={saving}>

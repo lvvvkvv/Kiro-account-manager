@@ -6,8 +6,8 @@ import { useTranslation } from '@/hooks/useTranslation'
 
 export function AutoUpdatePrompt(): JSX.Element | null {
   const { state, notice, dismiss, install, openDownload } = useAppUpdate()
-  const { t } = useTranslation()
-  const en = t('common.unknown') === 'Unknown'
+  const { actualLanguage } = useTranslation()
+  const en = actualLanguage === 'en'
   const version = state.ready?.version
   if (!version || state.dismissedVersion === version) return null
   return (

@@ -1,11 +1,23 @@
 import { app } from 'electron'
 import { constants, createReadStream, createWriteStream } from 'node:fs'
-import { access, chmod, copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  writeFile
+} from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { Readable, Transform } from 'node:stream'
+import type { ReadableStream } from 'node:stream/web'
 import { pipeline } from 'node:stream/promises'
 import publicKey from '../../../resources/update-public-key.json'
 import type { AppUpdateInfo, SignedMacManifest, UpdateEnvelope } from '../../shared/update'
@@ -18,18 +30,34 @@ export class UpdateNetworkError extends Error {}
 export async function request(
   fetcher: UpdateFetch,
   url: string,
-  timeout = 30000
+  timeout = 30000,
+  signal?: AbortSignal
 ): Promise<Response> {
+  signal?.throwIfAborted()
   try {
     const response = await fetcher(url, {
       headers: { Accept: 'application/json', 'User-Agent': 'Kiro-Account-Manager' },
-      signal: AbortSignal.timeout(timeout)
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeout)])
+        : AbortSignal.timeout(timeout)
     })
-    if (response.status >= 500 || response.status === 429 || response.status === 403)
+    if (response.status >= 500 || response.status === 429 || response.status === 403) {
+      await response.body?.cancel().catch(() => {})
       throw new UpdateNetworkError(`Update server: HTTP ${response.status}`)
+    }
     return response
   } catch (error) {
+    signal?.throwIfAborted()
     throw error instanceof UpdateNetworkError ? error : new UpdateNetworkError(String(error))
+  }
+}
+
+// Parse/verify outside this boundary: invalid metadata must never enable cached installation.
+export async function readUpdateText(response: Response): Promise<string> {
+  try {
+    return await response.text()
+  } catch (error) {
+    throw new UpdateNetworkError(String(error))
   }
 }
 
@@ -129,6 +157,8 @@ export class MacUpdateBackend {
       }
       await this.acknowledge(false)
     }
+    // Collection may verify several old bundles; never delay opening the application.
+    void this.cleanupTransactions()
     try {
       const cached = await json<{ info: AppUpdateInfo; envelope: UpdateEnvelope }>(
         join(this.root, 'pending.json')
@@ -149,6 +179,52 @@ export class MacUpdateBackend {
       await this.discard()
     }
     return { ready: this.cached?.info ?? null, recovery }
+  }
+
+  private async cleanupTransaction(directory: string): Promise<void> {
+    // The bundled helper validates paths and takes the same lock as install/recovery.
+    await exec(
+      join(process.resourcesPath, 'kiro-updater'),
+      ['cleanup', join(directory, 'transaction.json')],
+      {
+        timeout: 30000
+      }
+    )
+  }
+
+  private async cleanupTransactions(): Promise<void> {
+    const transactions = join(this.root, 'transactions')
+    try {
+      if ((await realpath(transactions)) !== transactions) return
+      for (const entry of await readdir(transactions, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !/^[a-f0-9-]{36}$/i.test(entry.name)) continue
+        const directory = join(transactions, entry.name)
+        try {
+          const tx = await json<MacTransaction>(join(directory, 'transaction.json'))
+          if (
+            tx.id !== entry.name ||
+            tx.appPath !== this.appPath ||
+            !['committed', 'rolled-back', 'failed', 'cancelled'].includes(tx.phase)
+          )
+            continue
+          const work = join(dirname(this.appPath), `.kiro-update-${tx.id}`)
+          const hasArtifacts = await Promise.all(
+            [work, join(directory, 'payload.zip'), join(directory, 'kiro-updater')].map((file) =>
+              access(file).then(
+                () => true,
+                () => false
+              )
+            )
+          )
+          if (hasArtifacts.some(Boolean)) await this.cleanupTransaction(directory)
+        } catch (error) {
+          console.warn('[Updater] Retaining transaction artifacts:', entry.name, error)
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+        console.warn('[Updater] Cannot inspect old transactions:', error)
+    }
   }
 
   private async activeDirectory(): Promise<string | null> {
@@ -184,7 +260,7 @@ export class MacUpdateBackend {
     )
     if (response.status === 404) return null
     if (!response.ok) throw new Error(`Update manifest: HTTP ${response.status}`)
-    const text = await response.text()
+    const text = await readUpdateText(response)
     if (text.length > 32768) throw new Error('Update manifest is too large')
     const envelope = JSON.parse(text) as UpdateEnvelope
     verifyMacManifest(envelope, publicKey.publicKey, version, process.arch)
@@ -194,8 +270,10 @@ export class MacUpdateBackend {
   async download(
     info: AppUpdateInfo,
     envelope: UpdateEnvelope,
-    progress: (percent: number) => void
+    progress: (percent: number) => void,
+    signal?: AbortSignal
   ): Promise<void> {
+    signal?.throwIfAborted()
     const manifest = verifyMacManifest(envelope, publicKey.publicKey, info.version, process.arch)
     if (
       this.cached?.manifest.sha256 === manifest.sha256 &&
@@ -208,7 +286,8 @@ export class MacUpdateBackend {
       const response = await request(
         this.fetcher,
         `https://github.com/${UPDATE_REPO}/releases/download/v${manifest.version}/${manifest.file}`,
-        15 * 60 * 1000
+        15 * 60 * 1000,
+        signal
       )
       if (!response.ok || !response.body)
         throw new Error(`Download failed: HTTP ${response.status}`)
@@ -231,10 +310,12 @@ export class MacUpdateBackend {
         }
       })
       await pipeline(
-        Readable.fromWeb(response.body as never),
+        Readable.fromWeb(response.body as ReadableStream<Uint8Array>),
         meter,
-        createWriteStream(partial, { mode: 0o600 })
+        createWriteStream(partial, { mode: 0o600 }),
+        { signal }
       )
+      signal?.throwIfAborted()
       if (downloaded !== manifest.size || hash.digest('hex') !== manifest.sha256)
         throw new Error('更新包校验失败 / Update digest mismatch')
       await rename(partial, this.archive)
@@ -261,10 +342,6 @@ export class MacUpdateBackend {
     const id = randomUUID()
     const directory = join(this.root, 'transactions', id)
     await mkdir(directory, { recursive: true, mode: 0o700 })
-    await copyFile(this.archive, join(directory, 'payload.zip'))
-    await save(join(directory, 'envelope.json'), this.cached.envelope)
-    await copyFile(join(process.resourcesPath, 'kiro-updater'), join(directory, 'kiro-updater'))
-    await chmod(join(directory, 'kiro-updater'), 0o700)
     await save(join(directory, 'transaction.json'), {
       id,
       appPath: this.appPath,
@@ -274,11 +351,30 @@ export class MacUpdateBackend {
       parentPid: process.pid,
       phase: 'created'
     })
-    // All expensive validation/extraction happens while the old app is still usable.
-    await exec(join(directory, 'kiro-updater'), ['prepare', join(directory, 'transaction.json')], {
-      timeout: 180000
-    })
-    await save(join(this.root, 'active.json'), { id })
+    try {
+      await copyFile(this.archive, join(directory, 'payload.zip'))
+      await save(join(directory, 'envelope.json'), this.cached.envelope)
+      await copyFile(join(process.resourcesPath, 'kiro-updater'), join(directory, 'kiro-updater'))
+      await chmod(join(directory, 'kiro-updater'), 0o700)
+      // All expensive validation/extraction happens while the old app is still usable.
+      await exec(
+        join(directory, 'kiro-updater'),
+        ['prepare', join(directory, 'transaction.json')],
+        {
+          timeout: 180000
+        }
+      )
+      await save(join(this.root, 'active.json'), { id })
+    } catch (error) {
+      const tx = await json<MacTransaction>(join(directory, 'transaction.json'))
+      tx.phase = 'failed'
+      tx.error = String(error)
+      await save(join(directory, 'transaction.json'), tx)
+      await this.cleanupTransaction(directory).catch((cleanupError) =>
+        console.warn('[Updater] Retaining failed preparation:', cleanupError)
+      )
+      throw error
+    }
     return async (action) => {
       if (action === 'cancel') {
         const tx = await json<MacTransaction>(join(directory, 'transaction.json'))
@@ -287,6 +383,9 @@ export class MacUpdateBackend {
           tx.error = '安装已取消 / Installation cancelled'
           await save(join(directory, 'transaction.json'), tx)
         }
+        await this.cleanupTransaction(directory).catch((error) =>
+          console.warn('[Updater] Cancellation cleanup deferred:', error)
+        )
         return
       }
       if (action === 'confirm') {

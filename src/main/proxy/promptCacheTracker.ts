@@ -22,7 +22,7 @@ interface CacheBreakpoint {
   ttl: number               // 缓存 TTL（毫秒）
 }
 
-interface CacheProfile {
+export interface CacheProfile {
   breakpoints: CacheBreakpoint[]
   totalInputTokens: number
   model: string
@@ -58,9 +58,16 @@ export class PromptCacheTracker {
     system: unknown,
     messages: { role: string; content: unknown; cache_control?: { type: string; ttl?: string } }[],
     tools: { name: string; description: string; input_schema: unknown; cache_control?: { type: string; ttl?: string } }[] | undefined,
-    totalInputTokens: number,
+    totalInputTokens: number | (() => number),
     model: string
   ): CacheProfile | null {
+    const hasControl = (value: unknown): boolean => {
+      if (!value || typeof value !== 'object') return false
+      if (Array.isArray(value)) return value.some(hasControl)
+      const item = value as Record<string, unknown>
+      return this.extractTTL(item) > 0 || (Array.isArray(item.content) && item.content.some(hasControl))
+    }
+    if (!hasControl(system) && !messages.some(hasControl) && !tools?.some(hasControl)) return null
     const blocks = this.flattenCacheBlocks(system, messages, tools)
     if (blocks.length === 0) return null
 
@@ -96,7 +103,7 @@ export class PromptCacheTracker {
 
     return {
       breakpoints,
-      totalInputTokens: Math.max(totalInputTokens, cumulativeTokens),
+      totalInputTokens: Math.max(typeof totalInputTokens === 'function' ? totalInputTokens() : totalInputTokens, cumulativeTokens),
       model
     }
   }
@@ -365,35 +372,3 @@ export class PromptCacheTracker {
 
 // 全局单例
 export const promptCacheTracker = new PromptCacheTracker()
-
-// 构建带缓存 usage 的 Claude usage 对象
-export function buildCachedClaudeUsage(
-  inputTokens: number,
-  outputTokens: number,
-  cacheUsage: CacheUsage
-): {
-  input_tokens: number
-  output_tokens: number
-  cache_creation_input_tokens?: number
-  cache_read_input_tokens?: number
-  cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
-} {
-  const billed = Math.max(inputTokens - cacheUsage.cacheCreationInputTokens - cacheUsage.cacheReadInputTokens, 0)
-  const result: Record<string, unknown> = {
-    input_tokens: billed,
-    output_tokens: outputTokens
-  }
-  if (cacheUsage.cacheCreationInputTokens > 0) {
-    result.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
-  }
-  if (cacheUsage.cacheReadInputTokens > 0) {
-    result.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
-  }
-  if (cacheUsage.cacheCreation5mTokens > 0 || cacheUsage.cacheCreation1hTokens > 0) {
-    result.cache_creation = {
-      ...(cacheUsage.cacheCreation5mTokens > 0 ? { ephemeral_5m_input_tokens: cacheUsage.cacheCreation5mTokens } : {}),
-      ...(cacheUsage.cacheCreation1hTokens > 0 ? { ephemeral_1h_input_tokens: cacheUsage.cacheCreation1hTokens } : {})
-    }
-  }
-  return result as ReturnType<typeof buildCachedClaudeUsage>
-}

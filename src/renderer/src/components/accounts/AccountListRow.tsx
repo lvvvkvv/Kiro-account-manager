@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow'
 import { TokenRefreshSchedule } from './TokenRefreshSchedule'
 import { memo, useState, useMemo, useCallback } from 'react'
 import { useAccountsStore } from '@/store/accounts'
@@ -44,8 +45,8 @@ interface AccountListRowProps {
   isSelected: boolean
   position: number
   total: number
-  onEdit: () => void
-  onShowDetail: () => void
+  onEdit: (account: Account) => void
+  onShowDetail: (account: Account) => void
 }
 
 // 账号列表：身份、额度、有效期与操作独立分区，窄容器重排为卡片。
@@ -69,17 +70,25 @@ function AccountListRowComponent({
     maskNickname,
     usagePrecision,
     updateAccountStatus,
-    accountProxyBindings,
-    proxyPool,
+    boundProxy,
     unbindAccountFromProxy
-  } = useAccountsStore()
-
-  // 该账号绑定的代理（如有）
-  const boundProxy = useMemo(() => {
-    const proxyId = accountProxyBindings[account.id]
-    if (!proxyId) return null
-    return proxyPool.get(proxyId) || null
-  }, [accountProxyBindings, account.id, proxyPool])
+  } = useAccountsStore(
+    useShallow((state) => ({
+      setActiveAccount: state.setActiveAccount,
+      removeAccount: state.removeAccount,
+      checkAccountStatus: state.checkAccountStatus,
+      refreshAccountToken: state.refreshAccountToken,
+      toggleSelection: state.toggleSelection,
+      maskEmail: state.maskEmail,
+      maskNickname: state.maskNickname,
+      usagePrecision: state.usagePrecision,
+      updateAccountStatus: state.updateAccountStatus,
+      // 脱敏函数引用稳定，仍需订阅隐私设置以更新显示。
+      privacyMode: state.privacyMode,
+      boundProxy: state.proxyPool.get(state.accountProxyBindings[account.id]) ?? null,
+      unbindAccountFromProxy: state.unbindAccountFromProxy
+    }))
+  )
 
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -129,86 +138,8 @@ function AccountListRowComponent({
       if (isSwitching) return
       setIsSwitching(true)
       try {
-        const { credentials } = account
-        const { switchTarget } = useAccountsStore.getState()
-
-        if (!credentials.refreshToken) {
-          alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
-          return
-        }
-        if (
-          credentials.authMethod !== 'social' &&
-          (!credentials.clientId || !credentials.clientSecret)
-        ) {
-          alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
-          return
-        }
-
-        const cliPayload = {
-          accessToken: credentials.accessToken,
-          refreshToken: credentials.refreshToken,
-          clientId: credentials.clientId,
-          clientSecret: credentials.clientSecret,
-          region: credentials.region || 'us-east-1',
-          profileArn: account.profileArn,
-          provider: credentials.provider
-        }
-        const idePayload = {
-          accessToken: credentials.accessToken,
-          refreshToken: credentials.refreshToken,
-          clientId: credentials.clientId || '',
-          clientSecret: credentials.clientSecret || '',
-          region: credentials.region || 'us-east-1',
-          startUrl: credentials.startUrl,
-          authMethod: credentials.authMethod,
-          provider: credentials.provider,
-          profileArn: account.profileArn,
-          accountId: account.id
-        }
-
-        let success = true
-        let errorMsg = ''
-        const target = switchTarget || 'ide'
-        if (target === 'ide' || target === 'both') {
-          const result = await window.api.switchAccount(idePayload)
-          if (!result.success) {
-            success = false
-            errorMsg = result.error || ''
-          } else if (result.refreshedCredentials) {
-            // 同步 main 进程 refresh 后的最新 credentials 到 store，避免反代 store 留下已作废的 refreshToken
-            const rc = result.refreshedCredentials
-            useAccountsStore.setState((state) => {
-              const accounts = new Map(state.accounts)
-              const acc = accounts.get(account.id)
-              if (acc) {
-                accounts.set(account.id, {
-                  ...acc,
-                  credentials: {
-                    ...acc.credentials,
-                    accessToken: rc.accessToken,
-                    refreshToken: rc.refreshToken,
-                    expiresAt: Date.now() + rc.expiresIn * 1000
-                  }
-                })
-              }
-              return { accounts }
-            })
-            useAccountsStore.getState().saveToStorage()
-          }
-        }
-        if (target === 'cli' || target === 'both') {
-          const result = await window.api.switchAccountCli(cliPayload)
-          if (!result.success && target === 'cli') {
-            success = false
-            errorMsg = result.error || ''
-          }
-        }
-
-        if (success) {
-          setActiveAccount(account.id)
-        } else {
-          alert(isEn ? `Switch failed: ${errorMsg}` : `切换失败：${errorMsg}`)
-        }
+        const result = await useAccountsStore.getState().switchAccount(account.id)
+        if (!result.success) alert(isEn ? `Switch failed: ${result.error}` : `切换失败：${result.error}`)
       } catch (error) {
         alert(isEn ? `Switch failed: ${String(error)}` : `切换失败：${String(error)}`)
       } finally {
@@ -325,7 +256,7 @@ function AccountListRowComponent({
       icon: <Info />,
       onClick: (event) => {
         event.stopPropagation()
-        onShowDetail()
+        onShowDetail(account)
       }
     },
     {
@@ -333,7 +264,7 @@ function AccountListRowComponent({
       icon: <Edit />,
       onClick: (event) => {
         event.stopPropagation()
-        onEdit()
+        onEdit(account)
       }
     },
     {
@@ -540,7 +471,7 @@ function AccountListRowComponent({
               className="account-list-name"
               onClick={(event) => {
                 event.stopPropagation()
-                onShowDetail()
+                onShowDetail(account)
               }}
               title={displayName}
             >
@@ -673,12 +604,12 @@ function AccountListRowComponent({
             isUnauthorized
               ? (event) => {
                   event.stopPropagation()
-                  onShowDetail()
+                  onShowDetail(account)
                 }
               : !hasCredentials
                 ? (event) => {
                     event.stopPropagation()
-                    onEdit()
+                    onEdit(account)
                   }
                 : handleSwitch
           }
@@ -809,7 +740,7 @@ function AccountListRowComponent({
             type="button"
             onClick={(event) => {
               event.stopPropagation()
-              onShowDetail()
+              onShowDetail(account)
             }}
           >
             {isEn ? 'Details' : '查看详情'}

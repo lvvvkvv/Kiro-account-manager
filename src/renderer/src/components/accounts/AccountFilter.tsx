@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow'
 import { useMemo, useState } from 'react'
 import { Button } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
@@ -9,7 +10,7 @@ import type {
   IdpType
 } from '@/types/account'
 import { cn } from '@/lib/utils'
-import { hasActiveAccountFilters } from './_helpers'
+import { hasActiveAccountFilters, toRgba } from './_helpers'
 
 const SubscriptionOptions: {
   value: SubscriptionType
@@ -65,27 +66,20 @@ const IdpOptions: { value: IdpType; label: string }[] = [
   { value: 'AWSIdC', label: 'AWSIdC' }
 ]
 
-// 解析 ARGB 颜色转换为 CSS rgba
-function toRgba(argbColor: string): string {
-  // 支持格式: #AARRGGBB 或 #RRGGBB
-  let alpha = 255
-  let rgb = argbColor
-  if (argbColor.length === 9 && argbColor.startsWith('#')) {
-    alpha = parseInt(argbColor.slice(1, 3), 16)
-    rgb = '#' + argbColor.slice(3)
-  }
-  const hex = rgb.startsWith('#') ? rgb.slice(1) : rgb
-  const r = parseInt(hex.slice(0, 2), 16)
-  const g = parseInt(hex.slice(2, 4), 16)
-  const b = parseInt(hex.slice(4, 6), 16)
-  return `rgba(${r}, ${g}, ${b}, ${alpha / 255})`
-}
-
 // 域名筛选默认展示的最大数量，超出部分折叠
 const DOMAIN_DISPLAY_LIMIT = 16
 
 export function AccountFilterPanel(): React.ReactNode {
-  const { filter, setFilter, clearFilter, tags, accounts, getStats } = useAccountsStore()
+  const { filter, setFilter, clearFilter, tags, accounts, getStats } = useAccountsStore(
+    useShallow((state) => ({
+      filter: state.filter,
+      setFilter: state.setFilter,
+      clearFilter: state.clearFilter,
+      tags: state.tags,
+      accounts: state.accounts,
+      getStats: state.getStats
+    }))
+  )
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const StatusOptions = isEn ? StatusOptionsEn : StatusOptionsZh
@@ -119,8 +113,13 @@ export function AccountFilterPanel(): React.ReactNode {
 
   const hasActiveFilters = hasActiveAccountFilters(filter)
 
-  const toggleArrayFilter = <T extends string>(key: keyof FilterType, value: T): void => {
-    const current = (filter[key] as T[] | undefined) ?? []
+  const toggleArrayFilter = <
+    K extends 'subscriptionTypes' | 'statuses' | 'idps' | 'tagIds' | 'emailDomains'
+  >(
+    key: K,
+    value: NonNullable<FilterType[K]>[number]
+  ): void => {
+    const current: readonly string[] = filter[key] ?? []
     const newValue = current.includes(value)
       ? current.filter((v) => v !== value)
       : [...current, value]
@@ -132,8 +131,8 @@ export function AccountFilterPanel(): React.ReactNode {
   }
 
   const setRangeFilter = (
-    minKey: keyof FilterType,
-    maxKey: keyof FilterType,
+    minKey: 'usageMin' | 'daysRemainingMin',
+    maxKey: 'usageMax' | 'daysRemainingMax',
     min: number | undefined,
     max: number | undefined
   ): void => {
@@ -156,6 +155,31 @@ export function AccountFilterPanel(): React.ReactNode {
             onClick={() => clearFilter()}
           >
             {isEn ? 'Clear' : '清除筛选'}
+          </Button>
+        </div>
+      )}
+      {filter.risk && (
+        <div className="flex items-center gap-2 text-caption">
+          <span>
+            {isEn ? 'Home alert:' : '首页告警：'}
+            {filter.risk === 'banned'
+              ? isEn
+                ? 'Banned'
+                : '已封禁'
+              : filter.risk === 'expiring'
+                ? isEn
+                  ? 'Expiring soon'
+                  : '即将到期'
+                : isEn
+                  ? 'Quota ≥90%'
+                  : '额度告急 ≥90%'}
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setFilter({ ...filter, risk: undefined })}
+          >
+            {isEn ? 'Remove' : '移除'}
           </Button>
         </div>
       )}

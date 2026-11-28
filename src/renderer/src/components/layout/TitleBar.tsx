@@ -13,38 +13,34 @@ import { TaskCenterButton } from './TaskCenter'
  * 按钮区：使用 no-drag 让点击生效
  */
 export function TitleBar(): React.ReactNode {
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
   const [platform, setPlatform] = useState<NodeJS.Platform>('win32')
   const [isMaximized, setIsMaximized] = useState(false)
   const [appVersion, setAppVersion] = useState('')
 
   useEffect(() => {
-    let cleanup: (() => void) | undefined
-
-    const init = async () => {
-      try {
-        const p = await window.api.window.getPlatform()
-        setPlatform(p)
-        const max = await window.api.window.isMaximized()
-        setIsMaximized(max)
-      } catch (err) {
-        console.warn('[TitleBar] init failed', err)
-      }
-
-      // 监听最大化状态变化
-      cleanup = window.api.window.onMaximizeChange((m) => setIsMaximized(m))
+    let active = true
+    const cleanup = window.api.window.onMaximizeChange((value) => {
+      if (active) setIsMaximized(value)
+    })
+    void Promise.all([
+      window.api.window.getPlatform(),
+      window.api.window.isMaximized(),
+      window.api.getAppVersion()
+    ])
+      .then(([platform, maximized, version]) => {
+        if (active) {
+          setPlatform(platform)
+          setIsMaximized(maximized)
+          setAppVersion(version)
+        }
+      })
+      .catch((error) => console.warn('[TitleBar] init failed', error))
+    return () => {
+      active = false
+      cleanup()
     }
-
-    init()
-
-    // 获取应用版本号
-    window.api
-      .getAppVersion()
-      .then(setAppVersion)
-      .catch(() => {})
-
-    return () => cleanup?.()
   }, [])
 
   const isMac = platform === 'darwin'

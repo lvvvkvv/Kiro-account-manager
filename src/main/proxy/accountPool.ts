@@ -49,6 +49,7 @@ export class AccountPool {
   private accounts: Map<string, ProxyAccount> = new Map()
   private accountStats: Map<string, AccountStats> = new Map()
   private currentIndex: number = 0
+  private accountIds: string[] = []
   private config: AccountPoolConfig
   // 默认 round-robin: 每次成功后指针前进 (满足负载均衡期望)
   // sticky: 一个账号成功就粘住 (保留 prompt cache 命中)
@@ -73,6 +74,7 @@ export class AccountPool {
   // 添加账号
   // 如果传入的 account 已带 suspended 字段（启动复原场景），保留其 suspended 状态
   addAccount(account: ProxyAccount): void {
+    if (!this.accounts.has(account.id)) this.accountIds.push(account.id)
     const suspended = this.isSuspended(account)
     this.accounts.set(account.id, {
       ...account,
@@ -101,6 +103,7 @@ export class AccountPool {
   // 移除账号
   removeAccount(accountId: string): void {
     this.accounts.delete(accountId)
+    this.accountIds = this.accountIds.filter((id) => id !== accountId)
     this.accountStats.delete(accountId)
     console.log(`[AccountPool] Removed account: ${accountId}`)
   }
@@ -109,54 +112,53 @@ export class AccountPool {
   updateAccount(accountId: string, updates: Partial<ProxyAccount>): void {
     const account = this.accounts.get(accountId)
     if (account) {
-      this.accounts.set(accountId, { ...account, ...updates })
+      const credentialsChanged = (updates.accessToken !== undefined && updates.accessToken !== account.accessToken)
+        || (updates.refreshToken !== undefined && updates.refreshToken !== account.refreshToken)
+      this.accounts.set(accountId, { ...account, ...updates,
+        ...(credentialsChanged && updates.isAvailable === undefined && !this.isSuspended(account) ? { isAvailable: true } : {}) })
     }
   }
 
-  // 获取下一个可用账号（粘滞 + 断路器 + 指数退避 + 概率重试）
-  getNextAccount(excludeIds?: Set<string>): ProxyAccount | null {
-    const accountList = Array.from(this.accounts.values())
-    if (accountList.length === 0) {
-      return null
-    }
-
-    // 单账号特殊处理：绕过断路器，直接返回（让用户看到真实 API 错误）
-    if (accountList.length === 1) {
-      const account = accountList[0]
-      if (excludeIds?.has(account.id)) return null
-      return account
-    }
-
+  // Selection reserves the next round-robin position before network work starts.
+  getNextAccount(excludeIds?: Set<string>, allowed: (account: ProxyAccount) => boolean = () => true): ProxyAccount | null {
     const now = Date.now()
-    // 从当前粘滞索引开始遍历所有账号
-    const startIndex = this.currentIndex
-
-    for (let i = 0; i < accountList.length; i++) {
-      const idx = (startIndex + i) % accountList.length
-      const account = accountList[idx]
-
-      // 跳过当前请求已试过的账号
-      if (excludeIds?.has(account.id)) continue
-
-      // 检查账号是否可用（含断路器状态）
-      if (this.isAccountAvailable(account, now)) {
+    const candidates: ProxyAccount[] = []
+    for (let i = 0; i < this.accountIds.length; i++) {
+      const index = (this.currentIndex + i) % this.accountIds.length
+      const account = this.accounts.get(this.accountIds[index])!
+      if (excludeIds?.has(account.id) || !allowed(account) || !this.isEligible(account, now)) continue
+      candidates.push(account)
+      if (this.isAccountAvailable(account, now) || this.accountIds.length === 1) {
+        if (this.strategy === 'round-robin') this.currentIndex = (index + 1) % this.accountIds.length
         return account
       }
     }
+    return this.getAccountWithShortestCooldown(candidates, now)
+  }
 
-    // 没有可用账号：检查是否全部因配额耗尽
-    const candidates = excludeIds
-      ? accountList.filter(a => !excludeIds.has(a.id))
-      : accountList
-    const allExhausted = candidates.length > 0 && candidates.every(a => this.isQuotaExhausted(a, now))
-    if (allExhausted) {
-      console.log(`[AccountPool] All ${candidates.length} accounts quota exhausted, no fallback available`)
-      return null
+  isEligible(account: ProxyAccount, now = Date.now()): boolean {
+    return !this.isSuspended(account) && account.isAvailable !== false && !!account.accessToken
+      && !this.isQuotaExhausted(account, now)
+      && !(account.expiresAt && account.expiresAt < now && !account.refreshToken)
+  }
+
+  syncAccounts(accounts: ProxyAccount[]): void {
+    const ids = new Set(accounts.map((account) => account.id))
+    for (const id of this.accountIds) {
+      if (!ids.has(id)) {
+        this.accounts.delete(id)
+        this.accountStats.delete(id)
+      }
     }
-
-    // 还有非配额原因不可用的账号，返回冷却时间最短的
-    const nonExhausted = candidates.filter(a => !this.isQuotaExhausted(a, now))
-    return this.getAccountWithShortestCooldown(nonExhausted, now)
+    this.accountIds = this.accountIds.filter((id) => ids.has(id))
+    for (const account of accounts) {
+      const previous = this.accounts.get(account.id)
+      if (!previous) this.addAccount(account)
+      else this.updateAccount(account.id, {
+        ...account,
+        ...(account.refreshToken !== previous.refreshToken ? { isAvailable: !this.isSuspended(previous) } : {})
+      })
+    }
   }
 
   // 获取特定账号
@@ -167,23 +169,7 @@ export class AccountPool {
   // 获取下一个可用账号（排除指定账号；支持单 ID 或 ID 集合）
   // 集合形式用于「请求级累计已试账号」，避免重试时循环命中已经失败过的账号
   getNextAvailableAccount(exclude: string | Set<string>): ProxyAccount | null {
-    const excludeSet = typeof exclude === 'string' ? new Set([exclude]) : exclude
-    const accountList = Array.from(this.accounts.values())
-    if (accountList.length === 0) return null
-
-    const now = Date.now()
-
-    // 尝试找到一个可用的账号（排除指定账号）
-    for (const account of accountList) {
-      if (!excludeSet.has(account.id) && this.isAccountAvailable(account, now)) {
-        return account
-      }
-    }
-
-    // 没有立即可用的账号，返回冷却时间最短的（排除指定账号）
-    const otherAccounts = accountList.filter(a => !excludeSet.has(a.id))
-    if (otherAccounts.length === 0) return null
-    return this.getAccountWithShortestCooldown(otherAccounts, now)
+    return this.getNextAccount(typeof exclude === 'string' ? new Set([exclude]) : exclude)
   }
 
   // 获取所有账号
@@ -195,28 +181,7 @@ export class AccountPool {
   // allowProbabilisticRetry=false 用于统计/计数场景：冷却中一律视为不可用，
   // 避免 Math.random() 让 availableCount / getQuotaStatus 的数字来回抖动
   private isAccountAvailable(account: ProxyAccount, now: number, allowProbabilisticRetry = true): boolean {
-    // 检查是否被 Kiro 后端封禁（需人工解封）
-    if (this.isSuspended(account)) {
-      return false
-    }
-
-    // 检查配额是否耗尽
-    if (this.isQuotaExhausted(account, now)) {
-      return false
-    }
-
-    // 检查 token 是否过期
-    // - 无 refreshToken 时直接判为不可用（无法刷新）
-    // - 有 refreshToken 时让账号通过 —— proxyServer.getAvailableAccount 会检测
-    //   isTokenExpiringSoon 并主动调用 refreshToken；若刷新失败会通过 markNeedsRefresh
-    //   设置 isAvailable=false，下次循环再被本函数 line 210 跳过，形成闭环
-    if (account.expiresAt && account.expiresAt < now && !account.refreshToken) {
-      return false
-    }
-
-    if (account.isAvailable === false) {
-      return false
-    }
+    if (!this.isEligible(account, now)) return false
 
     // 断路器检查：指数退避 + 概率重试
     const failures = account.errorCount || 0
@@ -306,7 +271,8 @@ export class AccountPool {
     let shortestWait = Infinity
 
     for (const account of accounts) {
-      const cooldownUntil = account.cooldownUntil || 0
+      if (!this.isEligible(account, now)) continue
+      const cooldownUntil = account.cooldownUntil || ((account.lastUsed || 0) + this.config.baseCooldownMs * Math.min(2 ** Math.max(0, (account.errorCount || 0) - 1), this.config.maxBackoffMultiplier))
       const wait = Math.max(0, cooldownUntil - now)
       
       if (wait < shortestWait) {
@@ -326,20 +292,14 @@ export class AccountPool {
         ...account,
         requestCount: (account.requestCount || 0) + 1,
         errorCount: 0, // 重置断路器失败计数
+        cooldownUntil: undefined,
         lastUsed: Date.now(),
         isAvailable: true
       })
 
-      const accountList = Array.from(this.accounts.keys())
-      const successIndex = accountList.indexOf(accountId)
-      if (successIndex >= 0 && accountList.length > 0) {
-        if (this.strategy === 'sticky') {
-          // 粘滞: 成功后将全局索引固定在这个账号 (保留 prompt cache 命中)
-          this.currentIndex = successIndex
-        } else {
-          // round-robin: 成功后指向下一个账号 (满足负载均衡)
-          this.currentIndex = (successIndex + 1) % accountList.length
-        }
+      if (this.strategy === 'sticky') {
+        const index = this.accountIds.indexOf(accountId)
+        if (index >= 0) this.currentIndex = index
       }
     }
 
@@ -397,6 +357,7 @@ export class AccountPool {
     this.accounts.set(accountId, {
       ...account,
       errorCount,
+      cooldownUntil: now + effectiveCooldown,
       quotaExhaustedAt,
       quotaResetAt,
       lastUsed: now
@@ -499,6 +460,7 @@ export class AccountPool {
   // 清空所有账号
   clear(): void {
     this.accounts.clear()
+    this.accountIds = []
     this.accountStats.clear()
     this.currentIndex = 0
   }

@@ -1,9 +1,14 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import { useShallow } from 'zustand/react/shallow'
+import { AccountAssignmentList } from './AccountAssignmentList'
 import { Button, Card, CardContent, CardHeader, CardTitle } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
-import type { AccountGroup } from '@/types/account'
+import type { Account, AccountGroup } from '@/types/account'
 import { X, Plus, Edit2, Trash2, Users, Check, FolderOpen } from 'lucide-react'
+
+const noAccounts = new Map<string, Account>()
+const noGroups = new Map<string, AccountGroup>()
 
 interface GroupManageDialogProps {
   isOpen: boolean
@@ -12,9 +17,18 @@ interface GroupManageDialogProps {
 
 export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): React.ReactNode {
   const { groups, accounts, addGroup, updateGroup, removeGroup, moveAccountsToGroup } =
-    useAccountsStore()
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+    useAccountsStore(
+      useShallow((state) => ({
+        groups: isOpen ? state.groups : noGroups,
+        accounts: isOpen ? state.accounts : noAccounts,
+        addGroup: state.addGroup,
+        updateGroup: state.updateGroup,
+        removeGroup: state.removeGroup,
+        moveAccountsToGroup: state.moveAccountsToGroup
+      }))
+    )
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
 
   // 编辑状态
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -31,18 +45,26 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
   // 分配账号状态
   const [assigningGroupId, setAssigningGroupId] = useState<string | null>(null)
 
-  // 获取分组内的账号数量
-  const getGroupAccountCount = (groupId: string): number => {
-    return Array.from(accounts.values()).filter((acc) => acc.groupId === groupId).length
-  }
-
-  // 获取未分组的账号数量
-  const getUngroupedCount = (): number => {
-    return Array.from(accounts.values()).filter((acc) => !acc.groupId).length
-  }
+  const { groupCounts, ungrouped } = useMemo(() => {
+    const counts = new Map<string, number>()
+    let ungrouped = 0
+    for (const account of accounts.values()) {
+      if (account.groupId) counts.set(account.groupId, (counts.get(account.groupId) || 0) + 1)
+      else ungrouped++
+    }
+    return { groupCounts: counts, ungrouped }
+  }, [accounts])
+  const { assigned, available } = useMemo(() => {
+    const assigned: Account[] = [],
+      available: Account[] = []
+    if (assigningGroupId)
+      for (const account of accounts.values())
+        (account.groupId === assigningGroupId ? assigned : available).push(account)
+    return { assigned, available }
+  }, [accounts, assigningGroupId])
 
   // 创建分组
-  const handleCreate = () => {
+  const handleCreate = (): void => {
     if (!newName.trim()) return
     addGroup({
       name: newName.trim(),
@@ -56,7 +78,7 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
   }
 
   // 开始编辑
-  const handleStartEdit = (group: AccountGroup) => {
+  const handleStartEdit = (group: AccountGroup): void => {
     setEditingId(group.id)
     setEditName(group.name)
     setEditDescription(group.description || '')
@@ -64,7 +86,7 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
   }
 
   // 保存编辑
-  const handleSaveEdit = () => {
+  const handleSaveEdit = (): void => {
     if (!editingId || !editName.trim()) return
     updateGroup(editingId, {
       name: editName.trim(),
@@ -75,8 +97,8 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
   }
 
   // 删除分组
-  const handleDelete = (id: string, name: string) => {
-    const count = getGroupAccountCount(id)
+  const handleDelete = (id: string, name: string): void => {
+    const count = groupCounts.get(id) || 0
     const msg =
       count > 0
         ? `确定要删除分组「${name}」吗？\n该分组包含 ${count} 个账号，删除后这些账号将变为未分组状态。`
@@ -87,21 +109,14 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
   }
 
   // 批量分配账号到分组（不退出分配模式，允许连续操作）
-  const handleAssignAccounts = (groupId: string | undefined, accountIds: string[]) => {
+  const handleAssignAccounts = (groupId: string | undefined, accountIds: string[]): void => {
     moveAccountsToGroup(accountIds, groupId)
   }
 
-  // 获取可分配的账号列表
-  const getAssignableAccounts = (groupId: string) => {
-    return Array.from(accounts.values()).filter((acc) => acc.groupId !== groupId)
-  }
-
-  // 获取分组内的账号列表
-  const getGroupAccounts = (groupId: string) => {
-    return Array.from(accounts.values()).filter((acc) => acc.groupId === groupId)
-  }
-
-  const groupList = Array.from(groups.values()).sort((a, b) => a.order - b.order)
+  const groupList = useMemo(
+    () => Array.from(groups.values()).sort((a, b) => a.order - b.order),
+    [groups]
+  )
 
   if (!isOpen) return null
 
@@ -138,9 +153,7 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
           <div className="flex gap-4 text-body text-muted-foreground">
             <span>{isEn ? `${groupList.length} groups` : `共 ${groupList.length} 个分组`}</span>
             <span>•</span>
-            <span>
-              {isEn ? `${getUngroupedCount()} ungrouped` : `${getUngroupedCount()} 个未分组账号`}
-            </span>
+            <span>{isEn ? `${ungrouped} ungrouped` : `${ungrouped} 个未分组账号`}</span>
           </div>
 
           {/* 新建分组 */}
@@ -240,13 +253,14 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                     </div>
 
                     {/* 当前分组内的账号 */}
-                    {getGroupAccounts(group.id).length > 0 && (
+                    {assigned.length > 0 && (
                       <div className="space-y-1">
                         <p className="text-caption text-muted-foreground">
                           {isEn ? 'Accounts in this group:' : '当前分组内的账号：'}
                         </p>
-                        <div className="flex flex-wrap gap-1">
-                          {getGroupAccounts(group.id).map((acc) => (
+                        <AccountAssignmentList
+                          items={assigned}
+                          renderItem={(acc) => (
                             <span
                               key={acc.id}
                               className="inline-flex items-center gap-1 h-5 px-[7px] bg-primary/10 text-primary rounded-full text-badge"
@@ -260,19 +274,20 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                                 <X className="h-3 w-3" />
                               </button>
                             </span>
-                          ))}
-                        </div>
+                          )}
+                        />
                       </div>
                     )}
 
                     {/* 可添加的账号 */}
-                    {getAssignableAccounts(group.id).length > 0 && (
+                    {available.length > 0 && (
                       <div className="space-y-1">
                         <p className="text-caption text-muted-foreground">
                           {isEn ? 'Click to add to this group:' : '点击添加到此分组：'}
                         </p>
-                        <div className="flex flex-wrap gap-1 max-h-32 overflow-auto">
-                          {getAssignableAccounts(group.id).map((acc) => (
+                        <AccountAssignmentList
+                          items={available}
+                          renderItem={(acc) => (
                             <button
                               key={acc.id}
                               onClick={() => handleAssignAccounts(group.id, [acc.id])}
@@ -280,8 +295,8 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                             >
                               {acc.email}
                             </button>
-                          ))}
-                        </div>
+                          )}
+                        />
                       </div>
                     )}
 
@@ -303,7 +318,7 @@ export function GroupManageDialog({ isOpen, onClose }: GroupManageDialogProps): 
                         <span className="font-medium truncate">{group.name}</span>
                         <span className="text-caption text-muted-foreground flex items-center gap-1">
                           <Users className="h-3 w-3" />
-                          {getGroupAccountCount(group.id)}
+                          {groupCounts.get(group.id) || 0}
                         </span>
                       </div>
                       {group.description && (

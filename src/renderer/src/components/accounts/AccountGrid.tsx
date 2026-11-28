@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow'
 import { useRef, useState, useEffect } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useAccountsStore } from '@/store/accounts'
@@ -70,14 +71,25 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
     tags,
     groups,
     selectedIds,
-    toggleSelection,
     checkAccountStatus,
     setFilter,
     setActiveGroupTab
-  } = useAccountsStore()
+  } = useAccountsStore(
+    useShallow((state) => ({
+      accounts: state.accounts,
+      getFilteredAccounts: state.getFilteredAccounts,
+      tags: state.tags,
+      groups: state.groups,
+      selectedIds: state.selectedIds,
+      checkAccountStatus: state.checkAccountStatus,
+      setFilter: state.setFilter,
+      setActiveGroupTab: state.setActiveGroupTab
+    }))
+  )
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
-  const accounts = getFilteredAccounts()
+  const accounts = useAccountsStore((state) => state.getFilteredAccounts())
+  const toggleSelection = useAccountsStore((state) => state.toggleSelection)
   const rowCount = Math.ceil(accounts.length / columns)
 
   const handleRefreshDetail = async (): Promise<void> => {
@@ -142,9 +154,9 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
                       tags={tags}
                       groups={groups}
                       isSelected={selectedIds.has(account.id)}
-                      onSelect={() => toggleSelection(account.id)}
-                      onEdit={() => onEditAccount(account)}
-                      onShowDetail={() => setDetailAccount(account)}
+                      onSelect={toggleSelection}
+                      onEdit={onEditAccount}
+                      onShowDetail={setDetailAccount}
                     />
                   ))}
               </div>

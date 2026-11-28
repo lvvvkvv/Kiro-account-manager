@@ -99,7 +99,7 @@ func swap(_ left: URL, _ right: URL) throws {
     }
 }
 
-guard CommandLine.arguments.count == 3 else { fputs("Usage: kiro-updater <prepare|install|recover|watch> <transaction.json>\n", stderr); exit(2) }
+guard CommandLine.arguments.count == 3 else { fputs("Usage: kiro-updater <prepare|install|recover|watch|cleanup> <transaction.json>\n", stderr); exit(2) }
 let mode = CommandLine.arguments[1]
 let jobURL = URL(fileURLWithPath: CommandLine.arguments[2]).standardizedFileURL
 let directory = jobURL.deletingLastPathComponent()
@@ -108,7 +108,7 @@ let healthURL = directory.appendingPathComponent("health.json")
 let armedURL = directory.appendingPathComponent("armed")
 
 do {
-    guard ["prepare", "install", "recover", "watch"].contains(mode), jobURL.lastPathComponent == "transaction.json",
+    guard ["prepare", "install", "recover", "watch", "cleanup"].contains(mode), jobURL.lastPathComponent == "transaction.json",
           directory.resolvingSymlinksInPath() == directory else { throw Failure("Invalid transaction location") }
     var tx = try read(Transaction.self, jobURL)
     guard UUID(uuidString: tx.id) != nil, directory.lastPathComponent == tx.id else { throw Failure("Invalid transaction ID") }
@@ -166,6 +166,28 @@ do {
         guard try containsArchitecture(url.appendingPathComponent("Contents/MacOS/\(name)"), architecture) else {
             throw Failure("Executable architecture mismatch")
         }
+    }
+    func cleanup() throws {
+        // A failed recovery may hold the only usable old application. Never collect it.
+        guard ["committed", "rolled-back", "failed", "cancelled"].contains(tx.phase) else { return }
+        let installedVersion = try bundleVersion(appURL)
+        let minimumVersion = tx.phase == "committed" ? tx.version : tx.currentVersion
+        guard installedVersion.compare(minimumVersion, options: .numeric) != .orderedAscending else {
+            throw Failure("Retaining rollback data until a working application is installed")
+        }
+        try validateBundle(appURL, version: installedVersion)
+        guard work.resolvingSymlinksInPath() == work else { throw Failure("Invalid staging location") }
+        if fm.fileExists(atPath: work.path) { try fm.removeItem(at: work) }
+        for name in ["payload.zip", "kiro-updater"] {
+            let artifact = directory.appendingPathComponent(name)
+            if fm.fileExists(atPath: artifact.path) { try fm.removeItem(at: artifact) }
+        }
+        // Keep the journal and small receipts for recovery diagnostics.
+    }
+    if mode == "cleanup" { try cleanup(); exit(0) }
+    defer {
+        do { try cleanup() }
+        catch { fputs("Update cleanup deferred: \(error)\n", stderr) }
     }
     func stopLaunched() throws {
         guard let instance = try? read(Health.self, instanceURL), instance.token == tx.launchToken, alive(instance.pid) else { return }

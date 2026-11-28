@@ -1,3 +1,5 @@
+import { useShallow } from 'zustand/react/shallow'
+import { VirtualRows } from '../ui/VirtualRows'
 import { useState, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -12,11 +14,8 @@ import {
   AlertTriangle,
   Trash2,
   ListChecks,
-  Network,
   UserPlus,
   CreditCard,
-  RefreshCw,
-  Zap,
   Loader2
 } from 'lucide-react'
 import { useTaskStore, type TaskEntry, type TaskKind } from '@/store/tasks'
@@ -25,12 +24,7 @@ import { cn } from '@/lib/utils'
 
 const KIND_ICONS: Record<TaskKind, React.ElementType> = {
   'register-batch': UserPlus,
-  'subscription-batch': CreditCard,
-  'overage-batch': Zap,
-  'proxy-validation': Network,
-  'token-refresh': RefreshCw,
-  'account-check': RefreshCw,
-  other: ListChecks
+  'subscription-batch': CreditCard
 }
 
 /**
@@ -38,36 +32,38 @@ const KIND_ICONS: Record<TaskKind, React.ElementType> = {
  * 点击展开任务列表抽屉
  */
 export function TaskCenterButton(): React.ReactNode {
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
   const [open, setOpen] = useState(false)
-  const tasks = useTaskStore((s) => s.tasks)
-
-  const { activeCount, finishedCount, hasFailure, totalProgress } = useMemo(() => {
-    let active = 0,
-      finished = 0,
-      hasFail = false
-    let totalDone = 0,
-      totalAll = 0
-    for (const t of tasks.values()) {
-      if (t.status === 'running' || t.status === 'paused') {
-        active++
-        totalDone += t.done
-        totalAll += t.total
-      } else {
-        finished++
-        if (t.status === 'failed') hasFail = true
+  const { size, activeCount, finishedCount, hasFailure, totalProgress } = useTaskStore(
+    useShallow((state) => {
+      const tasks = state.tasks
+      let active = 0,
+        finished = 0,
+        hasFail = false
+      let totalDone = 0,
+        totalAll = 0
+      for (const t of tasks.values()) {
+        if (t.status === 'running' || t.status === 'paused') {
+          active++
+          totalDone += t.done
+          totalAll += t.total
+        } else {
+          finished++
+          if (t.status === 'failed') hasFail = true
+        }
       }
-    }
-    return {
-      activeCount: active,
-      finishedCount: finished,
-      hasFailure: hasFail,
-      totalProgress: totalAll > 0 ? Math.round((totalDone / totalAll) * 100) : 0
-    }
-  }, [tasks])
+      return {
+        size: tasks.size,
+        activeCount: active,
+        finishedCount: finished,
+        hasFailure: hasFail,
+        totalProgress: totalAll > 0 ? Math.round((totalDone / totalAll) * 100) : 0
+      }
+    })
+  )
 
-  if (tasks.size === 0) return null
+  if (size === 0) return null
 
   return (
     <>
@@ -100,19 +96,20 @@ export function TaskCenterButton(): React.ReactNode {
         )}
       </button>
 
-      <TaskCenterDrawer open={open} onClose={() => setOpen(false)} />
+      <AnimatePresence>
+        {open && <TaskCenterDrawer onClose={() => setOpen(false)} />}
+      </AnimatePresence>
     </>
   )
 }
 
 interface TaskCenterDrawerProps {
-  open: boolean
   onClose: () => void
 }
 
-function TaskCenterDrawer({ open, onClose }: TaskCenterDrawerProps): React.ReactNode {
-  const { t: translate } = useTranslation()
-  const isEn = translate('common.unknown') === 'Unknown'
+function TaskCenterDrawer({ onClose }: TaskCenterDrawerProps): React.ReactNode {
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
   const tasks = useTaskStore((s) => s.tasks)
   const cancelTask = useTaskStore((s) => s.cancelTask)
   const removeTask = useTaskStore((s) => s.removeTask)
@@ -151,98 +148,101 @@ function TaskCenterDrawer({ open, onClose }: TaskCenterDrawerProps): React.React
   // 通过 Portal 渲染到 document.body：避免被 TitleBar 的 -webkit-app-region: drag
   // 拖拽区吞掉点击，也避免受 titlebar 堆叠上下文 / overflow 影响导致按钮点不动
   return createPortal(
-    <AnimatePresence>
-      {open && (
-        // no-drag 确保抽屉内所有按钮在 Windows 下可点击
-        <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-          {/* 遮罩 */}
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.15 }}
-            className="fixed inset-0 z-[9998] bg-[var(--overlay)]"
-            data-task-backdrop
-            onClick={onClose}
-          />
-          {/* 抽屉 */}
-          <motion.div
-            initial={{ x: '100%' }}
-            animate={{ x: 0 }}
-            exit={{ x: '100%' }}
-            transition={{ type: 'spring', stiffness: 300, damping: 30 }}
-            className="fixed right-0 top-0 bottom-0 z-[9999] w-[420px] max-w-full overflow-hidden rounded-l-dialog border-l bg-card text-card-foreground shadow-[var(--dialog-shadow)] flex flex-col"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="task-center-title"
-          >
-            {/* 头部 */}
-            <div className="relative shrink-0 border-b px-5 py-4">
-              <div className="flex items-center gap-2">
-                <Activity className="h-4 w-4 text-text-secondary" />
-                <h2 id="task-center-title" className="text-section">
-                  {isEn ? 'Task Center' : '任务中心'}
-                </h2>
-                <Badge variant="secondary" className="tabular-nums">
-                  {sortedTasks.length}
-                </Badge>
-              </div>
-              <div className="mt-3 flex flex-wrap items-center gap-2">
-                {activeCount > 0 && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={cancelAllActive}
-                    className="text-destructive hover:text-destructive"
-                    title={
-                      isEn
-                        ? `Cancel all ${activeCount} running tasks`
-                        : `取消所有 ${activeCount} 个正在进行的任务`
-                    }
-                  >
-                    <XCircle className="h-4 w-4" />
-                    {isEn ? 'Cancel all' : '全部取消'}
-                  </Button>
-                )}
-                <Button variant="ghost" size="sm" onClick={clearFinished}>
-                  <Trash2 className="h-4 w-4" />
-                  {isEn ? 'Clear finished' : '清理已完成'}
-                </Button>
-                <button
-                  type="button"
-                  onClick={onClose}
-                  aria-label={isEn ? 'Close' : '关闭'}
-                  className="absolute right-3 top-3 flex size-7 items-center justify-center rounded-control text-text-secondary hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
+    <>
+      {/* no-drag 确保抽屉内所有按钮在 Windows 下可点击 */}
+      <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+        {/* 遮罩 */}
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.15 }}
+          className="fixed inset-0 z-[9998] bg-[var(--overlay)]"
+          data-task-backdrop
+          onClick={onClose}
+        />
+        {/* 抽屉 */}
+        <motion.div
+          initial={{ x: '100%' }}
+          animate={{ x: 0 }}
+          exit={{ x: '100%' }}
+          transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+          className="fixed right-0 top-0 bottom-0 z-[9999] w-[420px] max-w-full overflow-hidden rounded-l-dialog border-l bg-card text-card-foreground shadow-[var(--dialog-shadow)] flex flex-col"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="task-center-title"
+        >
+          {/* 头部 */}
+          <div className="relative shrink-0 border-b px-5 py-4">
+            <div className="flex items-center gap-2">
+              <Activity className="h-4 w-4 text-text-secondary" />
+              <h2 id="task-center-title" className="text-section">
+                {isEn ? 'Task Center' : '任务中心'}
+              </h2>
+              <Badge variant="secondary" className="tabular-nums">
+                {sortedTasks.length}
+              </Badge>
             </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              {activeCount > 0 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={cancelAllActive}
+                  className="text-destructive hover:text-destructive"
+                  title={
+                    isEn
+                      ? `Cancel all ${activeCount} running tasks`
+                      : `取消所有 ${activeCount} 个正在进行的任务`
+                  }
+                >
+                  <XCircle className="h-4 w-4" />
+                  {isEn ? 'Cancel all' : '全部取消'}
+                </Button>
+              )}
+              <Button variant="ghost" size="sm" onClick={clearFinished}>
+                <Trash2 className="h-4 w-4" />
+                {isEn ? 'Clear finished' : '清理已完成'}
+              </Button>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label={isEn ? 'Close' : '关闭'}
+                className="absolute right-3 top-3 flex size-7 items-center justify-center rounded-control text-text-secondary hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
 
-            {/* 列表 */}
-            <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-              {sortedTasks.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full text-muted-foreground py-12">
-                  <ListChecks className="h-10 w-10 opacity-30 mb-3" />
-                  <p className="text-sm">{isEn ? 'No tasks' : '暂无任务'}</p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {sortedTasks.map((task) => (
+          {/* 列表 */}
+          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+            {sortedTasks.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full text-muted-foreground py-12">
+                <ListChecks className="h-10 w-10 opacity-30 mb-3" />
+                <p className="text-sm">{isEn ? 'No tasks' : '暂无任务'}</p>
+              </div>
+            ) : (
+              <VirtualRows
+                items={sortedTasks}
+                estimateSize={160}
+                maxHeight="calc(100vh - 200px)"
+                renderRow={(task) => (
+                  <div className="pb-2">
                     <TaskRow
                       key={task.id}
                       task={task}
                       onCancel={() => cancelTask(task.id)}
                       onRemove={() => removeTask(task.id)}
                     />
-                  ))}
-                </div>
-              )}
-            </div>
-          </motion.div>
-        </div>
-      )}
-    </AnimatePresence>,
+                  </div>
+                )}
+              />
+            )}
+          </div>
+        </motion.div>
+      </div>
+    </>,
     document.body
   )
 }
@@ -254,8 +254,8 @@ interface TaskRowProps {
 }
 
 function TaskRow({ task, onCancel, onRemove }: TaskRowProps): React.ReactNode {
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
   const Icon = KIND_ICONS[task.kind] || ListChecks
   const isActive = task.status === 'running' || task.status === 'paused'
   const elapsed = (task.finishedAt || Date.now()) - task.createdAt

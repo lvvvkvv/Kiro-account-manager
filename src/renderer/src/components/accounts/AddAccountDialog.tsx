@@ -1,8 +1,10 @@
-import { useState, useEffect, useRef } from 'react'
+import { createAccountIdentityIndex } from '@/lib/account'
+import { useShallow } from 'zustand/react/shallow'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label, Select } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
-import type { SubscriptionType } from '@/types/account'
+import type { SubscriptionType, Account } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
 import { splitCredentialLine } from '@/lib/utils'
 
@@ -11,69 +13,37 @@ interface AddAccountDialogProps {
   onClose: () => void
 }
 
-interface BonusData {
-  code: string
-  name: string
-  current: number
-  limit: number
-  expiresAt?: string
-}
-
-interface VerifiedData {
-  email: string
-  userId: string
-  accessToken: string
-  refreshToken: string
-  expiresIn?: number
-  subscriptionType: string
-  subscriptionTitle: string
-  subscription?: {
-    managementTarget?: string
-    upgradeCapability?: string
-    overageCapability?: string
-  }
-  usage: {
-    current: number
-    limit: number
-    baseLimit?: number
-    baseCurrent?: number
-    freeTrialLimit?: number
-    freeTrialCurrent?: number
-    freeTrialExpiry?: string
-    bonuses?: BonusData[]
-    nextResetDate?: string
-    resourceDetail?: {
-      displayName?: string
-      displayNamePlural?: string
-      resourceType?: string
-      currency?: string
-      unit?: string
-      overageRate?: number
-      overageCap?: number
-      overageEnabled?: boolean
-    }
-  }
-  daysRemaining?: number
-  expiresAt?: number
-}
+type NewAccount = Omit<Account, 'id' | 'createdAt' | 'isActive'>
 
 type ImportMode = 'oidc' | 'sso' | 'login'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
-  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } =
-    useAccountsStore()
+  const {
+    addAccount,
+    addAccounts,
+    batchImportConcurrency,
+    loginPrivateMode,
+    groups,
+    activeGroupTab
+  } = useAccountsStore(
+    useShallow((state) => ({
+      addAccount: state.addAccount,
+      addAccounts: state.addAccounts,
+      batchImportConcurrency: state.batchImportConcurrency,
+      loginPrivateMode: state.loginPrivateMode,
+      groups: state.groups,
+      activeGroupTab: state.activeGroupTab
+    }))
+  )
 
   // 检查账户是否已存在（同userId 或 同邮箱+同provider 才算重复）
   const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
-    return Array.from(accounts.values()).some((acc) => {
-      // userId 相同则重复（主要判断依据）
-      if (userId && acc.userId === userId) return true
-      // email 非空且相同，且 provider 相同则重复（允许同邮箱不同登录方式）
-      // 企业账号可能没有 email，所以 email 为空时不用 email 判断
-      if (email && acc.email === email && acc.credentials.provider === provider) return true
-      return false
-    })
+    return createAccountIdentityIndex(useAccountsStore.getState().accounts.values()).has(
+      email,
+      userId,
+      provider
+    )
   }
 
   // 导入模式
@@ -109,9 +79,6 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     errors: string[]
   } | null>(null)
 
-  // 验证后的数据（保留用于条件渲染）
-  const [verifiedData, setVerifiedData] = useState<VerifiedData | null>(null)
-
   // 状态
   const [isVerifying, setIsVerifying] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -130,7 +97,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     interval: number
   } | null>(null)
   const [copied, setCopied] = useState(false)
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const pollIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // IAM SSO 登录相关状态
   const [ssoStartUrl, setSsoStartUrl] = useState('')
@@ -141,14 +108,33 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     interval: number
   } | null>(null)
 
-  // 清理轮询
-  useEffect(() => {
-    return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current)
-      }
+  const loginGeneration = useRef(0)
+  const loginSession = useRef<LoginType | null>(null)
+  const cancelPendingLogin = useCallback((): void => {
+    loginGeneration.current++
+    if (pollIntervalRef.current) clearTimeout(pollIntervalRef.current)
+    pollIntervalRef.current = null
+    const kind = loginSession.current
+    loginSession.current = null
+    if (kind) {
+      const cancel =
+        kind === 'builderid'
+          ? window.api.cancelBuilderIdLogin
+          : kind === 'iamsso'
+            ? window.api.cancelIamSsoLogin
+            : window.api.cancelSocialLogin
+      void cancel().catch(console.error)
     }
   }, [])
+  useEffect(() => {
+    if (!isOpen) {
+      cancelPendingLogin()
+      setIsLoggingIn(false)
+      setBuilderIdLoginData(null)
+      setIamSsoLoginData(null)
+    }
+    return cancelPendingLogin
+  }, [isOpen, cancelPendingLogin])
 
   // 打开弹窗时默认选中"当前打开的分组"（activeGroupTab 为真实分组时），否则未分组
   useEffect(() => {
@@ -160,7 +146,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
   // 监听 Social Auth 回调
   useEffect(() => {
-    if (!isLoggingIn || loginType === 'builderid') return
+    if (!isLoggingIn || (loginType !== 'google' && loginType !== 'github')) return
 
     const unsubscribe = window.api.onSocialAuthCallback(async (data) => {
       console.log('[AddAccountDialog] Social auth callback:', data)
@@ -172,11 +158,14 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       }
 
       if (data.code && data.state) {
+        const generation = loginGeneration.current
         try {
           const result = await window.api.exchangeSocialToken(data.code, data.state)
+          if (generation !== loginGeneration.current) return
           if (result.success) {
             await handleLoginSuccess({
               accessToken: result.accessToken!,
+              expiresIn: result.expiresIn,
               refreshToken: result.refreshToken!,
               authMethod: 'social',
               provider: result.provider
@@ -198,6 +187,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   // 处理登录成功
   const handleLoginSuccess = async (tokenData: {
     accessToken: string
+    expiresIn?: number
     refreshToken: string
     clientId?: string
     clientSecret?: string
@@ -205,12 +195,15 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     startUrl?: string
     authMethod?: string
     provider?: string
-  }) => {
+  }): Promise<void> => {
+    const generation = loginGeneration.current
     console.log('[AddAccountDialog] Login successful, verifying credentials...')
 
     try {
       // 验证凭证并获取账号信息
       const result = await window.api.verifyAccountCredentials({
+        accessToken: tokenData.accessToken,
+        expiresIn: tokenData.expiresIn,
         refreshToken: tokenData.refreshToken,
         clientId: tokenData.clientId || '',
         clientSecret: tokenData.clientSecret || '',
@@ -219,6 +212,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         provider: tokenData.provider
       })
 
+      if (generation !== loginGeneration.current) return
       if (result.success && result.data) {
         const { email, userId } = result.data
         const providerName = tokenData.provider || 'BuilderId'
@@ -293,13 +287,16 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // 启动 Builder ID 登录
-  const handleStartBuilderIdLogin = async () => {
+  const handleStartBuilderIdLogin = async (): Promise<void> => {
+    const generation = ++loginGeneration.current
+    loginSession.current = 'builderid'
     setIsLoggingIn(true)
     setError(null)
     setBuilderIdLoginData(null)
 
     try {
       const result = await window.api.startBuilderIdLogin(region)
+      if (generation !== loginGeneration.current) return
 
       if (result.success && result.userCode && result.verificationUri) {
         setBuilderIdLoginData({
@@ -319,24 +316,28 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         setIsLoggingIn(false)
       }
     } catch (e) {
+      if (generation !== loginGeneration.current) return
       setError(e instanceof Error ? e.message : '启动登录失败')
       setIsLoggingIn(false)
     }
   }
 
   // 启动 IAM SSO 登录 (Authorization Code flow)
-  const handleStartIamSsoLogin = async () => {
+  const handleStartIamSsoLogin = async (): Promise<void> => {
     if (!ssoStartUrl.trim()) {
       setError(isEn ? 'Please enter SSO Start URL' : '请输入 SSO Start URL')
       return
     }
 
+    const generation = ++loginGeneration.current
+    loginSession.current = 'iamsso'
     setIsLoggingIn(true)
     setError(null)
     setIamSsoLoginData(null)
 
     try {
       const result = await window.api.startIamSsoLogin(ssoStartUrl.trim(), region)
+      if (generation !== loginGeneration.current) return
 
       if (result.success && result.authorizeUrl) {
         // 设置登录数据（用于显示等待状态）
@@ -357,121 +358,71 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         setIsLoggingIn(false)
       }
     } catch (e) {
+      if (generation !== loginGeneration.current) return
       setError(e instanceof Error ? e.message : isEn ? 'Failed to start login' : '启动登录失败')
       setIsLoggingIn(false)
     }
   }
 
-  // 开始轮询 IAM SSO 授权
-  const startIamSsoPolling = (interval: number) => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current)
-    }
-
-    pollIntervalRef.current = setInterval(async () => {
+  // 一次轮询结束后再调度下一次；关闭/取消后的迟到结果不再处理。
+  const startAuthorizationPolling = (kind: 'builderid' | 'iamsso', interval: number): void => {
+    if (pollIntervalRef.current) clearTimeout(pollIntervalRef.current)
+    const generation = loginGeneration.current
+    let delay = Math.max(1, interval) * 1000
+    const poll = async (): Promise<void> => {
+      if (generation !== loginGeneration.current) return
       try {
-        const result = await window.api.pollIamSsoAuth(region)
-
+        const result =
+          kind === 'builderid'
+            ? await window.api.pollBuilderIdAuth(region)
+            : await window.api.pollIamSsoAuth(region)
+        if (generation !== loginGeneration.current) return
         if (!result.success) {
           setError(result.error || (isEn ? 'Authorization failed' : '授权失败'))
+          cancelPendingLogin()
           setIsLoggingIn(false)
+          setBuilderIdLoginData(null)
           setIamSsoLoginData(null)
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current)
-            pollIntervalRef.current = null
-          }
           return
         }
-
         if (result.completed) {
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current)
-            pollIntervalRef.current = null
-          }
-
+          pollIntervalRef.current = null
           await handleLoginSuccess({
             accessToken: result.accessToken!,
             refreshToken: result.refreshToken!,
+            expiresIn: result.expiresIn,
             clientId: result.clientId,
             clientSecret: result.clientSecret,
             region: result.region,
-            startUrl: ssoStartUrl.trim(),
+            startUrl: kind === 'iamsso' ? ssoStartUrl.trim() : undefined,
             authMethod: 'IdC',
-            provider: 'Enterprise'
+            provider: kind === 'iamsso' ? 'Enterprise' : 'BuilderId'
           })
-
-          setIsLoggingIn(false)
-          setIamSsoLoginData(null)
-        }
-        // 如果是 pending 或 slow_down，继续轮询
-      } catch (e) {
-        console.error('[AddAccountDialog] IAM SSO Poll error:', e)
-      }
-    }, interval * 1000)
-  }
-
-  // 开始轮询 Builder ID 授权
-  const startPolling = (interval: number) => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current)
-    }
-
-    pollIntervalRef.current = setInterval(async () => {
-      try {
-        const result = await window.api.pollBuilderIdAuth(region)
-
-        if (!result.success) {
-          setError(result.error || '授权失败')
-          setIsLoggingIn(false)
-          setBuilderIdLoginData(null)
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current)
-            pollIntervalRef.current = null
+          if (generation === loginGeneration.current) {
+            setIsLoggingIn(false)
+            setBuilderIdLoginData(null)
+            setIamSsoLoginData(null)
           }
           return
         }
-
-        if (result.completed) {
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current)
-            pollIntervalRef.current = null
-          }
-
-          await handleLoginSuccess({
-            accessToken: result.accessToken!,
-            refreshToken: result.refreshToken!,
-            clientId: result.clientId,
-            clientSecret: result.clientSecret,
-            region: result.region,
-            authMethod: 'IdC',
-            provider: 'BuilderId'
-          })
-
-          setIsLoggingIn(false)
-          setBuilderIdLoginData(null)
-        }
-        // 如果是 pending 或 slow_down，继续轮询
-      } catch (e) {
-        console.error('[AddAccountDialog] Poll error:', e)
+        if (result.status === 'slow_down') delay += 5000
+      } catch (error) {
+        console.error('[Login] Poll failed:', error)
       }
-    }, interval * 1000)
+      if (generation === loginGeneration.current)
+        pollIntervalRef.current = setTimeout(() => {
+          void poll()
+        }, delay)
+    }
+    pollIntervalRef.current = setTimeout(() => {
+      void poll()
+    }, delay)
   }
-
-  // 取消登录
-  const handleCancelLogin = async () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current)
-      pollIntervalRef.current = null
-    }
-
-    if (loginType === 'builderid') {
-      await window.api.cancelBuilderIdLogin()
-    } else if (loginType === 'iamsso') {
-      await window.api.cancelIamSsoLogin()
-    } else {
-      await window.api.cancelSocialLogin()
-    }
-
+  const startPolling = (interval: number): void => startAuthorizationPolling('builderid', interval)
+  const startIamSsoPolling = (interval: number): void =>
+    startAuthorizationPolling('iamsso', interval)
+  const handleCancelLogin = (): void => {
+    cancelPendingLogin()
     setIsLoggingIn(false)
     setBuilderIdLoginData(null)
     setIamSsoLoginData(null)
@@ -479,12 +430,15 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // 启动 Social Auth 登录 (Google/GitHub)
-  const handleStartSocialLogin = async (socialProvider: 'Google' | 'Github') => {
+  const handleStartSocialLogin = async (socialProvider: 'Google' | 'Github'): Promise<void> => {
+    const generation = ++loginGeneration.current
+    loginSession.current = socialProvider === 'Google' ? 'google' : 'github'
     setIsLoggingIn(true)
     setError(null)
 
     try {
       const result = await window.api.startSocialLogin(socialProvider, usePrivateMode)
+      if (generation !== loginGeneration.current) return
 
       if (!result.success) {
         setError(result.error || '启动登录失败')
@@ -492,13 +446,14 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       }
       // 成功后等待回调
     } catch (e) {
+      if (generation !== loginGeneration.current) return
       setError(e instanceof Error ? e.message : '启动登录失败')
       setIsLoggingIn(false)
     }
   }
 
   // 复制 user_code
-  const handleCopyUserCode = async () => {
+  const handleCopyUserCode = async (): Promise<void> => {
     if (builderIdLoginData?.userCode) {
       await navigator.clipboard.writeText(builderIdLoginData.userCode)
       setCopied(true)
@@ -507,7 +462,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // 从本地配置导入
-  const handleImportFromLocal = async () => {
+  const handleImportFromLocal = async (): Promise<void> => {
     try {
       const result = await window.api.loadKiroCredentials()
       if (result.success && result.data) {
@@ -527,7 +482,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // 从 SSO Token 导入并添加账号（支持批量）
-  const handleSsoImport = async () => {
+  const handleSsoImport = async (): Promise<void> => {
     if (!ssoToken.trim()) {
       setError('请输入 x-amz-sso_authn 的值')
       return
@@ -548,6 +503,20 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setError(null)
     setBatchImportResult(null)
 
+    const pendingAccounts: NewAccount[] = []
+    const identities = createAccountIdentityIndex(useAccountsStore.getState().accounts.values())
+    const seenTokens = new Set<string>()
+    const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
+      if (identities.has(email, userId, provider)) return true
+      identities.add(email, userId, provider)
+      return false
+    }
+    const commitAccounts = (): void => {
+      const items = pendingAccounts.splice(0)
+      if (!items.length) return
+      const result = addAccounts(items)
+      importResult.success -= items.length - result.success
+    }
     const importResult = {
       total: tokens.length,
       success: 0,
@@ -559,6 +528,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     // 单个 Token 导入函数
     const importSingleToken = async (token: string, index: number): Promise<void> => {
       try {
+        if (seenTokens.has(token)) return
+        seenTokens.add(token)
         const result = await window.api.importFromSsoToken(token, region)
 
         if (result.success && result.data) {
@@ -574,7 +545,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
           // 添加账号
           const now = Date.now()
-          addAccount({
+          pendingAccounts.push({
             email: email || '',
             userId: userId || '',
             nickname: email ? email.split('@')[0] : undefined,
@@ -642,6 +613,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         await Promise.allSettled(
           batch.map((token, batchIndex) => importSingleToken(token, i + batchIndex))
         )
+        commitAccounts()
         // 批次间添加短暂延迟
         if (i + BATCH_SIZE < tokens.length) {
           await new Promise((resolve) => setTimeout(resolve, 100))
@@ -674,7 +646,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // OIDC 批量导入
-  const handleOidcBatchAdd = async () => {
+  const handleOidcBatchAdd = async (): Promise<void> => {
     if (!oidcBatchData.trim()) {
       setError('请输入凭证数据')
       return
@@ -752,6 +724,20 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setError(null)
     setOidcBatchImportResult(null)
 
+    const pendingAccounts: NewAccount[] = []
+    const identities = createAccountIdentityIndex(useAccountsStore.getState().accounts.values())
+    const seenTokens = new Set<string>()
+    const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
+      if (identities.has(email, userId, provider)) return true
+      identities.add(email, userId, provider)
+      return false
+    }
+    const commitAccounts = (): void => {
+      const items = pendingAccounts.splice(0)
+      if (!items.length) return
+      const result = addAccounts(items)
+      importResult.success -= items.length - result.success
+    }
     const importResult = {
       total: credentials.length,
       success: 0,
@@ -766,6 +752,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       index: number
     ): Promise<void> => {
       try {
+        if (seenTokens.has(cred.refreshToken)) return
+        seenTokens.add(cred.refreshToken)
         if (!cred.refreshToken) {
           importResult.failed++
           importResult.failedIndices.push(index)
@@ -818,7 +806,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             (provider === 'BuilderId' || provider === 'Enterprise' ? 'IdC' : 'social')
 
           const now = Date.now()
-          addAccount({
+          pendingAccounts.push({
             email,
             password: cred.password,
             userId,
@@ -893,6 +881,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         await Promise.allSettled(
           batch.map((cred, batchIndex) => importSingleCredential(cred, i + batchIndex))
         )
+        commitAccounts()
         // 批次间添加短暂延迟，进一步避免限流
         if (i + BATCH_SIZE < credentials.length) {
           await new Promise((resolve) => setTimeout(resolve, 100))
@@ -939,7 +928,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // OIDC 凭证添加账号（验证并添加）
-  const handleOidcAdd = async () => {
+  const handleOidcAdd = async (): Promise<void> => {
     if (!refreshToken) {
       setError('请填写 Refresh Token')
       return
@@ -1035,7 +1024,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     }
   }
 
-  const resetForm = () => {
+  const resetForm = (): void => {
+    cancelPendingLogin()
     setImportMode('login')
     setRefreshToken('')
     setClientId('')
@@ -1044,7 +1034,6 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setAuthMethod('IdC')
     setProvider('BuilderId')
     setSsoToken('')
-    setVerifiedData(null)
     setError(null)
     // 清理登录状态
     setLoginType('builderid')
@@ -1052,7 +1041,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setBuilderIdLoginData(null)
     setCopied(false)
     if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current)
+      clearTimeout(pollIntervalRef.current)
       pollIntervalRef.current = null
     }
   }
@@ -1122,7 +1111,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                 setImportMode('login')
                 setError(null)
               }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={isLoggingIn}
             >
               {isEn ? 'Login' : '在线登录'}
             </button>
@@ -1133,7 +1122,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                 setImportMode('oidc')
                 setError(null)
               }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={isLoggingIn}
             >
               {isEn ? 'OIDC Token' : 'OIDC 凭证'}
             </button>
@@ -1144,14 +1133,14 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                 setImportMode('sso')
                 setError(null)
               }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={isLoggingIn}
             >
               SSO Token
             </button>
           </div>
 
           {/* 登录模式 */}
-          {importMode === 'login' && !verifiedData && (
+          {importMode === 'login' && (
             <div className="space-y-4">
               {/* 登录中状态 - Builder ID */}
               {isLoggingIn && builderIdLoginData && (
@@ -1560,7 +1549,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           )}
 
           {/* SSO Token 导入模式 */}
-          {importMode === 'sso' && !verifiedData && (
+          {importMode === 'sso' && (
             <div className="space-y-5">
               <div className="p-4 bg-primary/[0.04] rounded-panel border border-primary/15">
                 <div className="flex items-start gap-3">
@@ -1762,7 +1751,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           )}
 
           {/* OIDC 凭证输入模式 */}
-          {importMode === 'oidc' && !verifiedData && (
+          {importMode === 'oidc' && (
             <div className="space-y-5">
               <div className="flex items-center justify-between">
                 <h3 className="text-body font-semibold">

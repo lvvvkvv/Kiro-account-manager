@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow'
 import { PageHeader } from '../layout/PageHeader'
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import {
@@ -159,16 +160,18 @@ type DiagnoseResult = {
 export function DiagnosePage(): React.ReactNode {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
-  const pick = (x: BiText): string => (isEn ? x.en : x.zh)
-  const {
-    proxyPool,
-    proxyPoolConfig,
-    accounts,
-    selectedIds,
-    getAccountProxyUrl,
-    updateAccount,
-    removeAccounts
-  } = useAccountsStore()
+  const pick = useCallback((x: BiText): string => (isEn ? x.en : x.zh), [isEn])
+  const { proxyPool, proxyPoolConfig, accounts, selectedIds, getAccountProxyUrl, removeAccounts } =
+    useAccountsStore(
+      useShallow((state) => ({
+        proxyPool: state.proxyPool,
+        proxyPoolConfig: state.proxyPoolConfig,
+        accounts: state.accounts,
+        selectedIds: state.selectedIds,
+        getAccountProxyUrl: state.getAccountProxyUrl,
+        removeAccounts: state.removeAccounts
+      }))
+    )
 
   // ============ 账号测活状态 ============
   const accountList = useMemo(() => Array.from(accounts.values()), [accounts])
@@ -198,9 +201,10 @@ export function DiagnosePage(): React.ReactNode {
   const [livenessResult, setLivenessResult] = useState<LivenessResult | null>(null)
   // 批量测活结果：accountId -> 结果（undefined 表示进行中）
   const [livenessBatch, setLivenessBatch] = useState<Map<string, LivenessResult | null>>(new Map())
-  const [livenessConcurrency] = useState(3)
+  const livenessConcurrency = 3
   // 中止标志：停止按钮 / 组件卸载时置 true，让 worker 立即停止（避免切页后继续消耗账号 credits）
-  const livenessAbort = useRef(false)
+  const livenessRun = useRef<string | null>(null)
+  const networkRun = useRef<string | null>(null)
 
   // 本地缓存的真实模型列表（来自代理缓存 / Kiro 可用模型；持久化到 localStorage，离线/代理未启时也能用上次结果）
   const [cachedModels, setCachedModels] = useState<string[]>(() => {
@@ -271,16 +275,21 @@ export function DiagnosePage(): React.ReactNode {
   // 组件卸载时中止所有进行中的批量测活，防止后台继续调用 Kiro API 浪费额度
   useEffect(() => {
     return () => {
-      livenessAbort.current = true
+      if (livenessRun.current) void window.api.diagnoseCancel(livenessRun.current)
+      if (networkRun.current) void window.api.diagnoseCancel(networkRun.current)
+      livenessRun.current = null
+      networkRun.current = null
     }
   }, [])
 
   /** 对单个账号执行测活（复用 IPC） */
   const testOneAccount = useCallback(
-    async (account: (typeof accountList)[number]): Promise<LivenessResult> => {
+    async (account: (typeof accountList)[number], requestId: string): Promise<LivenessResult> => {
+      account = useAccountsStore.getState().accounts.get(account.id) || account
       const cred = account.credentials
       try {
         return await window.api.diagnoseAccountLiveness({
+          requestId,
           account: {
             id: account.id,
             email: account.email,
@@ -310,70 +319,87 @@ export function DiagnosePage(): React.ReactNode {
     [livenessModel, livenessMessage, getAccountProxyUrl]
   )
 
+  const beginLiveness = useCallback((): string => {
+    if (livenessRun.current) void window.api.diagnoseCancel(livenessRun.current)
+    const id = crypto.randomUUID()
+    livenessRun.current = id
+    setLivenessRunning(true)
+    return id
+  }, [])
+
   const runLiveness = useCallback(async (): Promise<void> => {
-    const account = accounts.get(livenessAccountId)
+    const account = useAccountsStore.getState().accounts.get(livenessAccountId)
     if (!account) return
-    livenessAbort.current = false
-    setLivenessRunning(true)
+    const id = beginLiveness()
     setLivenessResult(null)
-    const res = await testOneAccount(account)
-    if (livenessAbort.current) return // 组件已卸载，不再 setState
-    setLivenessResult(res)
+    const result = await testOneAccount(account, id)
+    if (livenessRun.current !== id) return
+    setLivenessResult(result)
     setLivenessRunning(false)
-  }, [accounts, livenessAccountId, testOneAccount])
+    livenessRun.current = null
+  }, [livenessAccountId, testOneAccount, beginLiveness])
 
-  /** 批量测活选中账号（并发受限，可中止） */
-  const runLivenessBatch = useCallback(async (): Promise<void> => {
-    if (selectedAccounts.length === 0) return
-    livenessAbort.current = false
-    setLivenessRunning(true)
-    // 初始化所有为"进行中"(null)
-    const init = new Map<string, LivenessResult | null>()
-    for (const a of selectedAccounts) init.set(a.id, null)
-    setLivenessBatch(new Map(init))
-
-    const queue = [...selectedAccounts]
-    const worker = async (): Promise<void> => {
-      for (;;) {
-        if (livenessAbort.current) break // 停止/卸载 → 不再取新账号测试
-        const acc = queue.shift()
-        if (!acc) break
-        const res = await testOneAccount(acc)
-        if (livenessAbort.current) break // 测完发现已中止 → 不再 setState（组件可能已卸载）
-        setLivenessBatch((prev) => {
-          const next = new Map(prev)
-          next.set(acc.id, res)
+  const testBatch = useCallback(
+    async (ids: string[], reset = false): Promise<void> => {
+      if (!ids.length) return
+      const id = beginLiveness()
+      setLivenessBatch((previous) => {
+        const next = reset ? new Map<string, LivenessResult | null>() : new Map(previous)
+        for (const accountId of ids) next.set(accountId, null)
+        return next
+      })
+      const pending = new Map<string, LivenessResult>()
+      const flush = (): void => {
+        if (livenessRun.current !== id || !pending.size) return
+        const entries = Array.from(pending)
+        pending.clear()
+        setLivenessBatch((previous) => {
+          const next = new Map(previous)
+          for (const [key, value] of entries) next.set(key, value)
           return next
         })
       }
-    }
-    const workers = Array.from(
-      { length: Math.min(livenessConcurrency, selectedAccounts.length) },
-      () => worker()
-    )
-    await Promise.all(workers)
-    if (!livenessAbort.current) setLivenessRunning(false)
-  }, [selectedAccounts, testOneAccount, livenessConcurrency])
+      const timer = setInterval(flush, 120)
+      let cursor = 0
+      try {
+        await Promise.all(
+          Array.from({ length: Math.min(livenessConcurrency, ids.length) }, async () => {
+            while (livenessRun.current === id && cursor < ids.length) {
+              const accountId = ids[cursor++]
+              const account = useAccountsStore.getState().accounts.get(accountId)
+              const result = account
+                ? await testOneAccount(account, id)
+                : { success: false, latencyMs: 0, error: '账号已删除' }
+              if (livenessRun.current === id) pending.set(accountId, result)
+            }
+          })
+        )
+      } finally {
+        clearInterval(timer)
+        flush()
+        if (livenessRun.current === id) {
+          setLivenessRunning(false)
+          livenessRun.current = null
+        }
+      }
+    },
+    [testOneAccount, beginLiveness]
+  )
 
-  /** 停止批量测活 */
+  const runLivenessBatch = useCallback(
+    () =>
+      testBatch(
+        selectedAccounts.map((account) => account.id),
+        true
+      ),
+    [selectedAccounts, testBatch]
+  )
   const stopLivenessBatch = useCallback((): void => {
-    livenessAbort.current = true
+    if (livenessRun.current) void window.api.diagnoseCancel(livenessRun.current)
+    livenessRun.current = null
     setLivenessRunning(false)
   }, [])
-
-  /** 单个账号重测（用于批量结果列表里每行的「重测」按钮） */
-  const retestOne = useCallback(
-    async (accountId: string): Promise<void> => {
-      const account = accounts.get(accountId)
-      if (!account) return
-      livenessAbort.current = false
-      setLivenessBatch((prev) => new Map(prev).set(accountId, null)) // 标记进行中
-      const res = await testOneAccount(account)
-      if (livenessAbort.current) return
-      setLivenessBatch((prev) => new Map(prev).set(accountId, res))
-    },
-    [accounts, testOneAccount]
-  )
+  const retestOne = useCallback((accountId: string) => testBatch([accountId]), [testBatch])
 
   /** 当前批量结果里失败的账号（保持 selectedAccounts 顺序） */
   const failedAccountIds = useMemo(() => {
@@ -385,45 +411,24 @@ export function DiagnosePage(): React.ReactNode {
       .map((a) => a.id)
   }, [selectedAccounts, livenessBatch])
 
-  /** 重测全部失败的账号（并发受限，可中止） */
-  const retestFailed = useCallback(async (): Promise<void> => {
-    const ids = failedAccountIds
-    if (ids.length === 0) return
-    livenessAbort.current = false
-    setLivenessRunning(true)
-    setLivenessBatch((prev) => {
-      const next = new Map(prev)
-      for (const id of ids) next.set(id, null) // 失败项重置为进行中
-      return next
-    })
-    const queue = ids.map((id) => accounts.get(id)).filter((a): a is NonNullable<typeof a> => !!a)
-    const worker = async (): Promise<void> => {
-      for (;;) {
-        if (livenessAbort.current) break
-        const acc = queue.shift()
-        if (!acc) break
-        const res = await testOneAccount(acc)
-        if (livenessAbort.current) break
-        setLivenessBatch((prev) => new Map(prev).set(acc.id, res))
-      }
-    }
-    const workers = Array.from({ length: Math.min(livenessConcurrency, queue.length) }, () =>
-      worker()
-    )
-    await Promise.all(workers)
-    if (!livenessAbort.current) setLivenessRunning(false)
-  }, [failedAccountIds, accounts, testOneAccount, livenessConcurrency])
+  const retestFailed = useCallback(() => testBatch(failedAccountIds), [failedAccountIds, testBatch])
 
   /** 一键把失败账号标记为 error 状态（账号管理页会显示红色错误态） */
   const markFailedAsError = useCallback((): void => {
+    const current = useAccountsStore.getState()
+    const next = new Map(current.accounts)
     for (const id of failedAccountIds) {
-      const r = livenessBatch.get(id)
-      updateAccount(id, {
-        status: 'error',
-        lastError: r?.error || (isEn ? 'Liveness test failed' : '测活失败')
-      })
+      const account = next.get(id)
+      if (account)
+        next.set(id, {
+          ...account,
+          status: 'error',
+          lastError: livenessBatch.get(id)?.error || (isEn ? 'Liveness test failed' : '测活失败')
+        })
     }
-  }, [failedAccountIds, livenessBatch, updateAccount, isEn])
+    useAccountsStore.setState({ accounts: next })
+    void useAccountsStore.getState().saveToStorage()
+  }, [failedAccountIds, livenessBatch, isEn])
 
   /** 一键删除失败账号（带确认） */
   const deleteFailed = useCallback((): void => {
@@ -508,7 +513,7 @@ export function DiagnosePage(): React.ReactNode {
       })
     }
     return list
-  }, [customProbeUrl, isEn])
+  }, [customProbeUrl])
 
   const runDiagnose = useCallback(async (): Promise<void> => {
     const targets = buildTargets()
@@ -518,29 +523,42 @@ export function DiagnosePage(): React.ReactNode {
 
     const proxyUrl = useProxy && selectedProxyId ? proxyPool.get(selectedProxyId)?.url : undefined
 
+    if (networkRun.current) void window.api.diagnoseCancel(networkRun.current)
+    const requestId = crypto.randomUUID()
+    networkRun.current = requestId
     try {
-      // 分批跑，每次 4 个，让结果逐步出现
-      const BATCH = 4
-      const next: Record<string, DiagnoseResult> = {}
-      for (let i = 0; i < targets.length; i += BATCH) {
-        const slice = targets.slice(i, i + BATCH)
-        const resp = await window.api.diagnoseRun({
-          proxyUrl,
-          targets: slice.map((tg) => ({
-            id: tg.id,
-            label: pick(tg.label),
-            url: tg.url,
-            expectStatus: tg.expectStatus
-          }))
+      let cursor = 0
+      let done = 0
+      await Promise.all(
+        Array.from({ length: Math.min(4, targets.length) }, async () => {
+          while (networkRun.current === requestId && cursor < targets.length) {
+            const target = targets[cursor++]
+            const response = await window.api.diagnoseRun({
+              requestId,
+              proxyUrl,
+              targets: [
+                {
+                  id: target.id,
+                  label: pick(target.label),
+                  url: target.url,
+                  expectStatus: target.expectStatus
+                }
+              ]
+            })
+            if (networkRun.current !== requestId) return
+            setResults((previous) => ({
+              ...previous,
+              ...Object.fromEntries(response.results.map((result) => [result.id, result]))
+            }))
+            setProgress({ done: ++done, total: targets.length })
+          }
         })
-        for (const r of resp.results) {
-          next[r.id] = r
-        }
-        setResults({ ...next })
-        setProgress({ done: Math.min(i + BATCH, targets.length), total: targets.length })
-      }
+      )
     } finally {
-      setIsRunning(false)
+      if (networkRun.current === requestId) {
+        networkRun.current = null
+        setIsRunning(false)
+      }
       // 持久化用户填的探测 URL
       try {
         localStorage.setItem('kiro-diagnose-probe-url', customProbeUrl)
@@ -548,7 +566,7 @@ export function DiagnosePage(): React.ReactNode {
         /* ignore */
       }
     }
-  }, [buildTargets, useProxy, selectedProxyId, proxyPool, customProbeUrl])
+  }, [buildTargets, useProxy, selectedProxyId, proxyPool, customProbeUrl, pick])
 
   const exportReport = useCallback(() => {
     const targets = buildTargets()
@@ -576,7 +594,7 @@ export function DiagnosePage(): React.ReactNode {
     }
     void navigator.clipboard.writeText(lines.join('\n'))
     alert(isEn ? 'Report copied to clipboard' : '诊断报告已复制到剪贴板')
-  }, [buildTargets, results, useProxy, selectedProxyId, proxyPool, isEn])
+  }, [buildTargets, results, useProxy, selectedProxyId, proxyPool, isEn, pick])
 
   const stats = (() => {
     const all = Object.values(results)

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { Button } from '../ui'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -7,57 +7,84 @@ import { X, Save, RefreshCw } from 'lucide-react'
 interface SteeringEditorProps {
   filename: string
   onClose: () => void
-  onSaved?: () => void
 }
 
-export function SteeringEditor({ filename, onClose, onSaved }: SteeringEditorProps) {
+export function SteeringEditor({ filename, onClose }: SteeringEditorProps) {
   const [content, setContent] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [modified, setModified] = useState(false)
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+  const [savedContent, setSavedContent] = useState('')
+  const modified = content !== savedContent
+  const currentContent = useRef(content)
+  const savedSnapshot = useRef(savedContent)
+  currentContent.current = content
+  const mounted = useRef(false)
+  const readVersion = useRef(0)
+  const savePending = useRef(false)
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
 
   useEffect(() => {
-    loadContent()
+    mounted.current = true
+    void loadContent(false)
+    return () => {
+      mounted.current = false
+    }
   }, [filename])
 
-  const loadContent = async () => {
+  const loadContent = async (confirmDiscard = true) => {
+    if (savePending.current) return
+    if (
+      confirmDiscard &&
+      currentContent.current !== savedSnapshot.current &&
+      !confirm(isEn ? 'Discard unsaved changes and reload?' : '放弃未保存的更改并重新加载？')
+    )
+      return
+    const version = ++readVersion.current
     setLoading(true)
     setError(null)
     try {
       const result = await window.api.readKiroSteeringFile(filename)
+      if (!mounted.current || version !== readVersion.current) return
       if (result.success && result.content !== undefined) {
+        currentContent.current = result.content
+        savedSnapshot.current = result.content
         setContent(result.content)
-        setModified(false)
+        setSavedContent(result.content)
       } else {
         setError(result.error || (isEn ? 'Failed to read file' : '读取文件失败'))
       }
     } catch (err) {
-      setError(isEn ? 'Failed to read file' : '读取文件失败')
-      console.error(err)
+      if (mounted.current && version === readVersion.current)
+        setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLoading(false)
+      if (mounted.current && version === readVersion.current) setLoading(false)
     }
   }
 
   const saveContent = async () => {
+    if (savePending.current || loading || currentContent.current === savedSnapshot.current) return
+    savePending.current = true
+    const snapshot = currentContent.current
+    const version = readVersion.current
     setSaving(true)
     setError(null)
     try {
-      const result = await window.api.saveKiroSteeringFile(filename, content)
+      const result = await window.api.saveKiroSteeringFile(filename, snapshot)
+      if (!mounted.current || version !== readVersion.current) return
       if (result.success) {
-        setModified(false)
-        onSaved?.()
+        savedSnapshot.current = snapshot
+        setSavedContent(snapshot)
       } else {
         setError(result.error || (isEn ? 'Failed to save file' : '保存文件失败'))
       }
     } catch (err) {
-      setError(isEn ? 'Failed to save file' : '保存文件失败')
-      console.error(err)
+      if (mounted.current && version === readVersion.current)
+        setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setSaving(false)
+      savePending.current = false
+      if (mounted.current) setSaving(false)
     }
   }
 
@@ -78,8 +105,8 @@ export function SteeringEditor({ filename, onClose, onSaved }: SteeringEditorPro
   }
 
   const handleChange = (value: string) => {
+    currentContent.current = value
     setContent(value)
-    setModified(true)
   }
 
   return createPortal(
@@ -108,8 +135,8 @@ export function SteeringEditor({ filename, onClose, onSaved }: SteeringEditorPro
             <Button
               variant="ghost"
               size="icon"
-              onClick={loadContent}
-              disabled={loading}
+              onClick={() => loadContent()}
+              disabled={loading || saving}
               title={isEn ? 'Refresh' : '刷新'}
             >
               <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
@@ -118,7 +145,7 @@ export function SteeringEditor({ filename, onClose, onSaved }: SteeringEditorPro
               variant="default"
               size="sm"
               onClick={saveContent}
-              disabled={saving || !modified}
+              disabled={saving || loading || !modified}
             >
               <Save className="h-4 w-4 mr-0" />
               {saving ? (isEn ? 'Saving...' : '保存中...') : isEn ? 'Save' : '保存'}

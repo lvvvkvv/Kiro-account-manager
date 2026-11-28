@@ -1,3 +1,5 @@
+import { useProxyLogs } from '../../hooks/useProxyLogs'
+import type { ProxyLogEntry as LogEntry } from '../../../../shared/proxyLogs'
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Button, Badge, Input } from '../ui'
 import {
@@ -16,14 +18,6 @@ import {
 import { useTranslation } from '../../hooks/useTranslation'
 import { ProxyDropdownMenu } from './ProxyDropdownMenu'
 import { useVirtualizer } from '@tanstack/react-virtual'
-
-interface LogEntry {
-  timestamp: string
-  level: string
-  category: string
-  message: string
-  data?: unknown
-}
 
 interface ProxyDetailedLogsDialogProps {
   open: boolean
@@ -120,15 +114,11 @@ function CustomDropdown({ value, options, onChange, placeholder, className }: Cu
 export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLogsDialogProps) {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
-  const [logs, setLogs] = useState<LogEntry[]>([])
-  const [loading, setLoading] = useState(false)
   const [searchText, setSearchText] = useState('')
   const [levelFilter, setLevelFilter] = useState<string>('all')
   const [categoryFilter, setCategoryFilter] = useState<string>('all')
   const [isAtBottom, setIsAtBottom] = useState(true)
-  const [newLogCount, setNewLogCount] = useState(0)
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(new Set())
-  const prevLogCount = useRef(0)
   const [timeRange, setTimeRange] = useState<string>(() => {
     return localStorage.getItem('proxyLogs_timeRange') || 'all'
   })
@@ -136,41 +126,8 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
     return localStorage.getItem('proxyLogs_displayLimit') || 'all'
   })
   const scrollRef = useRef<HTMLDivElement>(null)
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
-
-  const loadLogs = useCallback(async () => {
-    try {
-      const result = await window.api.proxyGetLogs()
-      setLogs(result)
-    } catch (error) {
-      console.error('Failed to load logs:', error)
-    }
-  }, [])
-
-  useEffect(() => {
-    if (open) {
-      setLoading(true)
-      loadLogs().finally(() => setLoading(false))
-
-      // 每 1.5 秒刷新一次
-      pollIntervalRef.current = setInterval(() => {
-        loadLogs().then(() => {
-          // 如果用户不在底部，累计新日志数
-          if (!isAtBottom && logs.length > prevLogCount.current) {
-            setNewLogCount((prev) => prev + (logs.length - prevLogCount.current))
-          }
-          prevLogCount.current = logs.length
-        })
-      }, 1500)
-    }
-
-    return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current)
-        pollIntervalRef.current = null
-      }
-    }
-  }, [open, loadLogs, isAtBottom, logs.length])
+  const { logs, loading, newLogCount, setNewLogCount, refresh: loadLogs, clear: handleClearLogs } =
+    useProxyLogs(open, 50000, isAtBottom)
 
   // 监听滚动位置判断是否在底部
   const handleScroll = useCallback(() => {
@@ -197,17 +154,9 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
     localStorage.setItem('proxyLogs_displayLimit', displayLimit)
   }, [displayLimit])
 
-  const handleClearLogs = async () => {
-    try {
-      await window.api.proxyClearLogs()
-      setLogs([])
-    } catch (error) {
-      console.error('Failed to clear logs:', error)
-    }
-  }
-
-  const handleExportLogs = () => {
-    const content = logs
+  const handleExportLogs = async () => {
+    const allLogs = await window.api.proxyGetLogs()
+    const content = allLogs
       .map((log) => {
         const dataStr = log.data ? ` | ${JSON.stringify(log.data)}` : ''
         return `[${log.timestamp}] [${log.level}] [${log.category}] ${log.message}${dataStr}`

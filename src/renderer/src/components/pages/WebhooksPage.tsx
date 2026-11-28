@@ -80,7 +80,7 @@ export function WebhooksPage(): React.ReactNode {
     useWebhookStore()
 
   const [editing, setEditing] = useState<Partial<WebhookEntry> | null>(null)
-  const [testingId, setTestingId] = useState<string | null>(null)
+  const [testingIds, setTestingIds] = useState<Set<string>>(new Set())
   const [testResult, setTestResult] = useState<
     Record<string, { success: boolean; error?: string; time: number }>
   >({})
@@ -107,10 +107,17 @@ export function WebhooksPage(): React.ReactNode {
   }
 
   const handleTest = async (id: string): Promise<void> => {
-    setTestingId(id)
-    const result = await testWebhook(id)
-    setTestResult((prev) => ({ ...prev, [id]: { ...result, time: Date.now() } }))
-    setTestingId(null)
+    setTestingIds((ids) => new Set(ids).add(id))
+    try {
+      const result = await testWebhook(id)
+      setTestResult((prev) => ({ ...prev, [id]: { ...result, time: Date.now() } }))
+    } finally {
+      setTestingIds((ids) => {
+        const next = new Set(ids)
+        next.delete(id)
+        return next
+      })
+    }
   }
 
   return (
@@ -242,9 +249,9 @@ export function WebhooksPage(): React.ReactNode {
                           variant="ghost"
                           title={isEn ? 'Test' : '测试'}
                           onClick={() => handleTest(w.id)}
-                          disabled={testingId === w.id}
+                          disabled={testingIds.has(w.id)}
                         >
-                          {testingId === w.id ? (
+                          {testingIds.has(w.id) ? (
                             <Loader2 className="h-3.5 w-3.5 animate-spin" />
                           ) : (
                             <Send className="h-3.5 w-3.5" />

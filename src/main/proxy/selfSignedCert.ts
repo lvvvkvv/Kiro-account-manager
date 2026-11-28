@@ -1,14 +1,14 @@
 // 反代 HTTPS 自签证书生成器（不依赖外部 CA，单证书自签）
 // 用于让用户一键启用反代 HTTPS，证书包含 SubjectAltName 覆盖常见绑定地址
 import * as forge from 'node-forge'
-import * as fs from 'fs'
+import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as crypto from 'crypto'
 
 export interface ProxySelfSignedCert {
-  cert: string  // PEM 证书
-  key: string   // PEM 私钥
-  fingerprint: string  // SHA-256 指纹（hex）
+  cert: string // PEM 证书
+  key: string // PEM 私钥
+  fingerprint: string // SHA-256 指纹（hex）
   notBefore: number
   notAfter: number
   subject: string
@@ -25,29 +25,50 @@ export interface ProxySelfSignedCert {
  * @param hostnames 额外的 DNS / IP 名称（如配置的 proxy host）
  * @param forceRegen 强制重新生成
  */
+const certificateWrites = new Map<string, Promise<ProxySelfSignedCert>>()
+
 export function ensureProxySelfSignedCert(
   dataPath: string,
   hostnames: string[] = [],
   forceRegen = false
-): ProxySelfSignedCert {
+): Promise<ProxySelfSignedCert> {
+  const previous = certificateWrites.get(dataPath) || Promise.resolve()
+  const task = previous
+    .catch(() => {})
+    .then(() => ensureCertificate(dataPath, hostnames, forceRegen))
+  certificateWrites.set(dataPath, task)
+  const finished = (): void => {
+    if (certificateWrites.get(dataPath) === task) certificateWrites.delete(dataPath)
+  }
+  void task.then(finished, finished)
+  return task
+}
+
+async function ensureCertificate(
+  dataPath: string,
+  hostnames: string[],
+  forceRegen: boolean
+): Promise<ProxySelfSignedCert> {
   const certDir = path.join(dataPath, 'proxy-tls')
   const certPath = path.join(certDir, 'proxy.crt')
   const keyPath = path.join(certDir, 'proxy.key')
 
-  if (!fs.existsSync(certDir)) fs.mkdirSync(certDir, { recursive: true })
+  await fs.mkdir(certDir, { recursive: true })
 
   // 复用已有证书（未过期且 SAN 覆盖了请求的 hostnames）
-  if (!forceRegen && fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+  if (!forceRegen) {
     try {
-      const certPem = fs.readFileSync(certPath, 'utf8')
-      const keyPem = fs.readFileSync(keyPath, 'utf8')
+      const [certPem, keyPem] = await Promise.all([
+        fs.readFile(certPath, 'utf8'),
+        fs.readFile(keyPath, 'utf8')
+      ])
       const cert = forge.pki.certificateFromPem(certPem)
       const now = new Date()
       const renewBefore = new Date(cert.validity.notAfter.getTime() - 30 * 86400_000)
       // SAN 覆盖检查
       const existingAlt = extractAltNames(cert)
       const requested = normalizeAltNames(hostnames)
-      const missing = requested.filter(n => !existingAlt.includes(n))
+      const missing = requested.filter((n) => !existingAlt.includes(n))
       if (now < renewBefore && missing.length === 0) {
         return {
           cert: certPem,
@@ -60,18 +81,32 @@ export function ensureProxySelfSignedCert(
         }
       }
     } catch (err) {
-      console.warn('[ProxyTLS] Failed to load existing cert, regenerating:', (err as Error).message)
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+        console.warn(
+          '[ProxyTLS] Failed to load existing cert, regenerating:',
+          (err as Error).message
+        )
     }
   }
 
   // 生成新证书
-  const keys = forge.pki.rsa.generateKeyPair(2048)
+  const keys = await new Promise<{ publicKey: string; privateKey: string }>((resolve, reject) => {
+    crypto.generateKeyPair(
+      'rsa',
+      {
+        modulusLength: 2048,
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+      },
+      (error, publicKey, privateKey) => (error ? reject(error) : resolve({ publicKey, privateKey }))
+    )
+  })
   const cert = forge.pki.createCertificate()
-  cert.publicKey = keys.publicKey
+  cert.publicKey = forge.pki.publicKeyFromPem(keys.publicKey)
   cert.serialNumber = generateSerialNumber()
   cert.validity.notBefore = new Date()
   cert.validity.notAfter = new Date()
-  cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 2)  // 2 年有效期
+  cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 2) // 2 年有效期
 
   const subject = [
     { name: 'commonName', value: 'Kiro Reverse Proxy' },
@@ -87,9 +122,9 @@ export function ensureProxySelfSignedCert(
   const altList: Array<{ type: number; value?: string; ip?: string }> = []
   for (const name of altNames) {
     if (isIPv4(name) || isIPv6(name)) {
-      altList.push({ type: 7, ip: name })  // type 7 = iPAddress
+      altList.push({ type: 7, ip: name }) // type 7 = iPAddress
     } else {
-      altList.push({ type: 2, value: name })  // type 2 = dNSName
+      altList.push({ type: 2, value: name }) // type 2 = dNSName
     }
   }
 
@@ -105,12 +140,13 @@ export function ensureProxySelfSignedCert(
     { name: 'subjectAltName', altNames: altList }
   ])
 
-  cert.sign(keys.privateKey, forge.md.sha256.create())
+  const privateKey = forge.pki.privateKeyFromPem(keys.privateKey)
+  cert.sign(privateKey, forge.md.sha256.create())
   const certPem = forge.pki.certificateToPem(cert)
-  const keyPem = forge.pki.privateKeyToPem(keys.privateKey)
+  const keyPem = forge.pki.privateKeyToPem(privateKey)
 
-  fs.writeFileSync(certPath, certPem)
-  fs.writeFileSync(keyPath, keyPem, { mode: 0o600 })  // 私钥仅 owner 可读
+  await fs.writeFile(keyPath, keyPem, { mode: 0o600 }) // 私钥仅 owner 可读
+  await fs.writeFile(certPath, certPem)
 
   console.log(`[ProxyTLS] Generated self-signed cert: ${certPath} (SAN=${altNames.join(',')})`)
 
@@ -141,9 +177,11 @@ function normalizeAltNames(extras: string[]): string[] {
 }
 
 function extractAltNames(cert: forge.pki.Certificate): string[] {
-  const ext = cert.getExtension('subjectAltName') as { altNames?: Array<{ type: number; value?: string; ip?: string }> } | null
+  const ext = cert.getExtension('subjectAltName') as {
+    altNames?: Array<{ type: number; value?: string; ip?: string }>
+  } | null
   if (!ext?.altNames) return []
-  return ext.altNames.map(a => a.ip || a.value || '').filter(Boolean)
+  return ext.altNames.map((a) => a.ip || a.value || '').filter(Boolean)
 }
 
 function isIPv4(host: string): boolean {
@@ -163,5 +201,11 @@ function computeFingerprint(certPem: string): string {
   const m = certPem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/)
   if (!m) return ''
   const der = Buffer.from(m[1].replace(/\s/g, ''), 'base64')
-  return crypto.createHash('sha256').update(der).digest('hex').match(/.{2}/g)!.join(':').toUpperCase()
+  return crypto
+    .createHash('sha256')
+    .update(der)
+    .digest('hex')
+    .match(/.{2}/g)!
+    .join(':')
+    .toUpperCase()
 }

@@ -1,3 +1,4 @@
+import type { ProxyConfig } from './ProxyPanel'
 // 反代 v1.8 安全 / 限流 / 可观测设置面板
 import { useState, useEffect, useCallback } from 'react'
 import {
@@ -24,25 +25,6 @@ import {
   Activity
 } from 'lucide-react'
 
-interface ProxyConfigSecurity {
-  host: string
-  apiKey?: string
-  apiKeys?: Array<{ key: string; enabled: boolean }>
-  maxRequestBodyBytes?: number
-  allowedIPs?: string[]
-  deniedIPs?: string[]
-  allowExternalWithoutApiKey?: boolean
-  rateLimitPerKeyPerMinute?: number
-  sessionAffinityEnabled?: boolean
-  keepAliveTimeoutMs?: number
-  headersTimeoutMs?: number
-  recentRequestsLimit?: number
-  enableMetrics?: boolean
-  fallbackPort?: number
-  enableAuditLog?: boolean
-  tls?: { enabled?: boolean; cert?: string; key?: string; certPath?: string; keyPath?: string }
-}
-
 interface SelfSignedCertInfo {
   cert?: string
   key?: string
@@ -60,10 +42,8 @@ interface AuditEntry {
 }
 
 interface ProxySecurityPanelProps {
-  config: ProxyConfigSecurity & Record<string, unknown>
-  // 使用 unknown 替代严格类型，避免父组件 ProxyConfig 类型与本组件接口的精确字段冲突
-  // 实际写入仅使用 spread，类型安全由父组件的 ProxyConfig 接口保证
-  setConfig: React.Dispatch<React.SetStateAction<unknown>>
+  config: ProxyConfig
+  setConfig: React.Dispatch<React.SetStateAction<ProxyConfig>>
   isRunning: boolean
   isEn: boolean
 }
@@ -113,8 +93,8 @@ export function ProxySecurityPanel({
   }, [isRunning])
 
   const updateConfig = useCallback(
-    <K extends keyof ProxyConfigSecurity>(key: K, value: ProxyConfigSecurity[K]) => {
-      setConfig((prev: unknown) => ({ ...(prev as object), [key]: value }))
+    <K extends keyof ProxyConfig>(key: K, value: ProxyConfig[K]) => {
+      setConfig((prev) => ({ ...prev, [key]: value }))
       void window.api.proxyUpdateConfig({ [key]: value })
     },
     [setConfig]

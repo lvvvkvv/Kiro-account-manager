@@ -78,22 +78,36 @@ interface RateLimiterInternal {
 
 export interface RateLimiter {
   /** 启动一个任务前调用：等待获取令牌（含退避） */
-  waitForSlot: (signal?: { aborted: boolean }) => Promise<void>
+  waitForSlot: (signal?: AbortSignal) => Promise<void>
   /** 任务完成后上报结果 */
   reportResult: (success: boolean) => void
   /** 读取实时状态（供 UI 显示） */
   snapshot: () => RateLimiterSnapshot
-  /** 更新配置 */
-  updateConfig: (next: Partial<RateLimiterConfig>) => void
-  /** 重置统计 */
-  reset: () => void
+}
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = (): void => {
+      clearTimeout(timer)
+      reject(signal?.reason || new Error('已取消'))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) {
+      signal.removeEventListener('abort', abort)
+      abort()
+    }
+  })
 }
 
 export function createRateLimiter(config: Partial<RateLimiterConfig> = {}): RateLimiter {
   const state: RateLimiterInternal = {
     config: { ...DEFAULT_RATE_LIMITER_CONFIG, ...config },
     lastRefillTime: Date.now(),
-    tokens: (config.burst ?? DEFAULT_RATE_LIMITER_CONFIG.burst),
+    tokens: config.burst ?? DEFAULT_RATE_LIMITER_CONFIG.burst,
     events: [],
     consecutiveFailures: 0,
     backoffEndAt: 0
@@ -120,12 +134,11 @@ export function createRateLimiter(config: Partial<RateLimiterConfig> = {}): Rate
   return {
     waitForSlot: async (signal) => {
       while (true) {
-        if (signal?.aborted) return
+        signal?.throwIfAborted()
         // 退避优先
         const now = Date.now()
         if (state.backoffEndAt > now) {
-          const wait = Math.min(state.backoffEndAt - now, 1000)
-          await new Promise((r) => setTimeout(r, wait))
+          await wait(state.backoffEndAt - now, signal)
           continue
         }
         refillTokens()
@@ -137,7 +150,7 @@ export function createRateLimiter(config: Partial<RateLimiterConfig> = {}): Rate
         const tokensPerMs = state.config.maxPerMinute / 60_000
         const tokensNeeded = 1 - state.tokens
         const waitMs = Math.max(50, Math.min(2000, tokensNeeded / tokensPerMs))
-        await new Promise((r) => setTimeout(r, waitMs))
+        await wait(waitMs, signal)
       }
     },
 
@@ -166,17 +179,18 @@ export function createRateLimiter(config: Partial<RateLimiterConfig> = {}): Rate
       refillTokens()
       pruneEvents()
       const now = Date.now()
-      let success = 0, failed = 0
+      let success = 0,
+        failed = 0
       for (const [, ok] of state.events) {
-        if (ok) success++; else failed++
+        if (ok) success++
+        else failed++
       }
       const total = success + failed
       const successRate = total > 0 ? success / total : 1
       const samples = total
-      const riskWarning = samples >= state.config.minSamples && successRate < state.config.successRateThreshold
-      const throughput = state.config.windowSec > 0
-        ? (success * 60 / state.config.windowSec)
-        : 0
+      const riskWarning =
+        samples >= state.config.minSamples && successRate < state.config.successRateThreshold
+      const throughput = state.config.windowSec > 0 ? (success * 60) / state.config.windowSec : 0
 
       return {
         availableTokens: Math.floor(state.tokens),
@@ -188,18 +202,6 @@ export function createRateLimiter(config: Partial<RateLimiterConfig> = {}): Rate
         riskWarning,
         throughputPerMinute: Math.round(throughput * 10) / 10
       }
-    },
-
-    updateConfig: (next) => {
-      state.config = { ...state.config, ...next }
-    },
-
-    reset: () => {
-      state.events = []
-      state.consecutiveFailures = 0
-      state.backoffEndAt = 0
-      state.tokens = state.config.burst
-      state.lastRefillTime = Date.now()
     }
   }
 }

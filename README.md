@@ -268,6 +268,14 @@ Run **Build & Release** manually from GitHub Actions on the intended branch. The
 ## 📋 Changelog
 
 
+### v1.7.21 (2026-11-28) — Performance and Stability Across Modules
+
+- Improve rendering for large account lists, filters, group and tag assignments, proxy account selection and the task center, reducing unnecessary updates in closed dialogs and background state changes.
+- Optimize concurrency and resource cleanup for proxy requests, logging, batch registration and subscriptions, reducing main-process blocking and repeated computation while preserving existing workflows.
+- Fix races between background credential refresh and account saves to prevent stale snapshots from overwriting new credentials; drain in-flight tasks and buffered data before quitting or installing updates.
+- Strengthen failure recovery and data protection for backups, configuration sync, CLI credential writes and macOS update installation while preserving existing configuration and data formats.
+- Simplify duplicate logic, redundant types and unused code, and add module regression tests and production bundle checks.
+
 ### v1.7.20 (2026-11-27) — Stable Filter Indicator Position
 
 - Move the active-filter yellow dot closer to the filter button's top-right corner.

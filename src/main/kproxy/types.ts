@@ -1,3 +1,6 @@
+/** Request-scoped ID consumed locally by K-Proxy and never forwarded upstream. */
+export const DEVICE_ID_HEADER = 'x-kproxy-device-id'
+
 // K-Proxy 类型定义
 
 /**
@@ -15,10 +18,6 @@ export interface KProxyConfig {
   autoStart: boolean
   // 日志记录
   logRequests: boolean
-  // CA 证书路径
-  caPath?: string
-  // CA 私钥路径
-  caKeyPath?: string
 }
 
 /**
@@ -37,6 +36,7 @@ export interface KProxyStats {
  * K-Proxy 事件回调
  */
 export interface KProxyEvents {
+  onDeviceMappingsChange?: (mappings: DeviceIdMapping[]) => void
   onRequest?: (info: KProxyRequestInfo) => void
   onResponse?: (info: KProxyResponseInfo) => void
   onError?: (error: Error) => void
@@ -93,31 +93,9 @@ export interface DeviceIdMapping {
 }
 
 /**
- * MITM 拦截规则
- */
-export interface MitmRule {
-  // 域名匹配模式（支持通配符）
-  domainPattern: string
-  // 要修改的请求头
-  headerModifications?: {
-    name: string
-    // 正则表达式模式
-    pattern: string
-    // 替换值（支持 $DEVICE_ID 变量）
-    replacement: string
-  }[]
-  // 是否启用
-  enabled: boolean
-}
-
-/**
  * 默认 MITM 域名白名单
  */
-export const DEFAULT_MITM_DOMAINS = [
-  'amazonaws.com',
-  'amazon.com',
-  'kiro.dev'
-]
+export const DEFAULT_MITM_DOMAINS = ['amazonaws.com', 'amazon.com', 'kiro.dev']
 
 /**
  * 默认 K-Proxy 配置

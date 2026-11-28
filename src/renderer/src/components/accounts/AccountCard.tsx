@@ -1,5 +1,6 @@
+import { useShallow } from 'zustand/react/shallow'
 import { TokenRefreshSchedule } from './TokenRefreshSchedule'
-import { memo, useState, useMemo, useId } from 'react'
+import { memo, useState, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { Button } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
@@ -51,9 +52,9 @@ interface AccountCardProps {
   tags: Map<string, AccountTag>
   groups: Map<string, AccountGroup>
   isSelected: boolean
-  onSelect: () => void
-  onEdit: () => void
-  onShowDetail: () => void
+  onSelect: (id: string) => void
+  onEdit: (account: Account) => void
+  onShowDetail: (account: Account) => void
 }
 
 export const AccountCard = memo(function AccountCard({
@@ -74,17 +75,24 @@ export const AccountCard = memo(function AccountCard({
     maskNickname,
     usagePrecision,
     updateAccountStatus,
-    accountProxyBindings,
-    proxyPool,
+    boundProxy,
     unbindAccountFromProxy
-  } = useAccountsStore()
-
-  // 该账号绑定的代理（如有）
-  const boundProxy = useMemo(() => {
-    const proxyId = accountProxyBindings[account.id]
-    if (!proxyId) return null
-    return proxyPool.get(proxyId) || null
-  }, [accountProxyBindings, account.id, proxyPool])
+  } = useAccountsStore(
+    useShallow((state) => ({
+      setActiveAccount: state.setActiveAccount,
+      removeAccount: state.removeAccount,
+      checkAccountStatus: state.checkAccountStatus,
+      refreshAccountToken: state.refreshAccountToken,
+      maskEmail: state.maskEmail,
+      maskNickname: state.maskNickname,
+      usagePrecision: state.usagePrecision,
+      updateAccountStatus: state.updateAccountStatus,
+      // 脱敏函数引用稳定，仍需订阅隐私设置以更新显示。
+      privacyMode: state.privacyMode,
+      boundProxy: state.proxyPool.get(state.accountProxyBindings[account.id]) ?? null,
+      unbindAccountFromProxy: state.unbindAccountFromProxy
+    }))
+  )
 
   // 解除封禁标记中（loading 状态）
   const [isClearingSuspended, setIsClearingSuspended] = useState(false)
@@ -122,88 +130,8 @@ export const AccountCard = memo(function AccountCard({
   }
 
   const performSwitch = async (): Promise<void> => {
-    const { credentials } = account
-    const switchTarget = useAccountsStore.getState().switchTarget || 'ide'
-
-    // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
-    if (!credentials.refreshToken) {
-      alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
-      return
-    }
-    if (
-      credentials.authMethod !== 'social' &&
-      (!credentials.clientId || !credentials.clientSecret)
-    ) {
-      alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
-      return
-    }
-
-    const cliPayload = {
-      accessToken: credentials.accessToken,
-      refreshToken: credentials.refreshToken,
-      clientId: credentials.clientId,
-      clientSecret: credentials.clientSecret,
-      region: credentials.region || 'us-east-1',
-      profileArn: account.profileArn,
-      provider: credentials.provider
-    }
-    const idePayload = {
-      accessToken: credentials.accessToken,
-      refreshToken: credentials.refreshToken,
-      clientId: credentials.clientId || '',
-      clientSecret: credentials.clientSecret || '',
-      region: credentials.region || 'us-east-1',
-      startUrl: credentials.startUrl,
-      authMethod: credentials.authMethod,
-      provider: credentials.provider,
-      profileArn: account.profileArn,
-      accountId: account.id
-    }
-
-    let success = true
-    let errorMsg = ''
-
-    // 根据 switchTarget 设置决定切换目标
-    if (switchTarget === 'ide' || switchTarget === 'both') {
-      const result = await window.api.switchAccount(idePayload)
-      if (!result.success) {
-        success = false
-        errorMsg = result.error || ''
-      } else if (result.refreshedCredentials) {
-        // 同步 main 进程 refresh 后的最新 credentials 到 store，避免反代 store 留下已作废的 refreshToken
-        const rc = result.refreshedCredentials
-        useAccountsStore.setState((state) => {
-          const accounts = new Map(state.accounts)
-          const acc = accounts.get(account.id)
-          if (acc) {
-            accounts.set(account.id, {
-              ...acc,
-              credentials: {
-                ...acc.credentials,
-                accessToken: rc.accessToken,
-                refreshToken: rc.refreshToken,
-                expiresAt: Date.now() + rc.expiresIn * 1000
-              }
-            })
-          }
-          return { accounts }
-        })
-        useAccountsStore.getState().saveToStorage()
-      }
-    }
-    if (switchTarget === 'cli' || switchTarget === 'both') {
-      const result = await window.api.switchAccountCli(cliPayload)
-      if (!result.success && switchTarget === 'cli') {
-        success = false
-        errorMsg = result.error || ''
-      }
-    }
-
-    if (success) {
-      setActiveAccount(account.id)
-    } else {
-      alert(isEn ? `Switch failed: ${errorMsg}` : `切换失败: ${errorMsg}`)
-    }
+    const result = await useAccountsStore.getState().switchAccount(account.id)
+    if (!result.success) alert(isEn ? `Switch failed: ${result.error}` : `切换失败：${result.error}`)
   }
 
   const [isSwitching, setIsSwitching] = useState(false)
@@ -621,8 +549,8 @@ export const AccountCard = memo(function AccountCard({
     }))
   ]
   const actions: AccountListAction[] = [
-    { label: isEn ? 'Details' : '详情', icon: <Info />, onClick: onShowDetail },
-    { label: isEn ? 'Edit' : '编辑', icon: <Edit />, onClick: onEdit },
+    { label: isEn ? 'Details' : '详情', icon: <Info />, onClick: () => onShowDetail(account) },
+    { label: isEn ? 'Edit' : '编辑', icon: <Edit />, onClick: () => onEdit(account) },
     {
       label: isRefreshingToken
         ? isEn
@@ -711,7 +639,7 @@ export const AccountCard = memo(function AccountCard({
       data-state={isUnauthorized ? 'banned' : effectiveStatus}
       lang={isEn ? 'en' : 'zh-CN'}
       onClick={(event) => {
-        if (event.currentTarget.contains(event.target as Node)) onSelect()
+        if (event.currentTarget.contains(event.target as Node)) onSelect(account.id)
       }}
     >
       <header className="account-card-header">
@@ -727,7 +655,7 @@ export const AccountCard = memo(function AccountCard({
               title={displayName}
               onClick={(event) => {
                 event.stopPropagation()
-                onShowDetail()
+                onShowDetail(account)
               }}
             >
               {displayName || (isEn ? 'Unnamed account' : '未命名账号')}
@@ -773,7 +701,7 @@ export const AccountCard = memo(function AccountCard({
           checked={isSelected}
           aria-label={isEn ? `Select ${displayName}` : `选择 ${displayName}`}
           onClick={(event) => event.stopPropagation()}
-          onChange={onSelect}
+          onChange={() => onSelect(account.id)}
         />
       </header>
 
@@ -971,7 +899,7 @@ export const AccountCard = memo(function AccountCard({
           onClick={(event) => {
             event.stopPropagation()
             if (isUnauthorized) setShowBanDialog(true)
-            else onShowDetail()
+            else onShowDetail(account)
           }}
         >
           <AlertTriangle />
@@ -990,7 +918,7 @@ export const AccountCard = memo(function AccountCard({
           }
           onClick={() => {
             if (isUnauthorized) setShowBanDialog(true)
-            else if (!hasCredentials) onEdit()
+            else if (!hasCredentials) onEdit(account)
             else void handleSwitch()
           }}
         >

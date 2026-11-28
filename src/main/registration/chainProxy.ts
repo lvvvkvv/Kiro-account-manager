@@ -1,3 +1,4 @@
+import type { ChainDiagnose } from '../../shared/proxyPool'
 // 本地中继代理链（Proxy Chaining）
 //
 // 背景：部分目标代理（如 bestproxy）要求「来源 IP 必须为非大陆」，大陆 IP 既不能加白名单也会被拒（610）。
@@ -5,9 +6,10 @@
 //   本机 → 本地中继 → 上游中转(非大陆, upstream) → 目标代理(target, bestproxy) → 目标站点
 // 这样目标代理看到的来源 IP 是上游中转的出口（非大陆），即可通过。
 //
-// 仅实现 HTTP CONNECT 入站（注册全程为 https，足够）；上游中转支持 http / socks5(4)。
+// HTTP CONNECT 入站；上游与目标代理均支持 HTTP / HTTPS / SOCKS4 / SOCKS5。
 
 import net from 'net'
+import tls from 'tls'
 import { SocksClient } from 'socks'
 
 interface ParsedChainProxy {
@@ -28,7 +30,8 @@ function parseChainProxy(url: string): ParsedChainProxy | null {
     else if (proto === 'socks5' || proto === 'socks5h' || proto === 'socks') protocol = 'socks5'
     else if (proto === 'socks4' || proto === 'socks4a') protocol = 'socks4'
     else return null
-    const port = Number(u.port) || (protocol.startsWith('socks') ? 1080 : 8080)
+    const port =
+      Number(u.port) || (protocol.startsWith('socks') ? 1080 : protocol === 'https' ? 443 : 8080)
     if (!u.hostname) return null
     return {
       protocol,
@@ -45,24 +48,10 @@ function parseChainProxy(url: string): ParsedChainProxy | null {
 interface ConnectResponse {
   status: number
   statusText: string
-  headersRaw: string
   bodySnippet: string
 }
 
-export interface ChainDiagnose {
-  upstreamReachable: boolean
-  upstreamError?: string
-  upstreamRtMs?: number
-  targetReachable: boolean
-  targetError?: string
-  targetRtMs?: number
-  targetStatus?: number
-  targetStatusText?: string
-  targetBodySnippet?: string
-  endToEndOk?: boolean
-  endToEndError?: string
-  endToEndRtMs?: number
-}
+export type { ChainDiagnose } from '../../shared/proxyPool'
 
 export class ChainProxyRelay {
   private server: net.Server | null = null
@@ -109,7 +98,11 @@ export class ChainProxyRelay {
       // 强制销毁所有活跃隧道连接：否则 server.close() 会等 DLL Go http.Transport
       // 的 Keep-Alive 连接自然超时（~60s），导致注册结束后 cleanup 卡住一分钟
       for (const sock of this.sockets) {
-        try { sock.destroy() } catch { /* ignore */ }
+        try {
+          sock.destroy()
+        } catch {
+          /* ignore */
+        }
       }
       this.sockets.clear()
       if (!srv) {
@@ -117,103 +110,194 @@ export class ChainProxyRelay {
         return
       }
       srv.close(() => resolve())
-      // 双保险：500ms 后无论 close 回调是否触发都 resolve
-      setTimeout(resolve, 500)
     })
+  }
+
+  private track(socket: net.Socket): net.Socket {
+    this.sockets.add(socket)
+    socket.on('close', () => this.sockets.delete(socket))
+    socket.on('error', () => socket.destroy())
+    return socket
   }
 
   private handleClient(client: net.Socket): void {
-    this.sockets.add(client)
-    client.on('close', () => this.sockets.delete(client))
-    client.on('error', () => client.destroy())
-    client.once('data', (chunk) => {
-      const head = chunk.toString('latin1')
-      const m = head.match(/^CONNECT\s+([^\s:]+):(\d+)\s+HTTP\/1\.[01]/i)
-      if (!m) {
+    this.track(client)
+    let header = Buffer.alloc(0)
+    const timer = setTimeout(() => client.destroy(), 20000)
+    client.once('close', () => clearTimeout(timer))
+    const onData = (chunk: Buffer): void => {
+      header = Buffer.concat([header, chunk])
+      const end = header.indexOf('\r\n\r\n')
+      if (end < 0) {
+        if (header.length > 65536) client.destroy()
+        return
+      }
+      client.pause()
+      client.removeListener('data', onData)
+      const match = header
+        .toString('latin1', 0, end)
+        .match(/^CONNECT\s+(\[[^\]]+\]|[^\s:]+):(\d+)\s+HTTP\/1\.[01]/i)
+      if (!match) {
+        clearTimeout(timer)
         client.end('HTTP/1.1 405 Method Not Allowed\r\n\r\n')
         return
       }
-      const host = m[1]
-      const port = Number(m[2])
-      this.dialChain(host, port)
+      // Each pending socket is paired with this client, including during handshakes.
+      const owned = new Set<net.Socket>()
+      const track = (socket: net.Socket): net.Socket => {
+        owned.add(socket)
+        return this.track(socket)
+      }
+      const close = (): void => {
+        for (const socket of owned) socket.destroy()
+      }
+      client.once('close', close)
+      void this.dialChain(match[1].replace(/^\[|\]$/g, ''), Number(match[2]), track)
         .then((tunnel) => {
+          clearTimeout(timer)
+          if (client.destroyed) {
+            tunnel.destroy()
+            return
+          }
           client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+          const rest = header.subarray(end + 4)
+          if (rest.length) client.unshift(rest)
           client.pipe(tunnel)
           tunnel.pipe(client)
-          client.on('close', () => tunnel.destroy())
-          tunnel.on('close', () => client.destroy())
-          tunnel.on('error', () => { client.destroy(); tunnel.destroy() })
+          tunnel.once('close', () => client.destroy())
+          client.resume()
+          tunnel.resume()
         })
-        .catch((err: unknown) => {
-          this.log(`[ProxyChain] 隧道建立失败: ${err instanceof Error ? err.message : String(err)}`)
+        .catch((error: unknown) => {
+          clearTimeout(timer)
+          close()
+          this.log(
+            `[ProxyChain] 隧道建立失败: ${error instanceof Error ? error.message : String(error)}`
+          )
           if (!client.destroyed) client.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
         })
-    })
+    }
+    client.on('data', onData)
   }
 
-  /** 经上游中转连到目标代理入口，再在该连接上对目标代理做 CONNECT 抵达最终目标 */
-  private async dialChain(host: string, port: number): Promise<net.Socket> {
-    const sock = await this.connectViaUpstream(this.target.host, this.target.port)
+  private async dialChain(
+    host: string,
+    port: number,
+    track = (socket: net.Socket): net.Socket => this.track(socket)
+  ): Promise<net.Socket> {
+    let socket = await this.connectViaUpstream(this.target.host, this.target.port, track)
     try {
-      const resp = await this.sendConnectRequest(sock, host, port, this.target)
-      if (resp.status !== 200) {
-        throw new Error(this.formatConnectError('目标代理', resp))
-      }
-    } catch (err) {
-      sock.destroy()
-      throw err
+      socket = await this.connectTarget(socket, host, port, track)
+      return socket
+    } catch (error) {
+      socket.destroy()
+      throw error
     }
-    return sock
   }
 
-  private connectViaUpstream(host: string, port: number): Promise<net.Socket> {
-    if (this.upstream.protocol === 'socks5' || this.upstream.protocol === 'socks4') {
-      return this.connectViaSocks(host, port)
+  private async connectViaUpstream(
+    host: string,
+    port: number,
+    track = (socket: net.Socket): net.Socket => this.track(socket)
+  ): Promise<net.Socket> {
+    const socket = await this.connectSocket(
+      this.upstream.host,
+      this.upstream.port,
+      this.upstream.protocol === 'https',
+      track
+    )
+    try {
+      return await this.connectProxy(socket, this.upstream, host, port)
+    } catch (error) {
+      socket.destroy()
+      throw error
     }
-    return this.connectViaHttpUpstream(host, port)
   }
 
-  private connectViaHttpUpstream(host: string, port: number): Promise<net.Socket> {
-    return new Promise((resolve, reject) => {
-      const sock = net.connect(this.upstream.port, this.upstream.host)
-      sock.setTimeout(20000)
-      sock.once('timeout', () => { sock.destroy(); reject(new Error('上游中转连接超时')) })
-      sock.once('error', reject)
-      sock.once('connect', () => {
-        sock.setNoDelay(true)
-        this.sendConnectRequest(sock, host, port, this.upstream)
-          .then((resp) => {
-            sock.setTimeout(0)
-            if (resp.status === 200) resolve(sock)
-            else { sock.destroy(); reject(new Error(this.formatConnectError('上游中转', resp))) }
-          })
-          .catch((err: Error) => { sock.destroy(); reject(err) })
-      })
-    })
+  private async connectTarget(
+    socket: net.Socket,
+    host: string,
+    port: number,
+    track = (socket: net.Socket): net.Socket => this.track(socket)
+  ): Promise<net.Socket> {
+    if (this.target.protocol === 'https')
+      socket = await this.connectSocket(this.target.host, this.target.port, true, track, socket)
+    return this.connectProxy(socket, this.target, host, port)
   }
 
-  private connectViaSocks(host: string, port: number): Promise<net.Socket> {
-    return new Promise((resolve, reject) => {
-      void SocksClient.createConnection({
+  private async connectProxy(
+    socket: net.Socket,
+    proxy: ParsedChainProxy,
+    host: string,
+    port: number
+  ): Promise<net.Socket> {
+    if (proxy.protocol === 'socks4' || proxy.protocol === 'socks5') {
+      socket.resume()
+      const result = await SocksClient.createConnection({
+        existing_socket: socket,
         proxy: {
-          host: this.upstream.host,
-          port: this.upstream.port,
-          type: this.upstream.protocol === 'socks4' ? 4 : 5,
-          userId: this.upstream.username,
-          password: this.upstream.password
+          host: proxy.host,
+          port: proxy.port,
+          type: proxy.protocol === 'socks4' ? 4 : 5,
+          userId: proxy.username,
+          password: proxy.password
         },
         command: 'connect',
         destination: { host, port },
         timeout: 20000
       })
-        .then(({ socket }) => {
-          // socks 包返回的 socket 默认开启了 30s timeout，会在空闲后触发 'end'，导致我们误判为"被对端关闭"
-          socket.setTimeout(0)
-          socket.setNoDelay(true)
-          socket.setKeepAlive(true, 30000)
-          resolve(socket)
-        })
-        .catch((err: Error) => reject(err))
+      result.socket.setTimeout(0)
+      result.socket.pause()
+      return result.socket
+    }
+    const response = await this.sendConnectRequest(socket, host, port, proxy)
+    if (response.status !== 200)
+      throw new Error(
+        this.formatConnectError(proxy === this.upstream ? '上游中转' : '目标代理', response)
+      )
+    return socket
+  }
+
+  private connectSocket(
+    host: string,
+    port: number,
+    secure: boolean,
+    track: (socket: net.Socket) => net.Socket,
+    existing?: net.Socket
+  ): Promise<net.Socket> {
+    return new Promise((resolve, reject) => {
+      const socket = track(
+        secure
+          ? tls.connect({
+              host,
+              port,
+              socket: existing,
+              servername: net.isIP(host) ? undefined : host
+            })
+          : net.connect(port, host)
+      )
+      const timer = setTimeout(() => {
+        socket.destroy()
+        reject(new Error('代理连接超时'))
+      }, 20000)
+      const cleanup = (): void => {
+        clearTimeout(timer)
+        socket.removeListener('error', fail)
+        socket.removeListener('close', closed)
+      }
+      const fail = (error: Error): void => {
+        cleanup()
+        reject(error)
+      }
+      const closed = (): void => fail(new Error('代理连接被关闭'))
+      socket.once('error', fail)
+      socket.once('close', closed)
+      socket.once(secure ? 'secureConnect' : 'connect', () => {
+        cleanup()
+        socket.setNoDelay(true)
+        socket.pause()
+        resolve(socket)
+      })
     })
   }
 
@@ -254,7 +338,14 @@ export class ChainProxyRelay {
   private readHttpResponse(sock: net.Socket): Promise<ConnectResponse> {
     return new Promise((resolve, reject) => {
       let buf = ''
+      const timer = setTimeout(() => {
+        cleanup()
+        sock.destroy()
+        reject(new Error('代理 CONNECT 响应超时'))
+      }, 20000)
       const cleanup = (): void => {
+        clearTimeout(timer)
+        sock.pause()
         sock.removeListener('data', onData)
         sock.removeListener('error', onErr)
         sock.removeListener('end', onEnd)
@@ -269,41 +360,55 @@ export class ChainProxyRelay {
         const status = Number(m[1])
         const statusText = m[2] || ''
         const sep = raw.indexOf('\r\n\r\n')
-        const headersEnd = sep >= 0 ? sep : raw.length
-        const headersRaw = raw.slice(nlIdx + 2, headersEnd)
         const bodySnippet = sep >= 0 ? raw.slice(sep + 4, sep + 4 + 200) : ''
-        return { status, statusText, headersRaw, bodySnippet }
+        return { status, statusText, bodySnippet }
       }
-      const finish = (raw: string, viaClose: boolean): void => {
+      const finish = (raw: string): void => {
         cleanup()
         const parsed = parse(raw)
-        if (parsed) {
+        if (parsed && (parsed.status !== 200 || raw.includes('\r\n\r\n'))) {
           if (parsed.status === 200 && raw.indexOf('\r\n\r\n') >= 0) {
             const sep = raw.indexOf('\r\n\r\n')
             const rest = raw.slice(sep + 4)
             if (rest.length > 0) sock.unshift(Buffer.from(rest, 'latin1'))
           }
           resolve(parsed)
-        } else if (viaClose) {
-          reject(new Error(raw ? `代理返回不可解析: ${raw.slice(0, 120)}` : '代理连接被对端关闭（无任何响应）'))
+        } else {
+          reject(
+            new Error(
+              raw ? `代理返回不可解析: ${raw.slice(0, 120)}` : '代理连接被对端关闭（无任何响应）'
+            )
+          )
         }
       }
       const onData = (d: Buffer): void => {
         buf += d.toString('latin1')
+        if (buf.length > 65536) {
+          cleanup()
+          sock.destroy()
+          reject(new Error('代理 CONNECT 响应头过大'))
+          return
+        }
         const sep = buf.indexOf('\r\n\r\n')
-        if (sep >= 0) finish(buf, false)
+        if (sep >= 0) finish(buf)
       }
-      const onErr = (err: Error): void => { cleanup(); reject(err) }
-      const onEnd = (): void => finish(buf, true)
+      const onErr = (err: Error): void => {
+        cleanup()
+        reject(err)
+      }
+      const onEnd = (): void => finish(buf)
       sock.on('data', onData)
       sock.once('error', onErr)
       sock.once('end', onEnd)
       sock.once('close', onEnd)
+      sock.resume()
     })
   }
 
   private formatConnectError(stage: string, resp: ConnectResponse): string {
-    const suffix = resp.bodySnippet ? ` body=${resp.bodySnippet.replace(/[\r\n]/g, ' ').slice(0, 120)}` : ''
+    const suffix = resp.bodySnippet
+      ? ` body=${resp.bodySnippet.replace(/[\r\n]/g, ' ').slice(0, 120)}`
+      : ''
     return `${stage} CONNECT 失败: HTTP ${resp.status} ${resp.statusText}${suffix}`
   }
 
@@ -337,15 +442,24 @@ export class ChainProxyRelay {
     }
     const t2 = Date.now()
     try {
-      const resp = await this.sendConnectRequest(chainSock, testHost, testPort, this.target)
-      result.targetStatus = resp.status
-      result.targetStatusText = resp.statusText
-      result.targetBodySnippet = resp.bodySnippet
-      result.endToEndOk = resp.status === 200
-      result.endToEndRtMs = Date.now() - t2
-      if (resp.status !== 200) {
-        result.endToEndError = `目标代理拒绝: HTTP ${resp.status} ${resp.statusText}`
+      if (
+        this.target.protocol === 'socks4' ||
+        this.target.protocol === 'socks5' ||
+        this.target.protocol === 'https'
+      ) {
+        chainSock = await this.connectTarget(chainSock, testHost, testPort)
+        result.targetStatus = 200
+        result.endToEndOk = true
+      } else {
+        const resp = await this.sendConnectRequest(chainSock, testHost, testPort, this.target)
+        result.targetStatus = resp.status
+        result.targetStatusText = resp.statusText
+        result.targetBodySnippet = resp.bodySnippet
+        result.endToEndOk = resp.status === 200
+        if (resp.status !== 200)
+          result.endToEndError = `目标代理拒绝: HTTP ${resp.status} ${resp.statusText}`
       }
+      result.endToEndRtMs = Date.now() - t2
     } catch (err) {
       result.endToEndOk = false
       result.endToEndError = err instanceof Error ? err.message : String(err)
@@ -358,9 +472,19 @@ export class ChainProxyRelay {
   private tcpProbe(host: string, port: number, timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const sock = net.connect(port, host)
-      const timer = setTimeout(() => { sock.destroy(); reject(new Error(`TCP 连接超时 ${host}:${port}`)) }, timeoutMs)
-      sock.once('connect', () => { clearTimeout(timer); sock.destroy(); resolve() })
-      sock.once('error', (err) => { clearTimeout(timer); reject(err) })
+      const timer = setTimeout(() => {
+        sock.destroy()
+        reject(new Error(`TCP 连接超时 ${host}:${port}`))
+      }, timeoutMs)
+      sock.once('connect', () => {
+        clearTimeout(timer)
+        sock.destroy()
+        resolve()
+      })
+      sock.once('error', (err) => {
+        clearTimeout(timer)
+        reject(err)
+      })
     })
   }
 }

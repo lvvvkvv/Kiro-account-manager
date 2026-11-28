@@ -1,9 +1,15 @@
-import { useState } from 'react'
+import { toRgba } from './_helpers'
+import { useMemo, useState } from 'react'
+import { useShallow } from 'zustand/react/shallow'
+import { AccountAssignmentList } from './AccountAssignmentList'
 import { Button, Card, CardContent, CardHeader, CardTitle } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
-import type { AccountTag } from '@/types/account'
+import type { Account, AccountTag } from '@/types/account'
 import { X, Plus, Edit2, Trash2, Tag, Check, Palette } from 'lucide-react'
+
+const noAccounts = new Map<string, Account>()
+const noTags = new Map<string, AccountTag>()
 
 interface TagManageDialogProps {
   isOpen: boolean
@@ -47,20 +53,21 @@ function toArgb(rgb: string, alpha: number): string {
 }
 
 // 转换为 CSS rgba
-function toRgba(argbColor: string): string {
-  const { alpha, rgb } = parseArgb(argbColor)
-  const hex = rgb.startsWith('#') ? rgb.slice(1) : rgb
-  const r = parseInt(hex.slice(0, 2), 16)
-  const g = parseInt(hex.slice(2, 4), 16)
-  const b = parseInt(hex.slice(4, 6), 16)
-  return `rgba(${r}, ${g}, ${b}, ${alpha / 255})`
-}
-
 export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): React.ReactNode {
   const { tags, accounts, addTag, updateTag, removeTag, addTagToAccounts, removeTagFromAccounts } =
-    useAccountsStore()
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+    useAccountsStore(
+      useShallow((state) => ({
+        tags: isOpen ? state.tags : noTags,
+        accounts: isOpen ? state.accounts : noAccounts,
+        addTag: state.addTag,
+        updateTag: state.updateTag,
+        removeTag: state.removeTag,
+        addTagToAccounts: state.addTagToAccounts,
+        removeTagFromAccounts: state.removeTagFromAccounts
+      }))
+    )
+  const { actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
 
   // 编辑状态
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -77,18 +84,26 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
   // 分配账号状态
   const [assigningTagId, setAssigningTagId] = useState<string | null>(null)
 
-  // 获取标签的账号数量
-  const getTagAccountCount = (tagId: string): number => {
-    return Array.from(accounts.values()).filter((acc) => acc.tags.includes(tagId)).length
-  }
-
-  // 获取未标记的账号数量
-  const getUntaggedCount = (): number => {
-    return Array.from(accounts.values()).filter((acc) => acc.tags.length === 0).length
-  }
+  const { tagCounts, untagged } = useMemo(() => {
+    const counts = new Map<string, number>()
+    let untagged = 0
+    for (const account of accounts.values()) {
+      if (!account.tags.length) untagged++
+      for (const tag of account.tags) counts.set(tag, (counts.get(tag) || 0) + 1)
+    }
+    return { tagCounts: counts, untagged }
+  }, [accounts])
+  const { assigned, available } = useMemo(() => {
+    const assigned: Account[] = [],
+      available: Account[] = []
+    if (assigningTagId)
+      for (const account of accounts.values())
+        (account.tags.includes(assigningTagId) ? assigned : available).push(account)
+    return { assigned, available }
+  }, [accounts, assigningTagId])
 
   // 创建标签
-  const handleCreate = () => {
+  const handleCreate = (): void => {
     if (!newName.trim()) return
     const argbColor = toArgb(newColor, newAlpha)
     addTag({
@@ -102,7 +117,7 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
   }
 
   // 开始编辑
-  const handleStartEdit = (tag: AccountTag) => {
+  const handleStartEdit = (tag: AccountTag): void => {
     setEditingId(tag.id)
     setEditName(tag.name)
     const { alpha, rgb } = parseArgb(tag.color)
@@ -111,7 +126,7 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
   }
 
   // 保存编辑
-  const handleSaveEdit = () => {
+  const handleSaveEdit = (): void => {
     if (!editingId || !editName.trim()) return
     const argbColor = toArgb(editColor, editAlpha)
     updateTag(editingId, {
@@ -122,8 +137,8 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
   }
 
   // 删除标签
-  const handleDelete = (id: string, name: string) => {
-    const count = getTagAccountCount(id)
+  const handleDelete = (id: string, name: string): void => {
+    const count = tagCounts.get(id) || 0
     const msg =
       count > 0
         ? `确定要删除标签「${name}」吗？\n该标签已应用于 ${count} 个账号，删除后将从这些账号移除。`
@@ -133,17 +148,7 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
     }
   }
 
-  // 获取带有此标签的账号列表
-  const getTaggedAccounts = (tagId: string) => {
-    return Array.from(accounts.values()).filter((acc) => acc.tags.includes(tagId))
-  }
-
-  // 获取可添加此标签的账号列表
-  const getUntaggedByTag = (tagId: string) => {
-    return Array.from(accounts.values()).filter((acc) => !acc.tags.includes(tagId))
-  }
-
-  const tagList = Array.from(tags.values())
+  const tagList = useMemo(() => Array.from(tags.values()), [tags])
 
   if (!isOpen) return null
 
@@ -180,9 +185,7 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
           <div className="flex gap-4 text-body text-muted-foreground">
             <span>{isEn ? `${tagList.length} tags` : `共 ${tagList.length} 个标签`}</span>
             <span>•</span>
-            <span>
-              {isEn ? `${getUntaggedCount()} untagged` : `${getUntaggedCount()} 个未标记账号`}
-            </span>
+            <span>{isEn ? `${untagged} untagged` : `${untagged} 个未标记账号`}</span>
           </div>
 
           {/* 新建标签 */}
@@ -354,13 +357,14 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                     </div>
 
                     {/* 已标记的账号 */}
-                    {getTaggedAccounts(tag.id).length > 0 && (
+                    {assigned.length > 0 && (
                       <div className="space-y-1">
                         <p className="text-caption text-muted-foreground">
                           {isEn ? 'Tagged accounts:' : '已标记的账号：'}
                         </p>
-                        <div className="flex flex-wrap gap-1">
-                          {getTaggedAccounts(tag.id).map((acc) => (
+                        <AccountAssignmentList
+                          items={assigned}
+                          renderItem={(acc) => (
                             <span
                               key={acc.id}
                               className="inline-flex items-center gap-1 h-5 px-[7px] rounded-full text-badge"
@@ -375,19 +379,20 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                                 <X className="h-3 w-3" />
                               </button>
                             </span>
-                          ))}
-                        </div>
+                          )}
+                        />
                       </div>
                     )}
 
                     {/* 可添加标签的账号 */}
-                    {getUntaggedByTag(tag.id).length > 0 && (
+                    {available.length > 0 && (
                       <div className="space-y-1">
                         <p className="text-caption text-muted-foreground">
                           {isEn ? 'Click to add tag:' : '点击添加标签：'}
                         </p>
-                        <div className="flex flex-wrap gap-1 max-h-32 overflow-auto">
-                          {getUntaggedByTag(tag.id).map((acc) => (
+                        <AccountAssignmentList
+                          items={available}
+                          renderItem={(acc) => (
                             <button
                               key={acc.id}
                               onClick={() => addTagToAccounts([acc.id], tag.id)}
@@ -395,8 +400,8 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                             >
                               {acc.email}
                             </button>
-                          ))}
-                        </div>
+                          )}
+                        />
                       </div>
                     )}
 
@@ -416,7 +421,7 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
                       {tag.name}
                     </span>
                     <span className="text-caption text-muted-foreground">
-                      {getTagAccountCount(tag.id)} 个账号
+                      {tagCounts.get(tag.id) || 0} 个账号
                     </span>
                     <div className="flex-1" />
                     <div className="flex items-center gap-1 shrink-0">
@@ -470,6 +475,3 @@ export function TagManageDialog({ isOpen, onClose }: TagManageDialogProps): Reac
     </div>
   )
 }
-
-// 导出工具函数供其他组件使用
-export { toRgba, parseArgb, toArgb }

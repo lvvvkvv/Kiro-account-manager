@@ -3,11 +3,13 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
+  useRef,
   useState,
   type ReactNode,
   type JSX
 } from 'react'
-import type { AppUpdateState } from '../../../shared/update'
+import type { AppUpdateInfo, AppUpdateState } from '../../../shared/update'
 
 const initial: AppUpdateState = {
   revision: -1,
@@ -27,7 +29,7 @@ const initial: AppUpdateState = {
 }
 interface Updates {
   state: AppUpdateState
-  notice: 'latest' | string | null
+  notice: string | null
   check: () => Promise<void>
   install: () => Promise<void>
   setEnabled: (enabled: boolean) => Promise<void>
@@ -35,19 +37,50 @@ interface Updates {
   openDownload: () => Promise<void>
 }
 const Context = createContext<Updates | null>(null)
+const BadgeContext = createContext<boolean | null>(null)
+
+function sameInfo(a: AppUpdateInfo | null, b: AppUpdateInfo | null): boolean {
+  return (
+    a === b ||
+    !!(
+      a &&
+      b &&
+      a.version === b.version &&
+      a.notes === b.notes &&
+      a.publishedAt === b.publishedAt &&
+      a.installable === b.installable
+    )
+  )
+}
+
+function sameState(a: AppUpdateState, b: AppUpdateState): boolean {
+  return (
+    Object.keys(a).length === Object.keys(b).length &&
+    (Object.keys(b) as (keyof AppUpdateState)[]).every((key) =>
+      key === 'available' || key === 'ready' ? sameInfo(a[key], b[key]) : a[key] === b[key]
+    )
+  )
+}
 
 export function UpdateProvider({ children }: { children: ReactNode }): JSX.Element {
   const [state, setState] = useState(initial)
   const [notice, setNotice] = useState<string | null>(null)
+  const current = useRef(initial)
+  const operation = useRef(0)
   const accept = useCallback((next: AppUpdateState) => {
-    setState((current) => (next.revision >= current.revision ? next : current))
+    if (next.revision < current.current.revision || sameState(current.current, next)) return
+    current.current = next
+    setState(next)
   }, [])
-  const perform = useCallback(async (action: () => Promise<unknown>) => {
+  const perform = useCallback(async (action: () => Promise<string | void>) => {
+    const id = ++operation.current
     setNotice(null)
     try {
-      await action()
+      const result = await action()
+      if (id === operation.current) setNotice(result || null)
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error))
+      if (id === operation.current)
+        setNotice(error instanceof Error ? error.message : String(error))
     }
   }, [])
   useEffect(() => {
@@ -67,8 +100,9 @@ export function UpdateProvider({ children }: { children: ReactNode }): JSX.Eleme
       unsubscribe()
     }
   }, [accept])
+  const readyVersion = state.ready?.version
   useEffect(() => {
-    if (!state.ready) return
+    if (!readyVersion) return
     const timer = setInterval(() => {
       void window.api
         .getUpdateState()
@@ -76,27 +110,49 @@ export function UpdateProvider({ children }: { children: ReactNode }): JSX.Eleme
         .catch(() => {})
     }, 5000)
     return () => clearInterval(timer)
-  }, [state.ready, accept])
+  }, [readyVersion, accept])
+  const actions = useMemo(
+    () => ({
+      check: () =>
+        perform(async () => {
+          const next = await window.api.checkAppUpdate()
+          accept(next)
+          if (
+            !next.available &&
+            !next.ready &&
+            !current.current.available &&
+            !current.current.ready &&
+            !current.current.error
+          )
+            return 'latest'
+          return undefined
+        }),
+      install: () =>
+        perform(async () => {
+          await window.api.installAppUpdate()
+        }),
+      setEnabled: (enabled: boolean) =>
+        perform(async () => accept(await window.api.setAutoUpdateEnabled(enabled))),
+      dismiss: () => perform(async () => accept(await window.api.dismissAppUpdate())),
+      openDownload: () =>
+        perform(async () => {
+          await window.api.openUpdateDownloadPage()
+        })
+    }),
+    [accept, perform]
+  )
+  const visibleNotice =
+    notice === 'latest' && (state.available || state.ready || state.checking || state.error)
+      ? null
+      : notice
+  const value = useMemo(
+    () => ({ state, notice: visibleNotice, ...actions }),
+    [state, visibleNotice, actions]
+  )
   return (
-    <Context.Provider
-      value={{
-        state,
-        notice,
-        check: () =>
-          perform(async () => {
-            const next = await window.api.checkAppUpdate()
-            accept(next)
-            if (!next.available && !next.ready) setNotice('latest')
-          }),
-        install: () => perform(() => window.api.installAppUpdate()),
-        setEnabled: (enabled) =>
-          perform(async () => accept(await window.api.setAutoUpdateEnabled(enabled))),
-        dismiss: () => perform(async () => accept(await window.api.dismissAppUpdate())),
-        openDownload: () => perform(() => window.api.openUpdateDownloadPage())
-      }}
-    >
-      {children}
-    </Context.Provider>
+    <BadgeContext.Provider value={!!(state.available || state.ready)}>
+      <Context.Provider value={value}>{children}</Context.Provider>
+    </BadgeContext.Provider>
   )
 }
 
@@ -105,5 +161,12 @@ export function UpdateProvider({ children }: { children: ReactNode }): JSX.Eleme
 export function useAppUpdate(): Updates {
   const value = useContext(Context)
   if (!value) throw new Error('UpdateProvider is missing')
+  return value
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function useAppUpdateBadge(): boolean {
+  const value = useContext(BadgeContext)
+  if (value === null) throw new Error('UpdateProvider is missing')
   return value
 }

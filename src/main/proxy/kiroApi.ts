@@ -1,3 +1,4 @@
+import { withDeadline } from '../../shared/async'
 // Kiro API 调用核心模块
 import { v4 as uuidv4 } from 'uuid'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
@@ -17,7 +18,8 @@ import type {
 } from './types'
 import { proxyLogger } from './logger'
 import { getKProxyService } from '../kproxy'
-import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
+import { DEVICE_ID_HEADER } from '../kproxy/types'
+import { getSystemProxy, getCachedProxyAgent } from './systemProxy'
 import {
   countTokens,
   getModelContextLength,
@@ -59,9 +61,6 @@ let enableTokenBufferReserve = false
 export function setEnableTokenBufferReserve(enabled: boolean): void {
   enableTokenBufferReserve = !!enabled
 }
-export function getEnableTokenBufferReserve(): boolean {
-  return enableTokenBufferReserve
-}
 
 // Token buffer reserve（仅在 enableTokenBufferReserve=true 时生效）
 // 为 model context window 预留的余量，覆盖 system + tools + current + output + 估算偏差 + schema 开销
@@ -69,9 +68,6 @@ export function getEnableTokenBufferReserve(): boolean {
 let tokenBufferReserve = 20000
 export function setTokenBufferReserve(tokens: number): void {
   tokenBufferReserve = Math.max(5000, Math.min(150000, tokens))
-}
-export function getTokenBufferReserve(): number {
-  return tokenBufferReserve
 }
 
 // 根据 modelId 和 buffer 计算 effective token limit
@@ -106,7 +102,7 @@ function estimatePayloadTokens(payload: KiroPayload): number {
 function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
   // 1. 账号专属代理：实现"N 个账号共用 1 个 IP"的分桶反代
   if (account?.proxyUrl) {
-    const agent = safeCreateProxyAgent(account.proxyUrl)
+    const agent = getCachedProxyAgent(account.proxyUrl)
     if (agent) {
       proxyLogger.debug('KiroAPI', `Using account-bound proxy for ${account.email || account.id}`)
       return agent
@@ -118,16 +114,16 @@ function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      const agent = getCachedProxyAgent(proxyUrl)
       if (agent) return agent
     }
   }
   // 3. 环境变量
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  const envAgent = safeCreateProxyAgent(envProxy)
+  const envAgent = getCachedProxyAgent(envProxy)
   if (envAgent) return envAgent
   // 4. 系统代理
-  return safeCreateProxyAgent(getSystemProxy())
+  return getCachedProxyAgent(getSystemProxy())
 }
 
 /**
@@ -136,11 +132,16 @@ function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
  */
 async function fetchWithProxy(url: string, options: RequestInit, account?: ProxyAccount): Promise<Response> {
   const agent = getNetworkAgent(account)
-  if (agent) {
-    proxyLogger.debug('KiroAPI', `Using proxy agent: ${agent.constructor.name}`)
-    return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+  const headers = new Headers(options.headers)
+  const service = useKProxyForApi && !account?.proxyUrl ? getKProxyService() : null
+  if (account && agent && service?.isRunning()) {
+    const config = service.getConfig()
+    if (agent === getCachedProxyAgent(`http://${config.host}:${config.port}`)) {
+      headers.set(DEVICE_ID_HEADER, service.getDeviceIdForAccount(account.id) || getAccountMachineId(account.id, account.machineId))
+    }
   }
-  return await fetch(url, options)
+  if (agent) return await undiciFetch(url, { ...options, headers, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+  return await fetch(url, { ...options, headers })
 }
 
 // Kiro API 端点配置
@@ -186,17 +187,11 @@ function getKiroAmzUserAgent(machineId?: string): string {
   return `aws-sdk-js/${AWS_SDK_VERSION} ${suffix}`
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const KIRO_CLI_OS = OS_PLATFORM === 'win32' ? 'windows' : OS_PLATFORM === 'macos' ? 'macos' : 'linux'
-void KIRO_CLI_OS // reserved for future kiro-cli UA
 
 // Agent 模式（可通过 setAgentMode 配置切换）
 let configuredAgentMode: 'vibe' | 'spec' = 'vibe'
 export function setAgentMode(mode: 'vibe' | 'spec'): void {
   configuredAgentMode = mode
-}
-export function getAgentMode(): 'vibe' | 'spec' {
-  return configuredAgentMode
 }
 
 // profileArn 决策中心已迁移到 ../kiroAuthSync，反代和账号管理器主进程共用同一份定义，
@@ -236,40 +231,11 @@ function resolveProfileArn(account: ProxyAccount): string | undefined {
 // 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
 export { KIRO_SOCIAL_PROFILE_ARN }
 
-// Agentic 模式系统提示 - 防止大文件写入超时
-const AGENTIC_SYSTEM_PROMPT = `# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
-
-You MUST follow these rules for ALL file operations. Violation causes server timeouts and task failure.
-
-## ABSOLUTE LIMITS
-- **MAXIMUM 350 LINES** per single write/edit operation - NO EXCEPTIONS
-- **RECOMMENDED 300 LINES** or less for optimal performance
-- **NEVER** write entire files in one operation if >300 lines
-
-## MANDATORY CHUNKED WRITE STRATEGY
-
-### For NEW FILES (>300 lines total):
-1. FIRST: Write initial chunk (first 250-300 lines) using write_to_file/fsWrite
-2. THEN: Append remaining content in 250-300 line chunks using file append operations
-3. REPEAT: Continue appending until complete
-
-### For EDITING EXISTING FILES:
-1. Use surgical edits (apply_diff/targeted edits) - change ONLY what's needed
-2. NEVER rewrite entire files - use incremental modifications
-3. Split large refactors into multiple small, focused edits
-
-REMEMBER: When in doubt, write LESS per operation. Multiple small operations > one large operation.`
-
-// Thinking 模式标签
-const THINKING_MODE_PROMPT = `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>200000</max_thinking_length>`
-
 const CODEWHISPERER_DEFAULT_MODEL_ID = 'CLAUDE_SONNET_4_20250514_V1_0'
 const CODEWHISPERER_MODEL_CACHE_TTL = 5 * 60 * 1000
 
 const codeWhispererModelCache = new Map<string, { models: KiroModel[]; timestamp: number }>()
 
-// 模型 ID 映射
 const MODEL_ID_MAP: Record<string, string> = {
   // Claude 4.5 系列
   'claude-sonnet-4-5': 'claude-sonnet-4.5',
@@ -330,7 +296,19 @@ export function mapModelId(model: string): string {
 }
 
 function clonePayload(payload: KiroPayload): KiroPayload {
-  return JSON.parse(JSON.stringify(payload)) as KiroPayload
+  const cloneMessage = (message: KiroHistoryMessage): KiroHistoryMessage => ({
+    ...message,
+    ...(message.userInputMessage ? { userInputMessage: { ...message.userInputMessage } } : {}),
+    ...(message.assistantResponseMessage ? { assistantResponseMessage: { ...message.assistantResponseMessage } } : {})
+  })
+  return {
+    ...payload,
+    conversationState: {
+      ...payload.conversationState,
+      currentMessage: { ...payload.conversationState.currentMessage, userInputMessage: { ...payload.conversationState.currentMessage.userInputMessage } },
+      history: payload.conversationState.history?.map(cloneMessage)
+    }
+  }
 }
 
 function normalizeModelKey(value: string): string {
@@ -371,20 +349,49 @@ function getModelCacheKey(account: ProxyAccount): string {
   return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account) ?? 'no-arn'}`
 }
 
-async function getCachedCodeWhispererModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
+let modelCacheGeneration = 0
+export function clearKiroModelCache(): void {
+  modelCacheGeneration++
+  codeWhispererModelCache.clear()
+  pendingModelQueries.clear()
+}
+
+const pendingModelQueries = new Map<string, Promise<KiroModel[]>>()
+
+async function waitForModelQuery<T>(task: Promise<T>, signal?: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  if (!signal) return task
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(getAbortError(signal))
+    signal.addEventListener('abort', abort, { once: true })
+    task.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
+  })
+}
+
+export async function getCachedKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
   const key = getModelCacheKey(account)
+  const generation = modelCacheGeneration
   const cached = codeWhispererModelCache.get(key)
   if (cached && Date.now() - cached.timestamp < CODEWHISPERER_MODEL_CACHE_TTL) return cached.models
-  const models = await fetchKiroModels(account, signal)
-  codeWhispererModelCache.set(key, { models, timestamp: Date.now() })
-  return models
+  let task = pendingModelQueries.get(key)
+  if (!task) {
+    task = fetchKiroModels(account).then((models) => {
+      if (models.length && generation === modelCacheGeneration) {
+        if (codeWhispererModelCache.size >= 1000) codeWhispererModelCache.delete(codeWhispererModelCache.keys().next().value!)
+        codeWhispererModelCache.set(key, { models, timestamp: Date.now() })
+      }
+      return models
+    }).finally(() => { if (pendingModelQueries.get(key) === task) pendingModelQueries.delete(key) })
+    pendingModelQueries.set(key, task)
+  }
+  return await waitForModelQuery(task, signal)
 }
 
 async function resolveCodeWhispererModelId(account: ProxyAccount, requestedModelId?: string, signal?: AbortSignal): Promise<string> {
   const modelId = requestedModelId?.trim()
   if (!modelId) return CODEWHISPERER_DEFAULT_MODEL_ID
   if (isCodeWhispererModelId(modelId)) return modelId
-  const models = await getCachedCodeWhispererModels(account, signal)
+  const models = await getCachedKiroModels(account, signal)
   return models.find(model => matchesRequestedModel(model, modelId))?.modelId || CODEWHISPERER_DEFAULT_MODEL_ID
 }
 
@@ -408,51 +415,6 @@ function applyPayloadOrigin(payload: KiroPayload, origin: string): void {
   }
 }
 
-// 检测是否为 Agentic 模式请求
-export function isAgenticRequest(model: string, tools?: unknown[]): boolean {
-  const lower = model.toLowerCase()
-  // 模型名称包含 -agentic 或有工具调用
-  return lower.includes('-agentic') || lower.includes('agentic') || Boolean(tools && tools.length > 0)
-}
-
-// 检测是否启用 Thinking 模式
-export function isThinkingEnabled(headers?: Record<string, string>): boolean {
-  if (!headers) return false
-  // 检查 Anthropic-Beta 头是否包含 thinking
-  const betaHeader = headers['anthropic-beta'] || headers['Anthropic-Beta'] || ''
-  return betaHeader.toLowerCase().includes('thinking')
-}
-
-// 注入系统提示
-export function injectSystemPrompts(
-  content: string,
-  isAgentic: boolean,
-  thinkingEnabled: boolean
-): string {
-  let result = content
-  
-  // 注入时间戳
-  const timestamp = new Date().toISOString()
-  const timestampPrompt = `Current time: ${timestamp}`
-  
-  // 注入 Thinking 模式（必须在最前面）
-  if (thinkingEnabled) {
-    result = THINKING_MODE_PROMPT + '\n\n' + result
-  }
-  
-  // 注入 Agentic 模式提示
-  if (isAgentic) {
-    result = result + '\n\n' + AGENTIC_SYSTEM_PROMPT
-  }
-  
-  // 注入时间戳
-  result = timestampPrompt + '\n\n' + result
-  
-  return result
-}
-
-// ============= 消息清理逻辑（参考 Kiro 官方实现）=============
-
 // 占位消息
 const HELLO_MESSAGE: KiroHistoryMessage = {
   userInputMessage: { content: 'Hello', origin: 'AI_EDITOR' }
@@ -466,7 +428,6 @@ const UNDERSTOOD_MESSAGE: KiroHistoryMessage = {
   assistantResponseMessage: { content: 'understood' }
 }
 
-// 创建失败的工具结果消息
 function createFailedToolUseMessage(toolUseIds: string[]): KiroHistoryMessage {
   return {
     userInputMessage: {
@@ -877,7 +838,8 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
 
   let totalTrimmed = 0
   let iterations = 0
-  let currentTokens = estimatePayloadTokens(payload)
+  let currentBytes = Buffer.byteLength(JSON.stringify(payload), 'utf-8')
+  let currentTokens = Math.ceil(currentBytes / 3.5)
   const MAX_ITERATIONS = 100 // 防止极端情况死循环
 
   while (currentTokens > maxTokens && history.length >= 4 && iterations < MAX_ITERATIONS) {
@@ -897,13 +859,16 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
 
     if (cutAt === 0) break // 无法继续裁剪
 
+    const removed = history.slice(0, cutAt)
+    currentBytes -= removed.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message), 'utf-8'), 0) + cutAt
     history = history.slice(cutAt)
     totalTrimmed += cutAt
 
     // 裁剪后 history 可能以 assistant 起头 → 补 HELLO 重新规范
+    if (!history[0].userInputMessage) currentBytes += Buffer.byteLength(JSON.stringify(HELLO_MESSAGE), 'utf-8') + 1
     history = ensureStartsWithUserMessage(history)
     payload.conversationState.history = history
-    currentTokens = estimatePayloadTokens(payload)
+    currentTokens = Math.ceil(currentBytes / 3.5)
   }
 
   return { trimmed: totalTrimmed, finalTokens: currentTokens, iterations }
@@ -1076,10 +1041,11 @@ export function buildKiroPayload(
         for (const contentItem of toolResult.content) {
           if (initialPayloadSize <= PAYLOAD_SIZE_LIMIT) break
           if (contentItem.text && contentItem.text.length > TOOL_RESULT_TRUNCATE_LENGTH) {
+            const originalSerializedSize = JSON.stringify(contentItem.text).length
             const originalLen = contentItem.text.length
             contentItem.text = `${contentItem.text.slice(0, TOOL_RESULT_TRUNCATE_LENGTH)}\n\n[Truncated by proxy: original ${originalLen} chars]`
             truncatedCount++
-            initialPayloadSize = JSON.stringify(payload).length
+            initialPayloadSize += JSON.stringify(contentItem.text).length - originalSerializedSize
           }
         }
       }
@@ -1119,18 +1085,26 @@ function resolveConversationId(history: KiroHistoryMessage[], sessionHint?: stri
   const now = Date.now()
   const cached = conversationCache.get(key)
   if (cached) {
-    cached.timestamp = now
-    return cached.id
+    if (now - cached.timestamp < CONVERSATION_CACHE_TTL) {
+      cached.timestamp = now
+      conversationCache.delete(key)
+      conversationCache.set(key, cached)
+      return cached.id
+    }
+    conversationCache.delete(key)
   }
 
   // 清理过期缓存
-  if (conversationCache.size > CONVERSATION_CACHE_MAX) {
+  if (conversationCache.size >= CONVERSATION_CACHE_MAX) {
     const cutoff = now - CONVERSATION_CACHE_TTL
     for (const [k, v] of conversationCache) {
       if (v.timestamp < cutoff) conversationCache.delete(k)
     }
   }
 
+  if (conversationCache.size >= CONVERSATION_CACHE_MAX) {
+    conversationCache.delete(conversationCache.keys().next().value!)
+  }
   const id = uuidv4()
   conversationCache.set(key, { id, timestamp: now })
   return id
@@ -1150,7 +1124,7 @@ export function clearAllCaches(): { conversation: number; model: number } {
   const conversationCount = conversationCache.size
   const modelCount = codeWhispererModelCache.size
   conversationCache.clear()
-  codeWhispererModelCache.clear()
+  clearKiroModelCache()
   return { conversation: conversationCount, model: modelCount }
 }
 
@@ -1232,6 +1206,16 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw getAbortError(signal)
 }
 
+export class KiroApiError extends Error {
+  constructor(message: string, readonly statusCode?: number) {
+    super(message)
+  }
+}
+
+export function getKiroErrorStatus(error: Error): number | undefined {
+  return error instanceof KiroApiError ? error.statusCode : Number(error.message.match(/(?:error|HTTP|status)\s*(\d{3})/i)?.[1]) || undefined
+}
+
 // 调用 Kiro API（流式）
 export async function callKiroApiStream(
   account: ProxyAccount,
@@ -1243,13 +1227,18 @@ export async function callKiroApiStream(
   signal?: AbortSignal,
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
 ): Promise<void> {
+  let emitted = false
+  const emit: typeof onChunk = (...args) => {
+    if (args.some((value) => value !== undefined && value !== '' && value !== false)) emitted = true
+    return onChunk(...args)
+  }
   const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
   // 所有账号类型均走正常端点优先级（含 fallback），不再强制 Enterprise 走 CodeWhisperer
   const endpoints = getSortedEndpoints(preferredEndpoint)
 
   // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底，流式端点自动不传占位符）
   if (!account.profileArn && isEnterprise) {
-    const fetchedArn = await fetchEnterpriseProfileArn(account)
+    const fetchedArn = await fetchEnterpriseProfileArn(account, signal)
     if (fetchedArn) {
       account.profileArn = fetchedArn
       if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
@@ -1287,26 +1276,21 @@ export async function callKiroApiStream(
       const historyMessages = requestPayload.conversationState.history ?? []
       const historyToolUseCount = historyMessages.reduce((count, message) => count + (message.assistantResponseMessage?.toolUses?.length ?? 0), 0)
       const historyToolResultCount = historyMessages.reduce((count, message) => count + (message.userInputMessage?.userInputMessageContext?.toolResults?.length ?? 0), 0)
-      console.log(`[KiroAPI] Request to ${endpoint.name}:`)
-      console.log(`[KiroAPI]   - Content length: ${currentUserInput?.content?.length || 0}`)
-      console.log(`[KiroAPI]   - Tools count: ${currentUserInput?.userInputMessageContext?.tools?.length || 0}`)
-      console.log(`[KiroAPI]   - Current tool results: ${currentUserInput?.userInputMessageContext?.toolResults?.length || 0}`)
-      console.log(`[KiroAPI]   - History messages: ${historyMessages.length}`)
-      console.log(`[KiroAPI]   - History tool uses/results: ${historyToolUseCount}/${historyToolResultCount}`)
-      console.log(`[KiroAPI]   - Model ID: ${currentUserInput?.modelId || 'default'}`)
-      console.log(`[KiroAPI]   - Has profileArn: ${requestPayload.profileArn !== undefined}`)
-      console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
-      console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
+      proxyLogger.info('KiroAPI', `Request to ${endpoint.name}`, {
+        contentLength: currentUserInput?.content?.length || 0,
+        tools: currentUserInput?.userInputMessageContext?.tools?.length || 0,
+        toolResults: currentUserInput?.userInputMessageContext?.toolResults?.length || 0,
+        history: historyMessages.length, historyToolUseCount, historyToolResultCount,
+        model: currentUserInput?.modelId, agentMode: headers['x-amzn-kiro-agent-mode'],
+        payloadSize: payloadStr.length
+      })
       
-      const agent = getNetworkAgent(account)
-      if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
-      const response = agent
-        ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
-        : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+      const response = await fetchWithProxy(endpoint.url, { method: 'POST', headers, body: payloadStr, signal }, account)
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
-        lastError = new Error(`Quota exhausted on ${endpoint.name}`)
+        await response.body?.cancel()
+        lastError = new KiroApiError(`API error 429: Quota exhausted on ${endpoint.name}`, 429)
         continue
       }
 
@@ -1314,20 +1298,20 @@ export async function callKiroApiStream(
         throwIfAborted(signal)
         const body = await response.text()
         throwIfAborted(signal)
-        throw new Error(`Auth error ${response.status}: ${body}`)
+        throw new KiroApiError(`Auth error ${response.status}: ${body}`, response.status)
       }
 
       if (!response.ok) {
         throwIfAborted(signal)
         const body = await response.text()
         throwIfAborted(signal)
-        throw new Error(`API error ${response.status}: ${body}`)
+        throw new KiroApiError(`API error ${response.status}: ${body}`, response.status)
       }
 
       // 解析 Event Stream
       // 传入 modelId + payloadStr 用于精确 token 计算（contextUsage 反推 + tiktoken）
       const inputChars = payloadStr.length
-      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
+      await parseEventStream(response.body!, emit, onComplete, inputChars, signal, requestedModelId, payloadStr)
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -1338,7 +1322,7 @@ export async function callKiroApiStream(
       console.error(`[KiroAPI] Endpoint ${endpoint.name} failed:`, error)
       
       // 如果是认证错误，不继续尝试其他端点
-      if ((error as Error).message.includes('Auth error')) {
+      if (emitted || (error as Error).message.includes('Auth error')) {
         onError(error as Error)
         return
       }
@@ -1360,7 +1344,7 @@ export async function callKiroApiStream(
           }
           // 复用同一端点的配置（与主流程 profileArn 逻辑一致）
           const resolvedArn2 = resolveProfileArn(account)
-          if (resolvedArn2 && (!isPlaceholderProfileArn(resolvedArn2) || isEnterprise)) {
+          if (resolvedArn2) {
             retryPayload.profileArn = resolvedArn2
           } else {
             delete retryPayload.profileArn
@@ -1369,20 +1353,24 @@ export async function callKiroApiStream(
             applyPayloadModelId(retryPayload, await resolveCodeWhispererModelId(account, getPayloadModelId(retryPayload), signal))
           }
           applyPayloadOrigin(retryPayload, endpoint.origin)
+          if (endpoint.name === 'AmazonQCLI') {
+            delete retryPayload.conversationState.agentContinuationId
+            delete retryPayload.conversationState.agentTaskType
+          }
           const retryStr = JSON.stringify(retryPayload)
           const retryHeaders = getAuthHeaders(account, endpoint)
-          const retryAgent = getNetworkAgent(account)
-          const retryResponse = retryAgent
-            ? await undiciFetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal, dispatcher: retryAgent } as UndiciRequestInit) as unknown as Response
-            : await fetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal })
+          const retryResponse = await fetchWithProxy(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal }, account)
           if (retryResponse.ok) {
-            await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, retryStr.length, signal, getPayloadModelId(retryPayload), retryStr)
+            await parseEventStream(retryResponse.body!, emit, onComplete, retryStr.length, signal, getPayloadModelId(retryPayload), retryStr)
             return
           }
           const retryBody = await retryResponse.text()
+          lastError = new KiroApiError(`API error ${retryResponse.status}: ${retryBody}`, retryResponse.status)
           console.error(`[KiroAPI] THINKING_SIGNATURE_INVALID retry also failed: ${retryResponse.status} ${retryBody.slice(0, 200)}`)
         } catch (retryErr) {
           if (signal?.aborted) { onError(getAbortError(signal)); return }
+          lastError = retryErr as Error
+          if (emitted) { onError(lastError); return }
           console.error(`[KiroAPI] THINKING_SIGNATURE_INVALID retry error:`, retryErr)
         }
       }
@@ -1394,6 +1382,8 @@ export async function callKiroApiStream(
   }
 }
 
+const eventDecoder = new TextDecoder()
+
 // 从 headers 中提取 event type
 function extractEventType(headers: Uint8Array): string {
   let offset = 0
@@ -1402,7 +1392,7 @@ function extractEventType(headers: Uint8Array): string {
     const nameLen = headers[offset]
     offset++
     if (offset + nameLen > headers.length) break
-    const name = new TextDecoder().decode(headers.slice(offset, offset + nameLen))
+    const name = eventDecoder.decode(headers.subarray(offset, offset + nameLen))
     offset += nameLen
     if (offset >= headers.length) break
     const valueType = headers[offset]
@@ -1413,7 +1403,7 @@ function extractEventType(headers: Uint8Array): string {
       const valueLen = (headers[offset] << 8) | headers[offset + 1]
       offset += 2
       if (offset + valueLen > headers.length) break
-      const value = new TextDecoder().decode(headers.slice(offset, offset + valueLen))
+      const value = eventDecoder.decode(headers.subarray(offset, offset + valueLen))
       offset += valueLen
       if (name === ':event-type') {
         return value
@@ -1453,8 +1443,7 @@ export function estimateTokens(text: string): number {
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void | Promise<void>,
-  onComplete: (usage: KiroUsage) => void,
-  onError: (error: Error) => void,
+  onComplete: (usage: KiroUsage) => void | Promise<void>,
   inputChars: number = 0,  // 输入字符长度（兜底估算用）
   signal?: AbortSignal,
   modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
@@ -1464,13 +1453,13 @@ async function parseEventStream(
   const abort = () => {
     reader.cancel(getAbortError(signal)).catch(() => undefined)
   }
-  let buffer = new Uint8Array(0)
+  let buffer: Uint8Array = new Uint8Array(0)
+  let scratch = new Uint8Array(0)
+  let reachedEnd = false
   let usage: KiroUsage = { 
     inputTokens: 0, 
     outputTokens: 0, 
     credits: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
     reasoningTokens: 0
   }
   
@@ -1483,16 +1472,6 @@ async function parseEventStream(
   
   // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
   const streamEventCounts: Record<string, number> = {}
-  
-  // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数）
-  // 这里只是兜底初值，后续真实事件会覆盖
-  if (payloadStr) {
-    // 用 tiktoken cl100k_base 精确计算（±5%）
-    usage.inputTokens = countTokens(payloadStr)
-  } else if (inputChars > 0) {
-    // 字符系数兜底（针对 payload JSON 经验值 0.42）
-    usage.inputTokens = Math.max(1, Math.round(inputChars * 0.42))
-  }
   
   // Tool use 状态跟踪 - 用于累积输入片段
   let currentToolUse: ToolUseState | null = null
@@ -1637,14 +1616,20 @@ async function parseEventStream(
       throwIfAborted(signal)
       
       if (done) {
+        reachedEnd = true
+        if (buffer.length) throw new Error('Incomplete event stream frame')
         break
       }
 
-      // 合并缓冲区
-      const newBuffer = new Uint8Array(buffer.length + value.length)
-      newBuffer.set(buffer)
-      newBuffer.set(value, buffer.length)
-      buffer = newBuffer
+      if (buffer.length === 0) {
+        buffer = value
+      } else {
+        const size = buffer.length + value.length
+        if (scratch.length < size) scratch = new Uint8Array(Math.max(size, scratch.length * 2))
+        scratch.set(buffer)
+        scratch.set(value, buffer.length)
+        buffer = scratch.subarray(0, size)
+      }
 
       // 尝试解析消息
       while (buffer.length >= 16) {
@@ -1658,26 +1643,28 @@ async function parseEventStream(
 
         const totalLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(0, false)
         
+        if (totalLength < 16) throw new Error('Invalid event stream frame length')
         if (buffer.length < totalLength) {
           break // 等待更多数据
         }
 
         const headersLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(4, false)
         
+        if (headersLength > totalLength - 16) throw new Error('Invalid event stream headers length')
         // 从 headers 中提取 event type
         const headersStart = 12
         const headersEnd = 12 + headersLength
-        const eventType = extractEventType(buffer.slice(headersStart, headersEnd))
+        const eventType = extractEventType(buffer.subarray(headersStart, headersEnd))
         
         // 提取 payload
         const payloadStart = 12 + headersLength
         const payloadEnd = totalLength - 4 // 减去 message CRC
         
         if (payloadStart < payloadEnd) {
-          const payloadBytes = buffer.slice(payloadStart, payloadEnd)
+          const payloadBytes = buffer.subarray(payloadStart, payloadEnd)
           
           try {
-            const payloadText = new TextDecoder().decode(payloadBytes)
+            const payloadText = eventDecoder.decode(payloadBytes)
             const event = JSON.parse(payloadText)
             
             // 根据 event type 处理不同类型的事件
@@ -2080,7 +2067,7 @@ async function parseEventStream(
         }
         
         // 移动到下一条消息
-        buffer = buffer.slice(totalLength)
+        buffer = buffer.subarray(totalLength)
       }
     }
 
@@ -2131,6 +2118,10 @@ async function parseEventStream(
       }
     }
 
+    if (usage.inputTokens === 0) {
+      usage.inputTokens = payloadStr ? countTokens(payloadStr) : inputChars > 0 ? Math.max(1, Math.round(inputChars * 0.42)) : 0
+    }
+
     // 如果 API 没有返回 token 信息，优先用 tiktoken 精确计算，兜底字符系数
     if (usage.outputTokens === 0 && totalOutputChars > 0) {
       if (collectedOutputText) {
@@ -2152,11 +2143,10 @@ async function parseEventStream(
     
     throwIfAborted(signal)
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
-    onComplete(usage)
-  } catch (error) {
-    onError(signal?.aborted ? getAbortError(signal) : error as Error)
+    await onComplete(usage)
   } finally {
     signal?.removeEventListener('abort', abort)
+    if (!reachedEnd) await reader.cancel().catch(() => undefined)
     reader.releaseLock()
   }
 }
@@ -2165,7 +2155,8 @@ async function parseEventStream(
 export async function callKiroApi(
   account: ProxyAccount,
   payload: KiroPayload,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
 ): Promise<{
   content: string
   toolUses: KiroToolUse[]
@@ -2208,7 +2199,8 @@ export async function callKiroApi(
         resolve({ content, toolUses, usage })
       },
       reject,
-      signal
+      signal,
+      preferredEndpoint
     ).catch(reject)
   })
 }
@@ -2253,7 +2245,7 @@ function getCodeWhispererEndpoint(region?: string): string {
  * 官方 IDE 在认证后通过此 API 获取可用 profiles，用户选择后存储 ARN。
  * 反代自动取第一个 profile。
  */
-export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
+export async function fetchEnterpriseProfileArn(account: ProxyAccount, signal?: AbortSignal): Promise<string | undefined> {
   const baseUrl = getCodeWhispererEndpoint(account.region)
   const url = `${baseUrl}/ListAvailableProfiles`
   const machineId = getAccountMachineId(account.id, account.machineId)
@@ -2274,7 +2266,8 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
     const response = await fetchWithProxy(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify({})
+      body: JSON.stringify({}),
+      signal
     }, account)
 
     if (!response.ok) {
@@ -2326,7 +2319,7 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
   // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底）
   const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
   if (!account.profileArn && isEnterprise) {
-    const fetchedArn = await fetchEnterpriseProfileArn(account)
+    const fetchedArn = await fetchEnterpriseProfileArn(account, signal)
     if (fetchedArn) {
       account.profileArn = fetchedArn
       if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
@@ -2404,7 +2397,7 @@ function getSubscriptionAmzUserAgent(machineId?: string): string {
 }
 
 // 获取可用订阅列表
-export async function fetchAvailableSubscriptions(account: ProxyAccount): Promise<SubscriptionListResponse> {
+export async function fetchAvailableSubscriptions(account: ProxyAccount, signal?: AbortSignal): Promise<SubscriptionListResponse> {
   const baseUrl = getQServiceEndpoint(account.region)
   const url = `${baseUrl}/listAvailableSubscriptions`
   const machineId = getAccountMachineId(account.id, account.machineId)
@@ -2427,16 +2420,14 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   })
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body }, account)
-    const responseText = await response.text()
-    console.log(`[KiroAPI] ListAvailableSubscriptions → ${response.status}`, JSON.parse(responseText))
-    
-    if (!response.ok) {
-      return {}
-    }
-
-    return JSON.parse(responseText)
+    return await withDeadline(async signal => {
+      const response = await fetchWithProxy(url, { method: 'POST', headers, body, signal }, account)
+      const text = await response.text()
+      if (!response.ok) return {}
+      return JSON.parse(text) as SubscriptionListResponse
+    }, 30000, signal, '订阅计划请求超时')
   } catch (error) {
+    if (signal?.aborted) throw error
     console.error('[KiroAPI] ListAvailableSubscriptions error:', error)
     return {}
   }
@@ -2453,7 +2444,8 @@ export interface SubscriptionTokenResponse {
 // 获取订阅管理/支付链接
 export async function fetchSubscriptionToken(
   account: ProxyAccount,
-  subscriptionType?: string
+  subscriptionType?: string,
+  signal?: AbortSignal
 ): Promise<SubscriptionTokenResponse> {
   const baseUrl = getQServiceEndpoint(account.region)
   const url = `${baseUrl}/CreateSubscriptionToken`
@@ -2483,18 +2475,18 @@ export async function fetchSubscriptionToken(
   }
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body: JSON.stringify(payload) }, account)
-    
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      console.error('[KiroAPI] CreateSubscriptionToken failed:', response.status, errorData)
-      return { message: errorData.message || `Request failed with status ${response.status}` }
-    }
-
-    const data = await response.json()
-    return data
+    return await withDeadline(async signal => {
+      const response = await fetchWithProxy(url, { method: 'POST', headers, body: JSON.stringify(payload), signal }, account)
+      const text = await response.text()
+      if (!response.ok) {
+        let message = `Request failed with status ${response.status}`
+        try { message = JSON.parse(text).message || message } catch { /* use the HTTP status */ }
+        return { message }
+      }
+      return JSON.parse(text) as SubscriptionTokenResponse
+    }, 30000, signal, '订阅链接请求超时')
   } catch (error) {
-    console.error('[KiroAPI] CreateSubscriptionToken error:', error)
+    if (signal?.aborted) throw error
     return { message: error instanceof Error ? error.message : 'Unknown error' }
   }
 }
@@ -2502,7 +2494,8 @@ export async function fetchSubscriptionToken(
 // 设置用户偏好（超额开启/关闭）
 export async function setUserPreference(
   account: ProxyAccount,
-  overageStatus: 'ENABLED' | 'DISABLED'
+  overageStatus: 'ENABLED' | 'DISABLED',
+  signal?: AbortSignal
 ): Promise<{ success: boolean; error?: string }> {
   const baseUrl = getQServiceEndpoint(account.region)
   const url = `${baseUrl}/setUserPreference`
@@ -2527,13 +2520,13 @@ export async function setUserPreference(
   const body = JSON.stringify(bodyPayload)
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body }, account)
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      return { success: false, error: `HTTP ${response.status}: ${errorText.substring(0, 200)}` }
-    }
-    return { success: true }
+    return await withDeadline(async signal => {
+      const response = await fetchWithProxy(url, { method: 'POST', headers, body, signal }, account)
+      const text = await response.text()
+      return response.ok ? { success: true } : { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}` }
+    }, 30000, signal, '超额设置请求超时')
   } catch (error) {
+    if (signal?.aborted) throw error
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 }

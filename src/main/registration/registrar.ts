@@ -1,6 +1,13 @@
+import os from 'node:os'
+import path from 'node:path'
+import fs from 'node:fs'
+import { app } from 'electron'
+import type { FingerprintSnapshot, RegistrationResult, RegStepName, RegStepEvent } from '../../shared/registration'
+export type { FingerprintSnapshot, RegistrationResult, RegStepName, RegStepEvent } from '../../shared/registration'
 import { SessionClient, type ModuleClient } from 'tlsclientwrapper'
 import { acquireModuleClient } from './tlsClientPool'
-import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
+import { checkAborted, sleep, waitFor, withDeadline } from './async'
+import { RegistrationHttpClient } from './http'
 import { RegistrationConfig } from './config'
 import { BrowserIdentity, randomIdentity } from './browser-identity'
 import { ChainProxyRelay } from './chainProxy'
@@ -13,63 +20,24 @@ import {
   getNestedMap, getNestedStringMap
 } from './http-utils'
 import {
-  TempEmailService, MoEmailService, TempMailPlusService, ProtonWebviewService, GptMailService,
-  parseOutlookLines, getInboxCount, waitForOTP
+  TempEmailService,
+  MoEmailService,
+  TempMailPlusService,
+  ProtonWebviewService,
+  GptMailService,
+  type OutlookAccount,
+  parseOutlookLines,
+  getInboxCheckpoint,
+  waitForOTP
 } from './email-service'
-import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
+import { getSystemProxy } from '../proxy/systemProxy'
 import { redactString } from '../utils/redact'
 
-export type LogFn = (message: string) => void
-
-export interface FingerprintSnapshot {
-  chromeVer: string
-  ua: string
-  gpuVendor: string
-  gpuModel: string
-  canvasHash: number
-  screen: { width: number; height: number }
-  /** 注册时使用的出口代理 URL（脱敏前缀） */
-  proxyUrl?: string
-  /** 探测到的出口 IP（注册时实际用的公网 IP） */
-  exitIP?: string
-}
-
-export interface RegistrationResult {
-  status: 'success' | 'failed'
-  email: string
-  password?: string
-  error?: string
-  clientId?: string
-  clientSecret?: string
-  refreshToken?: string
-  accessToken?: string
-  region?: string
-  provider?: string
-  verify?: Record<string, unknown>
-  /** 本次注册使用的指纹摘要（用于审计与后续复用） */
-  fingerprint?: FingerprintSnapshot
-}
+const TRANSIENT_STATUSES = new Set([0, 408, 429, 500, 502, 503, 504, 521, 522, 523, 524])
 
 type StepFn = () => Promise<void>
-
-/** 注册流程的可观察「阶段」标识，供前端按 taskId 实时显示进度 */
-export type RegStepName =
-  | 'init' | 'proxy-chain-ready' | 'tls-ready' | 'exit-ip'
-  | 'oidc' | 'device' | 'email-created'
-  | 'portal' | 'workflow-init' | 'submit-email'
-  | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
-  | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
-  | 'verify-alive' | 'done'
-
-export interface RegStepEvent {
-  name: RegStepName
-  ts: number
-  email?: string
-  exitIp?: string
-  extra?: Record<string, unknown>
-}
-
 export type StepFn2 = (event: RegStepEvent) => void
+export type LogFn = (message: string) => void
 
 export class Registrar {
   private cfg: RegistrationConfig
@@ -97,7 +65,8 @@ export class Registrar {
   private ssoState = ''
   private wdcCSRFToken = ''
   private ssoToken = ''
-  private outlookMailCount = 0
+  private outlookAccount?: OutlookAccount
+  private outlookCheckpoint = { uidNext: 0, since: 0 }
 
   private log: LogFn
   private onStep: StepFn2
@@ -105,7 +74,10 @@ export class Registrar {
   private chainRelay: ChainProxyRelay | null = null
   private chainTargetProxy = ''
   private exitIP = ''
-  private readonly tlsSessionId = newUUID() // 固定：整个 Registrar 生命周期内 DLL 中只注册一个 session
+  private readonly http = new RegistrationHttpClient()
+  private readonly sessions = new Set<SessionClient>()
+  private readonly sessionReleases = new WeakMap<SessionClient, Promise<void>>()
+  private requestAttempts = 3
 
   constructor(cfg: RegistrationConfig, log?: LogFn, onStep?: StepFn2) {
     this.cfg = cfg
@@ -142,16 +114,23 @@ export class Registrar {
    * 并把 cfg.proxy 指向本地中继，使后续所有请求自动走链路。
    */
   private async setupProxyChain(): Promise<void> {
+    this.checkAborted()
     const target = (this.cfg.proxy || '').trim()
     const upstream = (this.cfg.upstreamProxy || '').trim()
     if (!target || !upstream) return
     try {
       this.chainRelay = new ChainProxyRelay(upstream, target, (m) => this.log(m))
-      const relayUrl = await this.chainRelay.start()
+      const relay = this.chainRelay
+      const relayUrl = await relay.start()
+      if (this.abortController.signal.aborted) {
+        await relay.stop()
+        this.checkAborted()
+      }
       this.chainTargetProxy = target
       this.cfg.proxy = relayUrl
       this.log('[ProxyChain] 已启用代理链：本机 → 上游中转 → 目标代理 → 目标站点')
     } catch (err) {
+      this.checkAborted()
       const msg = err instanceof Error ? err.message : String(err)
       this.chainRelay = null
       // 严格代理模式下，链路失败必须立刻中止，防止"回退仅用目标代理"时大陆 IP 被目标拒绝
@@ -163,7 +142,7 @@ export class Registrar {
   }
 
   private checkAborted(): void {
-    if (this.abortController.signal.aborted) throw new Error('注册已取消')
+    checkAborted(this.abortController.signal)
   }
 
   /**
@@ -173,17 +152,28 @@ export class Registrar {
    */
   private async detectExitIP(maxRetries = 2): Promise<void> {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      this.checkAborted()
       const proxyUrl = this.sessionOpts.proxyUrl
       try {
-        const agent = safeCreateProxyAgent(proxyUrl)
-        const resp = await undiciFetch('https://api.ipify.org?format=json', {
-          method: 'GET',
-          dispatcher: agent || undefined,
-          signal: AbortSignal.timeout(10000),
-          headers: { 'User-Agent': this.identity.ua }
-        } as UndiciRequestInit)
-        if (resp.ok) {
-          const body = await resp.json() as Record<string, unknown>
+        const body = await this.http.read(
+          'https://api.ipify.org?format=json',
+          proxyUrl,
+          {
+            method: 'GET',
+            signal: this.abortController.signal,
+            headers: { 'User-Agent': this.identity.ua }
+          },
+          async (response) => {
+            if (!response.ok) {
+              await response.arrayBuffer()
+              throw new Error(`HTTP ${response.status}`)
+            }
+            return (await response.json()) as Record<string, unknown>
+          },
+          10000
+        )
+        this.checkAborted()
+        {
           const ip = String(body.ip || body.query || body.origin || '').trim()
           if (ip) {
             this.exitIP = ip
@@ -193,8 +183,8 @@ export class Registrar {
           this.log(`[✓ IP] 出口 IP: ${ip || '未知'}${via ? ` (via ${via})` : ' (直连)'}`)
           return // 成功，退出
         }
-        this.log(`[IP] 出口 IP 检测失败: HTTP ${resp.status}`)
       } catch (err) {
+        this.checkAborted()
         this.log(`[IP] 出口 IP 检测失败: ${err instanceof Error ? err.message : String(err)}`)
       }
 
@@ -216,6 +206,7 @@ export class Registrar {
 
   /** 重新随机 session 并重建代理链 */
   private async refreshProxySession(): Promise<void> {
+    this.checkAborted()
     // 还原到原始目标代理 URL（代理链会把 cfg.proxy 替换为本地中继地址）
     const original = this.chainTargetProxy || this.cfg.proxy || ''
     if (!original) return
@@ -245,6 +236,7 @@ export class Registrar {
       this.chainRelay = null
     }
 
+    this.checkAborted()
     // 重建
     this.cfg.proxy = newTarget
     this.chainTargetProxy = ''
@@ -252,7 +244,7 @@ export class Registrar {
   }
 
   /** TLS SessionClient 选项 */
-  private get sessionOpts() {
+  private get sessionOpts(): SessionClient['defaultOptions'] & { proxyUrl?: string } {
     const explicit = (this.cfg.proxy && this.cfg.proxy.trim()) || undefined
     // 严格模式：必须有显式代理，禁止回退到环境变量/系统代理，防止裸奔真实 IP
     if (this.cfg.strictProxy) {
@@ -262,20 +254,22 @@ export class Registrar {
     }
     const proxyUrl = this.cfg.strictProxy
       ? explicit
-      : (explicit
-        || process.env.HTTPS_PROXY || process.env.https_proxy
-        || process.env.HTTP_PROXY || process.env.http_proxy
-        || getSystemProxy() || undefined)
+      : explicit ||
+        process.env.HTTPS_PROXY ||
+        process.env.https_proxy ||
+        process.env.HTTP_PROXY ||
+        process.env.http_proxy ||
+        getSystemProxy() ||
+        undefined
     return {
-      tlsClientIdentifier: 'chrome_146' as const,
+      tlsClientIdentifier: 'chrome_146',
       // 25s：AWS 注册 API 正常响应 1-5s，慢住宅代理 10-15s；超过基本是挂起。
       // 配合 sendRequest 的 3 次重试，单步最坏 ~75s（旧值 60s 会到 ~180s，是批量卡 1-5 分钟主因）
       timeoutSeconds: 25,
       followRedirects: true,
       insecureSkipVerify: true,
-      // 多线程隔离：固定 sessionId 隔离 DLL 层面共享的 TLS session cache
-      // 整个 Registrar 生命周期内用同一个 ID，避免 rebuildTlsClient 产生僵尸 session
-      sessionId: this.tlsSessionId,
+      // The wrapper generates its own session ID; application retries are managed in sendRequest.
+      retryIsEnabled: false,
       proxyUrl
     }
   }
@@ -290,14 +284,20 @@ export class Registrar {
    *   4. GitHub 下载到 userData（最后兜底，仅首次）
    */
   private async initTlsClient(): Promise<void> {
+    this.checkAborted()
     const { existingPath, downloadDir } = this.ensureTlsLib()
     const opts = existingPath
       ? { customLibraryPath: existingPath }
       : { customLibraryDownloadPath: downloadDir }
     // 共享池：首次注册才真正 open(DLL+worker pool)，之后所有注册秒级复用
-    this.moduleClient = await acquireModuleClient(opts)
-    this.log('[TLS] using shared ModuleClient, pool stats: ' + JSON.stringify(this.moduleClient.getPoolStats()))
-    this.session = new SessionClient(this.moduleClient, this.sessionOpts)
+    const moduleClient = await waitFor(acquireModuleClient(opts), this.abortController.signal)
+    this.checkAborted()
+    this.moduleClient = moduleClient
+    this.log(
+      '[TLS] using shared ModuleClient, pool stats: ' +
+        JSON.stringify(this.moduleClient.getPoolStats())
+    )
+    this.session = this.createSession()
   }
 
   /**
@@ -308,11 +308,6 @@ export class Registrar {
    * 优先放到 userData，避免被系统临时目录清理工具误删（之前用 tmpdir 会被清理）
    */
   private ensureTlsLib(): { existingPath?: string; downloadDir: string } {
-    const os = require('os')
-    const path = require('path')
-    const fs = require('fs')
-    const { app } = require('electron')
-
     const platform = os.platform()
     const arch = os.arch()
     let filename = 'tls-client-xgo-1.14.0-'
@@ -330,7 +325,11 @@ export class Registrar {
     const finalPath = path.join(tlsClientDir, filename)
 
     // 确保目录存在
-    try { fs.mkdirSync(tlsClientDir, { recursive: true }) } catch { /* ignore */ }
+    try {
+      fs.mkdirSync(tlsClientDir, { recursive: true })
+    } catch {
+      /* ignore */
+    }
 
     // 已存在 → 直接复用
     if (fs.existsSync(finalPath)) {
@@ -341,7 +340,12 @@ export class Registrar {
     // 2. 从打包资源复制（安装包自带）
     const resourcePath = path.join(process.resourcesPath || '', filename)
     if (fs.existsSync(resourcePath)) {
-      this.log('[TLS] Copying library from resources to userData (one-time): ' + resourcePath + ' -> ' + finalPath)
+      this.log(
+        '[TLS] Copying library from resources to userData (one-time): ' +
+          resourcePath +
+          ' -> ' +
+          finalPath
+      )
       try {
         fs.copyFileSync(resourcePath, finalPath)
         return { existingPath: finalPath, downloadDir: tlsClientDir }
@@ -364,66 +368,94 @@ export class Registrar {
     }
 
     // 4. 都没有 → 返回 downloadDir，让 tlsclientwrapper open() 自动下载到此目录（永久保存）
-    this.log('[TLS] Library not found, will download from GitHub to userData (one-time): ' + tlsClientDir)
+    this.log(
+      '[TLS] Library not found, will download from GitHub to userData (one-time): ' + tlsClientDir
+    )
     return { downloadDir: tlsClientDir }
   }
 
-  private async rebuildTlsClient(): Promise<void> {
-    // 只重建轻量级的 SessionClient（新 TLS 连接），复用重量级的 ModuleClient（worker pool + DLL）
-    // 之前的实现会 terminate + 重新 open ModuleClient，导致每次注册创建 2 个 worker pool
-    try { await this.session?.destroySession() } catch { /* ignore */ }
-    if (!this.moduleClient) {
-      await this.initTlsClient()
-      return
-    }
-    this.session = new SessionClient(this.moduleClient, this.sessionOpts)
+  private createSession(): SessionClient {
+    this.checkAborted()
+    if (!this.moduleClient) throw new Error('TLS 客户端未初始化')
+    const session = new SessionClient(this.moduleClient, this.sessionOpts)
+    this.sessions.add(session)
+    return session
   }
 
-  /**
-   * 用 undici 直接 fetch 静态资源（如 AWS signin app.js），绕过 tls-client。
-   * 原因：tls-client 的 dll 是进程级单例，失败请求会污染其全局状态，
-   * 导致后续重建 SessionClient 后仍报 "no tls client for modification check"。
-   * 静态资源不需要 TLS 指纹伪装，直接用 Node/undici fetch 即可。
-   */
-  private async fetchAppJS(url: string, init?: RequestInit): Promise<Response> {
-    const proxyUrl = (this.cfg.proxy && this.cfg.proxy.trim())
-      || process.env.HTTPS_PROXY || process.env.https_proxy
-      || process.env.HTTP_PROXY || process.env.http_proxy
-      || getSystemProxy() || undefined
-    const agent = safeCreateProxyAgent(proxyUrl)
-    if (agent) {
-      const resp = await undiciFetch(url, { ...(init as UndiciRequestInit), dispatcher: agent })
-      return resp as unknown as Response
+  private releaseSession(session: SessionClient): Promise<void> {
+    let release = this.sessionReleases.get(session)
+    if (!release) {
+      release = withDeadline(() => session.destroySession(), 3000)
+        .then(
+          () => {},
+          () => {}
+        )
+        .finally(() => {
+          this.sessions.delete(session)
+        })
+      this.sessionReleases.set(session, release)
     }
-    return await fetch(url, init)
+    return release
+  }
+
+  private async rebuildTlsClient(): Promise<void> {
+    this.checkAborted()
+    const previous = this.session
+    this.session = null
+    if (previous) await this.releaseSession(previous)
+    this.checkAborted()
+    if (!this.moduleClient) await this.initTlsClient()
+    else this.session = this.createSession()
+  }
+
+  /** The shared config download owns its transport until the response body has been consumed. */
+  private async fetchAppJS(url: string, init: RequestInit = {}): Promise<Response> {
+    const http = new RegistrationHttpClient()
+    const proxy = this.sessionOpts.proxyUrl
+    try {
+      return await http.read(
+        url,
+        proxy,
+        init,
+        async (response) => {
+          const body = await response.text()
+          if (!response.ok) throw new Error(`app.js HTTP ${response.status}`)
+          return new Response(body, { status: response.status })
+        },
+        20000
+      )
+    } finally {
+      http.close()
+    }
   }
 
   private isRecoverableTlsClientError(err: unknown): boolean {
     if (!(err instanceof Error)) return false
-    return err.message.includes('EOF')
-      || err.message.includes('no tls client for modification check')
-      || err.message.includes('failed to modify existing client')
+    return (
+      err.message.includes('EOF') ||
+      err.message.includes('no tls client for modification check') ||
+      err.message.includes('failed to modify existing client')
+    )
   }
 
   /** 清理 TLS 客户端资源：仅销毁 SessionClient；ModuleClient 是进程级共享池，不再每次 terminate */
-  private async cleanup(): Promise<void> {
-    if (this.chainRelay) {
-      try { await this.chainRelay.stop() } catch { /* ignore */ }
-      this.chainRelay = null
-    }
-    if (this.session) {
-      // destroySession 带 3 秒超时：Go runtime 的 idle connections 可能要等 60 秒才关闭
-      const s = this.session
-      this.session = null
-      try {
-        await Promise.race([
-          s.destroySession(),
-          new Promise(resolve => setTimeout(resolve, 3000))
-        ])
-      } catch { /* ignore */ }
-    }
-    // moduleClient 是共享引用，不能 terminate（会影响其它正在跑的注册）
+  private cleanupTask: Promise<void> | undefined
+  private cleanup(): Promise<void> {
+    if (!this.cleanupTask) this.cleanupTask = this.cleanupResources().finally(() => { this.cleanupTask = undefined })
+    return this.cleanupTask
+  }
+
+  private async cleanupResources(): Promise<void> {
+    this.abortController.abort()
+    this.http.close()
+    const relay = this.chainRelay
+    this.chainRelay = null
+    this.session = null
     this.moduleClient = null
+    await Promise.all([
+      relay?.stop().catch(() => {}),
+      ...Array.from(this.sessions, (session) => this.releaseSession(session))
+    ])
   }
 
   /** 公共销毁方法，供外部调用释放资源。同时 abort 所有进行中的异步操作。 */
@@ -435,12 +467,14 @@ export class Registrar {
   // ============ HTTP 工具方法 ============
 
   private cookieString(): string {
-    return Array.from(this.cookies.entries()).map(([k, v]) => `${k}=${v}`).join('; ')
+    return Array.from(this.cookies.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ')
   }
 
   private buildHeaders(referer: string, origin: string): Record<string, string> {
     const h: Record<string, string> = {
-      'Accept': 'application/json, text/plain, */*',
+      Accept: 'application/json, text/plain, */*',
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       'Accept-Encoding': 'gzip, deflate, br',
       'Content-Type': 'application/json',
@@ -460,19 +494,19 @@ export class Registrar {
 
   private buildProfileHeaders(referer: string): Record<string, string> {
     const h: Record<string, string> = {
-      'Accept': '*/*',
+      Accept: '*/*',
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       'Content-Type': 'application/json;charset=UTF-8',
       'User-Agent': this.identity.ua,
-      'Origin': this.cfg.profileBase,
-      'Referer': referer,
+      Origin: this.cfg.profileBase,
+      Referer: referer,
       'sec-ch-ua': this.secUA,
       'sec-ch-ua-mobile': '?0',
       'sec-ch-ua-platform': '"Windows"',
       'sec-fetch-dest': 'empty',
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
-      'priority': 'u=1, i'
+      priority: 'u=1, i'
     }
     const keys = ['awsccc', 'aws-user-profile-ubid', 'i18next']
     if (this.cookies.has('awsd2c-token')) keys.push('awsd2c-token', 'awsd2c-token-c')
@@ -501,10 +535,15 @@ export class Registrar {
    * 并不抛异常；若不在响应层识别，会被上层当成业务失败直接判死号（如 #9 的「未获取到加密公钥」）。
    */
   private isTransientResponse(status: number, body: string): boolean {
-    if (status === 0 || status === 429 || status === 502 || status === 503 || status === 504) return true
+    if (status >= 200 && status < 400) return false
+    if (TRANSIENT_STATUSES.has(status)) return true
     const lower = body.toLowerCase()
-    return lower.includes('failed to do request') || lower.includes('eof')
-      || lower.includes('connection reset') || lower.includes('timeout')
+    return (
+      lower.includes('failed to do request') ||
+      lower.includes('eof') ||
+      lower.includes('connection reset') ||
+      lower.includes('timeout')
+    )
   }
 
   /**
@@ -515,8 +554,12 @@ export class Registrar {
     if (status === 504) return true
     if (status !== 0) return false
     const lower = body.toLowerCase()
-    return lower.includes('timeout') || lower.includes('deadline')
-      || lower.includes('client.timeout') || lower.includes('failed to do request')
+    return (
+      lower.includes('timeout') ||
+      lower.includes('deadline') ||
+      lower.includes('client.timeout') ||
+      lower.includes('failed to do request')
+    )
   }
 
   /**
@@ -530,41 +573,68 @@ export class Registrar {
     body?: string
   ): Promise<{ body: string; status: number; headers: Record<string, string | string[]> }> {
     if (!this.session) throw new Error('TLS 客户端未初始化')
-    const maxAttempts = 3
+    const maxAttempts = this.requestAttempts
     let lastErr: unknown = null
     let sessionRefreshed = false // 整个请求最多换 1 次 proxy session，避免频繁停建代理链
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      this.checkAborted()
       try {
-        const resp = method === 'GET'
-          ? await this.session!.get(url, { headers })
-          : await this.session!.post(url, body ?? '', { headers })
+        const resp = await waitFor(
+          method === 'GET'
+            ? this.session!.get(url, { headers, retryIsEnabled: false })
+            : this.session!.post(url, body ?? '', { headers, retryIsEnabled: false }),
+          this.abortController.signal
+        )
+        this.checkAborted()
         const decoded = this.decodeBody(resp.body)
         const status = resp.status
+        if (maxAttempts === 1 && this.isTransientResponse(status, decoded)) {
+          if (status === 0 || /eof|reset|failed to do request/i.test(decoded))
+            await this.rebuildTlsClient()
+          throw new Error(`HTTP ${status}: ${decoded.slice(0, 200)}`)
+        }
         if (attempt < maxAttempts && this.isTransientResponse(status, decoded)) {
           const broken = status === 0 || /eof|reset|failed to do request/i.test(decoded)
           // 超时类（出口 IP 慢/被限/隧道挂起）：重建 TLS 同 IP 无用，换 proxy session 切换出口 IP
-          if (this.isTimeoutResponse(status, decoded) && !sessionRefreshed && this.canRefreshProxySession()) {
-            this.log(`[Net] ${method} 超时(status=${status})，换 proxy session 切换出口 IP 重试 ${attempt}/${maxAttempts - 1}`)
+          if (
+            this.isTimeoutResponse(status, decoded) &&
+            !sessionRefreshed &&
+            this.canRefreshProxySession()
+          ) {
+            this.log(
+              `[Net] ${method} 超时(status=${status})，换 proxy session 切换出口 IP 重试 ${attempt}/${maxAttempts - 1}`
+            )
             try {
               await this.refreshProxySession()
               await this.rebuildTlsClient()
               sessionRefreshed = true
             } catch (e) {
-              this.log(`[Net] 换 session 失败，回退普通重建: ${e instanceof Error ? e.message : String(e)}`)
+              this.log(
+                `[Net] 换 session 失败，回退普通重建: ${e instanceof Error ? e.message : String(e)}`
+              )
               await this.rebuildTlsClient()
             }
           } else {
-            this.log(`[Net] ${method} 瞬时失败 status=${status}，${broken ? '重建 TLS + ' : ''}退避重试 ${attempt}/${maxAttempts - 1}`)
+            this.log(
+              `[Net] ${method} 瞬时失败 status=${status}，${broken ? '重建 TLS + ' : ''}退避重试 ${attempt}/${maxAttempts - 1}`
+            )
             if (broken) await this.rebuildTlsClient()
           }
           await this.abortableSleep(this.netBackoffMs(attempt))
           continue
         }
-        return { body: decoded, status, headers: (resp.headers || {}) as Record<string, string | string[]> }
+        return {
+          body: decoded,
+          status,
+          headers: (resp.headers || {}) as Record<string, string | string[]>
+        }
       } catch (err: unknown) {
+        this.checkAborted()
         lastErr = err
         if (attempt < maxAttempts && this.isRecoverableTlsClientError(err)) {
-          this.log(`[TLS] ${method} 可恢复错误：${err instanceof Error ? err.message : String(err)}，重建 TLS 退避重试 ${attempt}/${maxAttempts - 1}`)
+          this.log(
+            `[TLS] ${method} 可恢复错误：${err instanceof Error ? err.message : String(err)}，重建 TLS 退避重试 ${attempt}/${maxAttempts - 1}`
+          )
           await this.rebuildTlsClient()
           await this.abortableSleep(this.netBackoffMs(attempt))
           continue
@@ -576,16 +646,8 @@ export class Registrar {
     throw new Error(`${method} ${url} 重试 ${maxAttempts} 次仍失败`)
   }
 
-  /** 可被中止打断的 sleep：停止注册时立即结束等待，让 abort 即时生效 */
   private abortableSleep(ms: number): Promise<void> {
-    const signal = this.abortController.signal
-    return new Promise((resolve, reject) => {
-      if (signal.aborted) { reject(new Error('注册已取消')); return }
-      let timer: ReturnType<typeof setTimeout>
-      const onAbort = (): void => { clearTimeout(timer); reject(new Error('注册已取消')) }
-      timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve() }, ms)
-      signal.addEventListener('abort', onAbort, { once: true })
-    })
+    return sleep(ms, this.abortController.signal)
   }
 
   /** 拟人随机延迟：步骤之间停顿，降低机械化节奏特征 */
@@ -593,35 +655,27 @@ export class Registrar {
     await this.abortableSleep(min + Math.floor(Math.random() * Math.max(1, max - min)))
   }
 
-  /**
-   * 整体超时看门狗：给任意步骤 Promise 加上限，超时后 reject（原 Promise 在后台自生自灭）。
-   * 用于批量场景快速释放卡住的线程，避免单个账号占用并发槽 1-5 分钟。支持 abort 即时中断。
-   */
-  private withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-    const signal = this.abortController.signal
-    return new Promise<T>((resolve, reject) => {
-      if (signal.aborted) { reject(new Error('注册已取消')); return }
-      let done = false
-      const settle = (fn: () => void): void => {
-        if (done) return
-        done = true
-        clearTimeout(timer)
-        signal.removeEventListener('abort', onAbort)
-        fn()
-      }
-      const timer = setTimeout(() => settle(() => reject(new Error(`${label} 整体超时 ${Math.round(ms / 1000)}s`))), ms)
-      const onAbort = (): void => settle(() => reject(new Error('注册已取消')))
-      signal.addEventListener('abort', onAbort, { once: true })
-      p.then(
-        (v) => settle(() => resolve(v)),
-        (e) => settle(() => reject(e))
-      )
-    })
+  /** A timed-out workflow is terminal: late native responses must never advance registration. */
+  private withTimeout<T>(work: () => Promise<T>, ms: number, label: string): Promise<T> {
+    return withDeadline(
+      async (signal) => {
+        const abort = (): void => this.abortController.abort(signal.reason)
+        signal.addEventListener('abort', abort, { once: true })
+        try {
+          return await waitFor(work(), signal)
+        } finally {
+          signal.removeEventListener('abort', abort)
+        }
+      },
+      ms,
+      this.abortController.signal,
+      `${label} 整体超时 ${Math.round(ms / 1000)}s`
+    )
   }
 
   /**
    * 幂等步骤重试：失败后退避重试（仅用于无副作用的前置步骤，如 OIDC / Device / Portal / WorkflowInit）。
-   * - timeoutMs：每次尝试加整体超时看门狗，超时即判失败进入下一次（防止单次卡满 3×25s）
+   * - timeoutMs：每次尝试加整体超时看门狗；超时终止工作流，防止旧请求与后续尝试交叉
    * - refreshSession：失败后若代理支持，换 proxy session 切换出口 IP 再退避（避开慢/被限的 IP）
    */
   private async retryStep(
@@ -630,30 +684,42 @@ export class Registrar {
     attempts: number,
     opts?: { timeoutMs?: number; refreshSession?: boolean }
   ): Promise<void> {
-    let lastErr: unknown = null
-    for (let i = 1; i <= attempts; i++) {
-      try {
-        if (opts?.timeoutMs) await this.withTimeout(fn(), opts.timeoutMs, name)
-        else await fn()
-        return
-      } catch (err) {
-        lastErr = err
-        if (i < attempts) {
-          // 幂等步骤失败：若支持换 session，先切换出口 IP 再退避（针对慢/被限的住宅 IP）
-          if (opts?.refreshSession && this.canRefreshProxySession()) {
-            try {
-              await this.refreshProxySession()
-              await this.rebuildTlsClient()
-              this.log(`[${name}] 已换 proxy session 切换出口 IP`)
-            } catch { /* 换 session 失败则继续普通重试 */ }
+    const previousAttempts = this.requestAttempts
+    this.requestAttempts = 1
+    try {
+      let lastErr: unknown = null
+      for (let i = 1; i <= attempts; i++) {
+        this.checkAborted()
+        try {
+          if (opts?.timeoutMs) await this.withTimeout(fn, opts.timeoutMs, name)
+          else await fn()
+          return
+        } catch (err) {
+          this.checkAborted()
+          lastErr = err
+          if (i < attempts) {
+            // 幂等步骤失败：若支持换 session，先切换出口 IP 再退避（针对慢/被限的住宅 IP）
+            if (opts?.refreshSession && this.canRefreshProxySession()) {
+              try {
+                await this.refreshProxySession()
+                await this.rebuildTlsClient()
+                this.log(`[${name}] 已换 proxy session 切换出口 IP`)
+              } catch {
+                /* 换 session 失败则继续普通重试 */
+              }
+            }
+            const wait = 1500 * i + Math.floor(Math.random() * 800)
+            this.log(
+              `[${name}] 第 ${i}/${attempts} 次失败：${(err as Error).message}，${wait}ms 后重试`
+            )
+            await this.abortableSleep(wait)
           }
-          const wait = 1500 * i + Math.floor(Math.random() * 800)
-          this.log(`[${name}] 第 ${i}/${attempts} 次失败：${(err as Error).message}，${wait}ms 后重试`)
-          await this.abortableSleep(wait)
         }
       }
+      throw lastErr
+    } finally {
+      this.requestAttempts = previousAttempts
     }
-    throw lastErr
   }
 
   /**
@@ -712,11 +778,18 @@ export class Registrar {
 
   private async fetchD2CToken(origin: string, referer: string): Promise<void> {
     const headers: Record<string, string> = {
-      'Accept': '*/*', 'Content-Type': 'application/json',
-      'User-Agent': this.identity.ua, 'Origin': origin, 'Referer': referer,
-      'sec-ch-ua': this.secUA, 'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"', 'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors', 'sec-fetch-site': 'cross-site', 'priority': 'u=1, i'
+      Accept: '*/*',
+      'Content-Type': 'application/json',
+      'User-Agent': this.identity.ua,
+      Origin: origin,
+      Referer: referer,
+      'sec-ch-ua': this.secUA,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'cross-site',
+      priority: 'u=1, i'
     }
     const parts: string[] = []
     if (this.cookies.has('awsccc')) parts.push('awsccc=' + this.cookies.get('awsccc'))
@@ -742,7 +815,9 @@ export class Registrar {
         try {
           const decoded = JSON.parse(Buffer.from(jwtParts[1], 'base64url').toString())
           if (decoded.vid) this.vid = decoded.vid
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
     }
   }
@@ -753,7 +828,13 @@ export class Registrar {
     return this.genFPWithTime(pageType, eventType, 0, emailLen, emailAddr)
   }
 
-  private genFPWithTime(pageType: string, eventType: string, timeOnPage: number, emailLen: number, emailAddr: string): string {
+  private genFPWithTime(
+    pageType: string,
+    eventType: string,
+    timeOnPage: number,
+    emailLen: number,
+    emailAddr: string
+  ): string {
     const did = this.cfg.directoryId
     let loc = '', ref = ''
 
@@ -779,7 +860,17 @@ export class Registrar {
       ref = this.cfg.viewBase + '/'
     }
 
-    return generateFingerprint(this.identity, loc, ref, this.fpCtx, pageType, eventType, timeOnPage, emailLen, emailAddr)
+    return generateFingerprint(
+      this.identity,
+      loc,
+      ref,
+      this.fpCtx,
+      pageType,
+      eventType,
+      timeOnPage,
+      emailLen,
+      emailAddr
+    )
   }
 
   // ============ 注册步骤 ============
@@ -794,22 +885,7 @@ export class Registrar {
     }
     const headers = { 'Content-Type': 'application/json' }
 
-    let resp: { body: string; status: number; headers: Record<string, string | string[]> } | null = null
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        resp = await this.doPost(this.cfg.oidcBase + '/client/register', payload, headers)
-        if (resp.status === 200) break
-      } catch (err: unknown) {
-        if (attempt < 2) {
-          this.log(`[1] OIDC 重试 (${attempt + 1}/3)...`)
-          await this.abortableSleep(2000 * (attempt + 1))
-          await this.rebuildTlsClient()
-          continue
-        }
-        throw err
-      }
-    }
-    if (!resp) throw new Error('OIDC 注册失败: 所有重试均失败')
+    const resp = await this.doPost(this.cfg.oidcBase + '/client/register', payload, headers)
     const data = this.parseBody(resp.body)
     this.clientId = (data.clientId as string) || ''
     this.clientSecret = (data.clientSecret as string) || ''
@@ -841,6 +917,7 @@ export class Registrar {
       const acc = accounts.length === 1
         ? accounts[0]
         : accounts[Math.floor(Math.random() * accounts.length)]
+      this.outlookAccount = acc
       this.email = acc.email
       this.emitStep('email-created')
       this.log(`email=${this.email}`)
@@ -849,13 +926,19 @@ export class Registrar {
 
     if (this.cfg.useTempMailPlus) {
       this.log('[3] 使用自建域名邮箱 (TempMail.Plus)')
-      if (!this.cfg.tempMailPlusEmail || !this.cfg.tempMailPlusEpin || !this.cfg.tempMailPlusDomain) {
+      if (
+        !this.cfg.tempMailPlusEmail ||
+        !this.cfg.tempMailPlusEpin ||
+        !this.cfg.tempMailPlusDomain
+      ) {
         throw new Error('TempMail.Plus 配置不完整')
       }
       this.emailSvc = new TempMailPlusService(
-        this.cfg.tempMailPlusEmail, this.cfg.tempMailPlusEpin, this.cfg.tempMailPlusDomain
+        this.cfg.tempMailPlusEmail,
+        this.cfg.tempMailPlusEpin,
+        this.cfg.tempMailPlusDomain
       )
-      this.email = await this.emailSvc.create()
+      this.email = await this.emailSvc.create(this.abortController.signal)
       if (!this.email) throw new Error('生成邮箱地址失败')
       this.emitStep('email-created')
       this.log(`email=${this.email}`)
@@ -868,7 +951,7 @@ export class Registrar {
         throw new Error('Proton 邮箱地址未配置')
       }
       this.emailSvc = new ProtonWebviewService(this.cfg.protonEmail, (m) => this.log(m))
-      this.email = await this.emailSvc.create()
+      this.email = await this.emailSvc.create(this.abortController.signal)
       if (!this.email) throw new Error('Proton 邮箱地址为空')
       this.emitStep('email-created')
       this.log(`email=${this.email}`)
@@ -878,14 +961,17 @@ export class Registrar {
     if (this.cfg.useGptMail) {
       const mode = this.cfg.gptMailInboxEmail
         ? `CF 转发 → ${this.cfg.gptMailInboxEmail}`
-        : this.cfg.gptMailPrivatePassword ? '私有域名直收（带密码）' : '私有域名直收'
+        : this.cfg.gptMailPrivatePassword
+          ? '私有域名直收（带密码）'
+          : '私有域名直收'
       this.log(`[3] 使用 GPTmail (${mode}) → mail.chatgpt.org.uk`)
       if (!this.cfg.gptMailDomain) {
         throw new Error('GPTmail 域名未配置')
       }
       // 复用注册流程已经初始化的 TLS SessionClient（伪装 Chrome 146 JA3 + 注入代理），
       // 否则 GPTmail 后端通过 TLS 指纹校验会返回 401 "Browser session required"
-      if (!this.session) throw new Error('TLS SessionClient 未初始化，无法启动 GPTmail（请检查代理）')
+      if (!this.session)
+        throw new Error('TLS SessionClient 未初始化，无法启动 GPTmail（请检查代理）')
       this.emailSvc = new GptMailService({
         baseURL: this.cfg.gptMailBaseURL,
         inboxEmail: this.cfg.gptMailInboxEmail,
@@ -896,7 +982,7 @@ export class Registrar {
         // GptMailService 每次请求都读这里的最新引用，避免用到已 destroyed 的旧 session
         getSession: () => this.session
       })
-      this.email = await this.emailSvc.create()
+      this.email = await this.emailSvc.create(this.abortController.signal)
       if (!this.email) throw new Error('生成 GPTmail 注册邮箱失败')
       this.emitStep('email-created')
       this.log(`email=${this.email}`)
@@ -906,7 +992,7 @@ export class Registrar {
     this.log('[3] 创建临时邮箱')
     if (!this.cfg.moEmailBaseURL) throw new Error('MoEmail 未配置')
     this.emailSvc = new MoEmailService(this.cfg.moEmailBaseURL, this.cfg.moEmailAPIKey)
-    this.email = await this.emailSvc.create()
+    this.email = await this.emailSvc.create(this.abortController.signal)
     if (!this.email) throw new Error('创建临时邮箱失败')
     this.emitStep('email-created')
     this.log(`email=${this.email}`)
@@ -920,10 +1006,10 @@ export class Registrar {
     const url = `${this.cfg.portalBase}/login?directory_id=view&redirect_url=${redirect}`
 
     const h: Record<string, string> = {
-      'Accept': 'application/json, text/plain, */*',
+      Accept: 'application/json, text/plain, */*',
       'Content-Type': 'application/json',
-      'Origin': this.cfg.viewBase,
-      'Referer': this.cfg.viewBase + '/',
+      Origin: this.cfg.viewBase,
+      Referer: this.cfg.viewBase + '/',
       'User-Agent': this.identity.ua
     }
     const resp = await this.doGet(url, h)
@@ -950,7 +1036,9 @@ export class Registrar {
     let fp = this.genFP('signin', 'first_load', 0, '')
     let rid = newUUID()
     let h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
     let resp = await this.doPost(api, {
       stepId: '', workflowStateHandle: this.workflowHandle,
@@ -965,13 +1053,20 @@ export class Registrar {
       fp = this.genFP('signin', 'PageLoad', 0, '')
       rid = newUUID()
       h = this.buildHeaders(ref, this.cfg.signinBase)
-      h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+      h['x-amzn-requestid'] = rid
+      h['x-amz-date'] = gmtDate()
+      h['priority'] = 'u=1, i'
 
-      resp = await this.doPost(api, {
-        stepId: 'start', workflowStateHandle: this.workflowHandle,
-        inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
-        requestId: rid
-      }, h)
+      resp = await this.doPost(
+        api,
+        {
+          stepId: 'start',
+          workflowStateHandle: this.workflowHandle,
+          inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
+          requestId: rid
+        },
+        h
+      )
       saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
       data = this.parseBody(resp.body)
       if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
@@ -986,7 +1081,9 @@ export class Registrar {
     const fp = this.genFP('signin', 'PageSubmit', this.email.length, this.email)
     const rid = newUUID()
     const h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
     const resp = await this.doPost(api, {
       stepId: 'get-identity-user', workflowStateHandle: this.workflowHandle,
@@ -1020,7 +1117,9 @@ export class Registrar {
     const fp = this.genFP('signup', 'PageSubmit', 0, '')
     const rid = newUUID()
     const h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
     const resp = await this.doPost(api, {
       stepId: 'get-identity-user', workflowStateHandle: this.workflowHandle,
@@ -1048,7 +1147,9 @@ export class Registrar {
     let fp = this.genFP('signup', 'first_load', 0, '')
     let rid = newUUID()
     let h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
     let resp = await this.doPost(api, {
       stepId: '', workflowStateHandle: this.workflowHandle,
@@ -1061,21 +1162,30 @@ export class Registrar {
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     let data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
-    if (data.stepId !== 'start') throw new Error(`Signup init 失败: ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (data.stepId !== 'start')
+      throw new Error(`Signup init 失败: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     fp = this.genFP('signup', 'PageLoad', 0, '')
     rid = newUUID()
     h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    resp = await this.doPost(api, {
-      stepId: 'start', workflowStateHandle: this.workflowHandle,
-      inputs: [
-        { input_type: 'UserRequestInput', username: this.email },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      visitorId: this.vid, requestId: rid
-    }, h)
+    resp = await this.doPost(
+      api,
+      {
+        stepId: 'start',
+        workflowStateHandle: this.workflowHandle,
+        inputs: [
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        visitorId: this.vid,
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
@@ -1099,9 +1209,10 @@ export class Registrar {
 
     const url = `${this.cfg.profileBase}/?workflowID=${this.workflowId}`
     const resp = await this.doGet(url, {
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'User-Agent': this.identity.ua,
-      'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate'
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate'
     })
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     resetPerfTiming(this.fpCtx)
@@ -1127,7 +1238,8 @@ export class Registrar {
     }, this.buildProfileHeaders(ref))
     const data = this.parseBody(resp.body)
     this.workflowState = (data.workflowState as string) || ''
-    if (!this.workflowState) throw new Error(`Profile start 未返回 workflowState: ${resp.body.slice(0, 200)}`)
+    if (!this.workflowState)
+      throw new Error(`Profile start 未返回 workflowState: ${resp.body.slice(0, 200)}`)
   }
 
   private async step9SendOTP(): Promise<void> {
@@ -1136,13 +1248,16 @@ export class Registrar {
 
     if (this.cfg.useOutlook && this.cfg.outlookData) {
       const accounts = parseOutlookLines(this.cfg.outlookData)
-      const acc = accounts.find((a) => a.email === this.email)
+      const acc = this.outlookAccount || accounts.find((a) => a.email === this.email)
       if (acc) {
+        this.outlookAccount = acc
         try {
-          this.outlookMailCount = await getInboxCount(acc)
-          this.log(`发送前邮件数: ${this.outlookMailCount}`)
+          this.outlookCheckpoint = await getInboxCheckpoint(acc, this.abortController.signal)
+          this.log(`发送前 UIDNEXT: ${this.outlookCheckpoint.uidNext}`)
         } catch (err) {
-          this.log(`获取邮件数量失败: ${err}, 默认为0`)
+          this.checkAborted()
+          this.outlookCheckpoint = { uidNext: 0, since: Date.now() }
+          this.log(`获取邮件基线失败: ${err}，按新邮件时间筛选`)
         }
       }
     }
@@ -1167,7 +1282,8 @@ export class Registrar {
     }
 
     const resp = await this.doPost(this.cfg.profileBase + '/api/send-otp', payload, this.buildProfileHeaders(ref))
-    if (resp.status !== 200) throw new Error(`send-otp 失败 (${resp.status}), body: ${resp.body.substring(0, 300)}`)
+    if (resp.status !== 200)
+      throw new Error(`send-otp 失败 (${resp.status}), body: ${resp.body.substring(0, 300)}`)
     this.log('验证码已发送')
   }
 
@@ -1179,9 +1295,9 @@ export class Registrar {
     const signal = this.abortController.signal
     if (this.cfg.useOutlook && this.cfg.outlookData) {
       const accounts = parseOutlookLines(this.cfg.outlookData)
-      const acc = accounts.find((a) => a.email === this.email)
+      const acc = this.outlookAccount || accounts.find((a) => a.email === this.email)
       if (!acc) throw new Error('未找到对应 Outlook 账号')
-      return await waitForOTP(acc, this.outlookMailCount, 120, 5, signal)
+      return await waitForOTP(acc, this.outlookCheckpoint, 120, 5, signal)
     }
     if (!this.emailSvc) throw new Error('邮箱服务未初始化')
     return await this.emailSvc.waitForCode(120, 3, signal)
@@ -1211,7 +1327,8 @@ export class Registrar {
     const data = this.parseBody(resp.body)
     this.regCode = (data.registrationCode as string) || ''
     this.signState = (data.signInState as string) || ''
-    if (!this.regCode) throw new Error(`create-identity 未返回 registrationCode: ${resp.body.slice(0, 200)}`)
+    if (!this.regCode)
+      throw new Error(`create-identity 未返回 registrationCode: ${resp.body.slice(0, 200)}`)
   }
 
   private async step12SetPassword(): Promise<void> {
@@ -1224,7 +1341,9 @@ export class Registrar {
     // 12a: 获取加密公钥
     let rid = newUUID()
     let h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
     let resp = await this.doPost(api, {
       stepId: '', state: this.signState,
@@ -1240,7 +1359,8 @@ export class Registrar {
 
     const encCtx = getNestedMap(data as Record<string, unknown>, 'workflowResponseData', 'encryptionContextResponse')
     const pubKeyMap = encCtx ? getNestedStringMap(encCtx, 'publicKey') : null
-    if (!pubKeyMap?.n) throw new Error(`未获取到加密公钥: ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (!pubKeyMap?.n)
+      throw new Error(`未获取到加密公钥: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     const issuer = (encCtx?.issuer as string) || 'signin'
     const audience = (encCtx?.audience as string) || 'AWSPasswordService'
@@ -1252,18 +1372,30 @@ export class Registrar {
     fp = this.genFP('signup', 'PageSubmit', 0, '')
     rid = newUUID()
     h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
-    resp = await this.doPost(api, {
-      stepId: 'get-new-password-for-password-creation',
-      workflowStateHandle: this.workflowHandle, actionId: 'SUBMIT',
-      inputs: [
-        { input_type: 'PasswordRequestInput', password: encrypted, successfullyEncrypted: 'SUCCESSFUL' },
-        { input_type: 'UserRequestInput', username: this.email },
-        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
-      ],
-      visitorId: this.vid, requestId: rid
-    }, h)
+    resp = await this.doPost(
+      api,
+      {
+        stepId: 'get-new-password-for-password-creation',
+        workflowStateHandle: this.workflowHandle,
+        actionId: 'SUBMIT',
+        inputs: [
+          {
+            input_type: 'PasswordRequestInput',
+            password: encrypted,
+            successfullyEncrypted: 'SUCCESSFUL'
+          },
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+        ],
+        visitorId: this.vid,
+        requestId: rid
+      },
+      h
+    )
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     data = this.parseBody(resp.body)
 
@@ -1284,7 +1416,9 @@ export class Registrar {
     const fp = this.genFP('signin', 'PageLoad', 0, '')
     const rid = newUUID()
     const h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
     const resp = await this.doPost(api, {
       stepId: '', workflowStateHandle: wh,
@@ -1297,7 +1431,10 @@ export class Registrar {
     }, h)
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     const data = this.parseBody(resp.body)
-    if (data.stepId !== 'end-of-workflow-success') throw new Error(`完成工作流失败: ${data.stepId || 'undefined'} ${this.formatErrorBody(resp.body, resp.status)}`)
+    if (data.stepId !== 'end-of-workflow-success')
+      throw new Error(
+        `完成工作流失败: ${data.stepId || 'undefined'} ${this.formatErrorBody(resp.body, resp.status)}`
+      )
 
     const redir = data.redirect as Record<string, unknown> | undefined
     const rurl = redir?.url as string
@@ -1317,11 +1454,17 @@ export class Registrar {
     const loginURL = `${this.cfg.portalBase}/login?directory_id=view&redirect_url=${redirectURL}`
 
     const h: Record<string, string> = {
-      'Accept': '*/*', 'User-Agent': this.identity.ua,
-      'Origin': this.cfg.viewBase, 'Referer': this.cfg.viewBase + '/',
-      'sec-ch-ua': this.secUA, 'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"', 'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors', 'sec-fetch-site': 'cross-site', 'priority': 'u=1, i'
+      Accept: '*/*',
+      'User-Agent': this.identity.ua,
+      Origin: this.cfg.viewBase,
+      Referer: this.cfg.viewBase + '/',
+      'sec-ch-ua': this.secUA,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'cross-site',
+      priority: 'u=1, i'
     }
     if (this.cookies.has('awsccc')) h['Cookie'] = 'awsccc=' + this.cookies.get('awsccc')
 
@@ -1346,7 +1489,9 @@ export class Registrar {
     let fp = this.genFP('signin', 'PageLoad', 0, '')
     let rid = newUUID()
     let h = this.buildHeaders(ref, this.cfg.signinBase)
-    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    h['x-amzn-requestid'] = rid
+    h['x-amz-date'] = gmtDate()
+    h['priority'] = 'u=1, i'
 
     let resp = await this.doPost(api, {
       stepId: '', workflowStateHandle: wh,
@@ -1355,19 +1500,26 @@ export class Registrar {
     }, h)
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     let data = this.parseBody(resp.body)
-    let newWH = (data.workflowStateHandle as string) || wh
+    const newWH = (data.workflowStateHandle as string) || wh
 
     if (data.stepId === 'start') {
       fp = this.genFP('signin', 'PageLoad', 0, '')
       rid = newUUID()
       h = this.buildHeaders(ref, this.cfg.signinBase)
-      h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+      h['x-amzn-requestid'] = rid
+      h['x-amz-date'] = gmtDate()
+      h['priority'] = 'u=1, i'
 
-      resp = await this.doPost(api, {
-        stepId: 'start', workflowStateHandle: newWH,
-        inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
-        requestId: rid
-      }, h)
+      resp = await this.doPost(
+        api,
+        {
+          stepId: 'start',
+          workflowStateHandle: newWH,
+          inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: fp }],
+          requestId: rid
+        },
+        h
+      )
       saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
       data = this.parseBody(resp.body)
     }
@@ -1390,14 +1542,16 @@ export class Registrar {
     const startURL = this.cfg.viewBase + '/start/?' + params.toString()
 
     const cookieParts: string[] = []
-    if (this.cookies.has('loginCsrfToken')) cookieParts.push('loginCsrfToken=' + this.cookies.get('loginCsrfToken'))
+    if (this.cookies.has('loginCsrfToken'))
+      cookieParts.push('loginCsrfToken=' + this.cookies.get('loginCsrfToken'))
     if (this.cookies.has('awsccc')) cookieParts.push('awsccc=' + this.cookies.get('awsccc'))
 
     await this.doGet(startURL, {
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'User-Agent': this.identity.ua,
-      'Referer': this.cfg.signinBase + '/',
-      'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate',
+      Referer: this.cfg.signinBase + '/',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
       ...(cookieParts.length ? { Cookie: cookieParts.join('; ') } : {})
     })
   }
@@ -1409,23 +1563,36 @@ export class Registrar {
     if (!csrf) throw new Error('缺少 loginCsrfToken')
 
     const h: Record<string, string> = {
-      'Accept': 'application/json, text/plain, */*',
+      Accept: 'application/json, text/plain, */*',
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': this.identity.ua, 'Origin': this.cfg.viewBase,
-      'Referer': this.cfg.viewBase + '/',
+      'User-Agent': this.identity.ua,
+      Origin: this.cfg.viewBase,
+      Referer: this.cfg.viewBase + '/',
       'x-amz-sso-csrf-token': csrf,
-      'sec-ch-ua': this.secUA, 'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"', 'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors', 'sec-fetch-site': 'cross-site', 'priority': 'u=1, i'
+      'sec-ch-ua': this.secUA,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'cross-site',
+      priority: 'u=1, i'
     }
     const formData = `authCode=${encodeURIComponent(this.authCode)}&state=${encodeURIComponent(this.ssoState)}&orgId=view`
 
     // 使用新客户端轮询 SSO Token
-    const ssoSession = new SessionClient(this.moduleClient!, this.sessionOpts)
+    const ssoSession = this.createSession()
 
     try {
       for (let retry = 0; retry < 5; retry++) {
-        const resp = await ssoSession.post(this.cfg.portalBase + '/auth/sso-token', formData, { headers: h })
+        this.checkAborted()
+        const resp = await waitFor(
+          ssoSession.post(this.cfg.portalBase + '/auth/sso-token', formData, {
+            headers: h,
+            retryIsEnabled: false
+          }),
+          this.abortController.signal
+        )
+        this.checkAborted()
         const data = JSON.parse(resp.body || '{}')
 
         if (data.token) {
@@ -1440,7 +1607,7 @@ export class Registrar {
         throw new Error(`SSO Token 失败: ${resp.body?.slice(0, 200)}`)
       }
     } finally {
-      try { await ssoSession.destroySession() } catch { /* ignore */ }
+      await this.releaseSession(ssoSession)
     }
 
     if (!this.ssoToken) throw new Error('SSO Token 重试 5 次仍失败')
@@ -1452,17 +1619,27 @@ export class Registrar {
     const dcData = this.parseBody(resp.body)
     const dc = dcData.deviceContext
 
-    await this.doPost(this.cfg.oidcBase + '/device_authorization/associate_token', {
-      deviceContext: dc, userSessionId: this.ssoToken
-    }, { 'Content-Type': 'application/json' })
+    await this.doPost(
+      this.cfg.oidcBase + '/device_authorization/associate_token',
+      {
+        deviceContext: dc,
+        userSessionId: this.ssoToken
+      },
+      { 'Content-Type': 'application/json' }
+    )
 
     // 轮询 token
     for (let i = 0; i < 30; i++) {
-      resp = await this.doPost(this.cfg.oidcBase + '/token', {
-        clientId: this.clientId, clientSecret: this.clientSecret,
-        deviceCode: this.deviceCode,
-        grantType: 'urn:ietf:params:oauth:grant-type:device_code'
-      }, { 'Content-Type': 'application/json' })
+      resp = await this.doPost(
+        this.cfg.oidcBase + '/token',
+        {
+          clientId: this.clientId,
+          clientSecret: this.clientSecret,
+          deviceCode: this.deviceCode,
+          grantType: 'urn:ietf:params:oauth:grant-type:device_code'
+        },
+        { 'Content-Type': 'application/json' }
+      )
 
       if (resp.status === 200) return this.parseBody(resp.body)
       await this.abortableSleep(2000)
@@ -1487,15 +1664,23 @@ export class Registrar {
     }
 
     const tok = this.parseBody(resp.body)
-    const access = (tok.accessToken as string) || ''
+    for (const key of ['accessToken', 'refreshToken']) {
+      if (typeof tok[key] === 'string' && tok[key]) awsToken[key] = tok[key]
+    }
+    if (typeof tok.expiresIn === 'number' && tok.expiresIn > 0)
+      awsToken.expiresAt = Date.now() + tok.expiresIn * 1000
+    const access = (awsToken.accessToken as string) || ''
 
     const usageUA = 'aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18'
 
-    for (const baseURL of ['https://q.us-east-1.amazonaws.com/getUsageLimits', 'https://q.eu-central-1.amazonaws.com/getUsageLimits']) {
+    for (const baseURL of [
+      'https://q.us-east-1.amazonaws.com/getUsageLimits',
+      'https://q.eu-central-1.amazonaws.com/getUsageLimits'
+    ]) {
       const usageURL = baseURL + '?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true'
       const usageResp = await this.doGet(usageURL, {
-        'Accept': 'application/json',
-        'Authorization': 'Bearer ' + access,
+        Accept: 'application/json',
+        Authorization: 'Bearer ' + access,
         'User-Agent': usageUA
       })
 
@@ -1514,7 +1699,7 @@ export class Registrar {
     const userInfo = (usage.userInfo as Record<string, unknown>) || {}
     const emailAddr = (userInfo.email as string) || ''
     const subInfo = (usage.subscriptionInfo as Record<string, unknown>) || {}
-    let sub = (subInfo.subscriptionTitle as string) || 'Free'
+    const sub = (subInfo.subscriptionTitle as string) || 'Free'
 
     let totalLimit = 0, totalUsed = 0
     const breakdown = usage.usageBreakdownList as Array<Record<string, unknown>> | undefined
@@ -1524,7 +1709,8 @@ export class Registrar {
         const dn = item.displayName as string
         if (rt === 'CREDIT' || dn === 'Credits') {
           totalLimit = (item.usageLimitWithPrecision as number) || (item.usageLimit as number) || 0
-          totalUsed = (item.currentUsageWithPrecision as number) || (item.currentUsage as number) || 0
+          totalUsed =
+            (item.currentUsageWithPrecision as number) || (item.currentUsage as number) || 0
 
           const ft = item.freeTrialInfo as Record<string, unknown> | undefined
           if (ft?.freeTrialStatus === 'ACTIVE') {
@@ -1537,7 +1723,13 @@ export class Registrar {
     }
 
     this.log(`验活成功! 邮箱=${emailAddr} 订阅=${sub} Credit=${totalUsed}/${totalLimit}`)
-    return { alive: true, email: emailAddr, subscription: sub, credit_used: totalUsed, credit_limit: totalLimit }
+    return {
+      alive: true,
+      email: emailAddr,
+      subscription: sub,
+      credit_used: totalUsed,
+      credit_limit: totalLimit
+    }
   }
 
   // ============ 主流程 ============
@@ -1551,25 +1743,61 @@ export class Registrar {
       await this.initTlsClient()
       this.emitStep('tls-ready')
       await this.detectExitIP()
-      await refreshAppJSConfig((url, init) => this.fetchAppJS(url, init))
+      await waitFor(
+        refreshAppJSConfig((url, init) => this.fetchAppJS(url, init)),
+        this.abortController.signal
+      )
+      this.checkAborted()
       await this.rebuildTlsClient()
 
       // 幂等只读步骤：retry 次数 + 整体超时看门狗 + 失败换出口 IP。
       // OIDC 为首步（失败即废号）保留自带 3 次重试不快速超时；Email 创建有副作用不重试。
-      const initSteps: Array<{ name: string; fn: StepFn; retry?: number; timeoutMs?: number; refreshSession?: boolean }> = [
+      const initSteps: Array<{
+        name: string
+        fn: StepFn
+        retry?: number
+        timeoutMs?: number
+        refreshSession?: boolean
+      }> = [
         { name: 'OIDC', fn: () => this.step1OIDC() },
-        { name: 'Device', fn: () => this.step2Device(), retry: 2, timeoutMs: 30000, refreshSession: true },
+        {
+          name: 'Device',
+          fn: () => this.step2Device(),
+          retry: 2,
+          timeoutMs: 30000,
+          refreshSession: true
+        },
         { name: 'Email', fn: () => this.step3Email() },
-        { name: 'Portal', fn: () => this.step4Portal(), retry: 3, timeoutMs: 35000, refreshSession: true },
-        { name: 'WorkflowInit', fn: () => this.step5WorkflowInit(), retry: 2, timeoutMs: 35000, refreshSession: true }
+        {
+          name: 'Portal',
+          fn: () => this.step4Portal(),
+          retry: 3,
+          timeoutMs: 35000,
+          refreshSession: true
+        },
+        {
+          name: 'WorkflowInit',
+          fn: () => this.step5WorkflowInit(),
+          retry: 2,
+          timeoutMs: 35000,
+          refreshSession: true
+        }
       ]
       for (const s of initSteps) {
         this.checkAborted()
         try {
-          if (s.retry) await this.retryStep(s.name, s.fn, s.retry, { timeoutMs: s.timeoutMs, refreshSession: s.refreshSession })
+          if (s.retry)
+            await this.retryStep(s.name, s.fn, s.retry, {
+              timeoutMs: s.timeoutMs,
+              refreshSession: s.refreshSession
+            })
           else await s.fn()
         } catch (err) {
-          return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+          return {
+            status: 'failed',
+            email: this.email,
+            error: `[${s.name}] ${(err as Error).message}`
+          }
         }
         await this.humanDelay()
       }
@@ -1577,7 +1805,11 @@ export class Registrar {
       this.checkAborted()
       // 非幂等步骤统一加整体超时看门狗（默认 55s）：卡住时快速失败释放并发槽，不死等 3×25s
       const STEP_TIMEOUT = 55000
-      const emailStatus = await this.withTimeout(this.step6SubmitEmail(), STEP_TIMEOUT, 'SubmitEmail')
+      const emailStatus = await this.withTimeout(
+        () => this.step6SubmitEmail(),
+        STEP_TIMEOUT,
+        'SubmitEmail'
+      )
 
       if (emailStatus === 'signup') {
         const signupSteps: Array<{ name: string; fn: StepFn }> = [
@@ -1589,16 +1821,28 @@ export class Registrar {
         ]
         for (const s of signupSteps) {
           this.checkAborted()
-          try { await this.withTimeout(s.fn(), STEP_TIMEOUT, s.name) } catch (err) {
-            return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+          try {
+            await this.withTimeout(s.fn, STEP_TIMEOUT, s.name)
+          } catch (err) {
+            return {
+              status: 'failed',
+              email: this.email,
+              error: `[${s.name}] ${(err as Error).message}`
+            }
           }
           await this.humanDelay()
         }
 
         this.checkAborted()
         let otp: string
-        try { otp = await this.step10GetOTP() } catch (err) {
-          return { status: 'failed', email: this.email, error: `[GetOTP] ${(err as Error).message}` }
+        try {
+          otp = await this.step10GetOTP()
+        } catch (err) {
+          return {
+            status: 'failed',
+            email: this.email,
+            error: `[GetOTP] ${(err as Error).message}`
+          }
         }
 
         for (const s of [
@@ -1606,8 +1850,14 @@ export class Registrar {
           { name: 'SetPassword', fn: () => this.step12SetPassword() }
         ] as Array<{ name: string; fn: StepFn }>) {
           this.checkAborted()
-          try { await this.withTimeout(s.fn(), STEP_TIMEOUT, s.name) } catch (err) {
-            return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+          try {
+            await this.withTimeout(s.fn, STEP_TIMEOUT, s.name)
+          } catch (err) {
+            return {
+              status: 'failed',
+              email: this.email,
+              error: `[${s.name}] ${(err as Error).message}`
+            }
           }
           await this.humanDelay()
         }
@@ -1625,26 +1875,32 @@ export class Registrar {
       for (let ssoAttempt = 0; ssoAttempt <= SSO_MAX_RETRIES; ssoAttempt++) {
         try {
           // SSO 含 token 轮询，单次尝试加整体超时（卡死时切断进入下一次重试）
-          await this.withTimeout(this.step12_8SSOWorkflow(), 60000, 'SSOWorkflow')
+          await this.withTimeout(() => this.step12_8SSOWorkflow(), 60000, 'SSOWorkflow')
           await this.abortableSleep(2000)
           this.checkAborted()
-          awsToken = await this.withTimeout(this.step13SSOToken(), 90000, 'SSOToken')
+          awsToken = await this.withTimeout(() => this.step13SSOToken(), 90000, 'SSOToken')
           break // SSO 成功
         } catch (err) {
           const errMsg = (err as Error).message
           if (ssoAttempt < SSO_MAX_RETRIES) {
-            this.log(`[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
+            this.log(
+              `[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`
+            )
             await this.abortableSleep(3000 + Math.floor(Math.random() * 2000))
           } else {
             // 最终失败：账号已创建但拿不到 Token
-            return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (账号已创建，可手动导入刷新)` }
+            return {
+              status: 'failed',
+              email: this.email,
+              error: `[SSOToken] ${errMsg} (账号已创建，可手动导入刷新)`
+            }
           }
         }
       }
 
       const token = awsToken!
       this.emitStep('verify-alive')
-      const verify = await this.withTimeout(this.verifyAlive(token), 60000, 'VerifyAlive')
+      const verify = await this.withTimeout(() => this.verifyAlive(token), 60000, 'VerifyAlive')
       if (verify.suspended) {
         return { status: 'failed', email: this.email, error: 'suspended' }
       }
@@ -1658,6 +1914,7 @@ export class Registrar {
         clientSecret: this.clientSecret,
         refreshToken: (token.refreshToken as string) || '',
         accessToken: (token.accessToken as string) || '',
+        expiresAt: token.expiresAt as number | undefined,
         region: 'us-east-1',
         provider: 'BuilderId',
         verify,
@@ -1674,11 +1931,16 @@ export class Registrar {
    */
   private resolvedProxyUrl(): string | undefined {
     // 代理链启用时 cfg.proxy 是本地中继地址，审计应显示真正的目标代理
-    return (this.chainTargetProxy && this.chainTargetProxy.trim())
-      || (this.cfg.proxy && this.cfg.proxy.trim())
-      || process.env.HTTPS_PROXY || process.env.https_proxy
-      || process.env.HTTP_PROXY || process.env.http_proxy
-      || getSystemProxy() || undefined
+    return (
+      (this.chainTargetProxy && this.chainTargetProxy.trim()) ||
+      (this.cfg.proxy && this.cfg.proxy.trim()) ||
+      process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy ||
+      getSystemProxy() ||
+      undefined
+    )
   }
 
   /** 输出本次注册使用的指纹摘要（用于审计与后续复用） */
@@ -1703,11 +1965,15 @@ export class Registrar {
       await this.setupProxyChain()
       await this.initTlsClient()
       await this.detectExitIP()
-      await refreshAppJSConfig((url, init) => this.fetchAppJS(url, init))
+      await waitFor(
+        refreshAppJSConfig((url, init) => this.fetchAppJS(url, init)),
+        this.abortController.signal
+      )
+      this.checkAborted()
       await this.rebuildTlsClient()
 
       await this.step1OIDC()
-      await this.withTimeout(this.step2Device(), 30000, 'Device')
+      await this.withTimeout(() => this.step2Device(), 30000, 'Device')
       return { success: true }
     } catch (err) {
       return { success: false, error: (err as Error).message }
@@ -1715,24 +1981,37 @@ export class Registrar {
   }
 
   /** 手动模式 - 设置邮箱后继续注册流程到发送 OTP */
-  async runManualPhase2(email: string, fullName?: string): Promise<{ success: boolean; error?: string }> {
+  async runManualPhase2(
+    email: string,
+    fullName?: string
+  ): Promise<{ success: boolean; error?: string }> {
     this.email = email
     if (fullName) this.cfg.fullName = fullName
 
     try {
       // 幂等只读步骤：retry + 超时看门狗 + 失败换出口 IP；后续非幂等步骤仅加超时快速失败
       const STEP_TIMEOUT = 55000
-      await this.retryStep('Portal', () => this.step4Portal(), 3, { timeoutMs: 35000, refreshSession: true })
-      await this.retryStep('WorkflowInit', () => this.step5WorkflowInit(), 2, { timeoutMs: 35000, refreshSession: true })
+      await this.retryStep('Portal', () => this.step4Portal(), 3, {
+        timeoutMs: 35000,
+        refreshSession: true
+      })
+      await this.retryStep('WorkflowInit', () => this.step5WorkflowInit(), 2, {
+        timeoutMs: 35000,
+        refreshSession: true
+      })
 
-      const status = await this.withTimeout(this.step6SubmitEmail(), STEP_TIMEOUT, 'SubmitEmail')
+      const status = await this.withTimeout(
+        () => this.step6SubmitEmail(),
+        STEP_TIMEOUT,
+        'SubmitEmail'
+      )
       if (status !== 'signup') return { success: false, error: '该邮箱已注册过' }
 
-      await this.withTimeout(this.step7Signup(), STEP_TIMEOUT, 'Signup')
-      await this.withTimeout(this.step7_5SignupInit(), STEP_TIMEOUT, 'SignupInit')
-      await this.withTimeout(this.step7_8ProfileInit(), STEP_TIMEOUT, 'ProfileInit')
-      await this.withTimeout(this.step8ProfileStart(), STEP_TIMEOUT, 'ProfileStart')
-      await this.withTimeout(this.step9SendOTP(), STEP_TIMEOUT, 'SendOTP')
+      await this.withTimeout(() => this.step7Signup(), STEP_TIMEOUT, 'Signup')
+      await this.withTimeout(() => this.step7_5SignupInit(), STEP_TIMEOUT, 'SignupInit')
+      await this.withTimeout(() => this.step7_8ProfileInit(), STEP_TIMEOUT, 'ProfileInit')
+      await this.withTimeout(() => this.step8ProfileStart(), STEP_TIMEOUT, 'ProfileStart')
+      await this.withTimeout(() => this.step9SendOTP(), STEP_TIMEOUT, 'SendOTP')
       return { success: true }
     } catch (err) {
       return { success: false, error: (err as Error).message }
@@ -1743,32 +2022,38 @@ export class Registrar {
   async runManualPhase3(otp: string): Promise<RegistrationResult> {
     try {
       // 非幂等步骤加整体超时看门狗，卡住时快速失败
-      await this.withTimeout(this.step11CreateIdentity(otp), 55000, 'CreateIdentity')
-      await this.withTimeout(this.step12SetPassword(), 55000, 'SetPassword')
+      await this.withTimeout(() => this.step11CreateIdentity(otp), 55000, 'CreateIdentity')
+      await this.withTimeout(() => this.step12SetPassword(), 55000, 'SetPassword')
 
       // SSO + Token：账号已创建，网络波动时在同一 Registrar 内重试（复用已有注册状态），避免白费已完成的注册
       let awsToken: Record<string, unknown> | null = null
       const SSO_MAX_RETRIES = 2
       for (let ssoAttempt = 0; ssoAttempt <= SSO_MAX_RETRIES; ssoAttempt++) {
         try {
-          await this.withTimeout(this.step12_8SSOWorkflow(), 60000, 'SSOWorkflow')
+          await this.withTimeout(() => this.step12_8SSOWorkflow(), 60000, 'SSOWorkflow')
           await this.abortableSleep(2000)
           this.checkAborted()
-          awsToken = await this.withTimeout(this.step13SSOToken(), 90000, 'SSOToken')
+          awsToken = await this.withTimeout(() => this.step13SSOToken(), 90000, 'SSOToken')
           break
         } catch (err) {
           const errMsg = (err as Error).message
           if (ssoAttempt < SSO_MAX_RETRIES) {
-            this.log(`[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
+            this.log(
+              `[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`
+            )
             await this.abortableSleep(3000 + Math.floor(Math.random() * 2000))
           } else {
-            return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (账号已创建，可手动导入刷新)` }
+            return {
+              status: 'failed',
+              email: this.email,
+              error: `[SSOToken] ${errMsg} (账号已创建，可手动导入刷新)`
+            }
           }
         }
       }
 
       const token = awsToken!
-      const verify = await this.withTimeout(this.verifyAlive(token), 60000, 'VerifyAlive')
+      const verify = await this.withTimeout(() => this.verifyAlive(token), 60000, 'VerifyAlive')
       if (verify.suspended) {
         return { status: 'failed', email: this.email, error: 'suspended' }
       }
@@ -1781,6 +2066,7 @@ export class Registrar {
         clientSecret: this.clientSecret,
         refreshToken: (token.refreshToken as string) || '',
         accessToken: (token.accessToken as string) || '',
+        expiresAt: token.expiresAt as number | undefined,
         region: 'us-east-1',
         provider: 'BuilderId',
         verify,

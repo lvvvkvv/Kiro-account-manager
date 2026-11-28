@@ -1,111 +1,11 @@
 // 代理服务器日志模块
 import * as fs from 'fs'
 import * as path from 'path'
-import { app } from 'electron'
 import { redactString, redactValue } from '../utils/redact'
 
-export interface LogEntry {
-  timestamp: string
-  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
-  category: string
-  message: string
-  data?: unknown
-}
-
-export interface LoggerConfig {
-  enabled: boolean
-  logDir?: string
-  maxFileSize?: number // 最大文件大小 (bytes)
-  maxFiles?: number // 最大文件数量
-  logToConsole?: boolean
-}
-
-const DEFAULT_CONFIG: LoggerConfig = {
-  enabled: false,
-  maxFileSize: 10 * 1024 * 1024, // 10MB
-  maxFiles: 5,
-  logToConsole: true
-}
+import type { ProxyLogEntry as LogEntry, ProxyLogBatch } from '../../shared/proxyLogs'
 
 class ProxyLogger {
-  private config: LoggerConfig
-  private logStream: fs.WriteStream | null = null
-  private currentLogFile: string = ''
-  private currentFileSize: number = 0
-
-  constructor() {
-    this.config = { ...DEFAULT_CONFIG }
-  }
-
-  configure(config: Partial<LoggerConfig>): void {
-    this.config = { ...this.config, ...config }
-    
-    if (this.config.enabled && !this.config.logDir) {
-      // 默认日志目录
-      this.config.logDir = path.join(app.getPath('userData'), 'logs', 'proxy')
-    }
-
-    if (this.config.enabled) {
-      this.initLogFile()
-    } else {
-      this.close()
-    }
-  }
-
-  private initLogFile(): void {
-    if (!this.config.logDir) return
-
-    try {
-      // 确保目录存在
-      fs.mkdirSync(this.config.logDir, { recursive: true })
-
-      // 创建新的日志文件
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-      this.currentLogFile = path.join(this.config.logDir, `proxy-${timestamp}.log`)
-      this.logStream = fs.createWriteStream(this.currentLogFile, { flags: 'a' })
-      this.currentFileSize = 0
-
-      this.info('Logger', 'Log file initialized', { file: this.currentLogFile })
-    } catch (error) {
-      console.error('[ProxyLogger] Failed to init log file:', error)
-    }
-  }
-
-  private rotateIfNeeded(): void {
-    if (!this.config.maxFileSize || this.currentFileSize < this.config.maxFileSize) {
-      return
-    }
-
-    this.close()
-    this.cleanOldLogs()
-    this.initLogFile()
-  }
-
-  private cleanOldLogs(): void {
-    if (!this.config.logDir || !this.config.maxFiles) return
-
-    try {
-      const files = fs.readdirSync(this.config.logDir)
-        .filter(f => f.startsWith('proxy-') && f.endsWith('.log'))
-        .map(f => ({
-          name: f,
-          path: path.join(this.config.logDir!, f),
-          time: fs.statSync(path.join(this.config.logDir!, f)).mtime.getTime()
-        }))
-        .sort((a, b) => b.time - a.time)
-
-      // 删除超出数量限制的旧文件
-      while (files.length >= this.config.maxFiles) {
-        const oldest = files.pop()
-        if (oldest) {
-          fs.unlinkSync(oldest.path)
-        }
-      }
-    } catch (error) {
-      console.error('[ProxyLogger] Failed to clean old logs:', error)
-    }
-  }
-
   private isWriting = false
   private write(rawEntry: LogEntry): void {
     // 统一脱敏：message + data 里的代理账密 / token / password 等，避免明文落盘或上屏
@@ -114,9 +14,8 @@ class ProxyLogger {
       message: redactString(rawEntry.message),
       data: rawEntry.data === undefined ? undefined : redactValue(rawEntry.data)
     }
-    const line = JSON.stringify(entry) + '\n'
 
-    if (this.config.logToConsole) {
+    {
       const prefix = `[${entry.level}][${entry.category}]`
       // 设置 flag 防止 console 拦截器重复写入 proxyLogStore
       this.isWriting = true
@@ -128,12 +27,6 @@ class ProxyLogger {
         console.log(prefix, entry.message, entry.data || '')
       }
       this.isWriting = false
-    }
-
-    if (this.config.enabled && this.logStream) {
-      this.logStream.write(line)
-      this.currentFileSize += Buffer.byteLength(line)
-      this.rotateIfNeeded()
     }
 
     // 同时添加到内存存储（用于 UI 显示）
@@ -182,65 +75,15 @@ class ProxyLogger {
     })
   }
 
-  // 记录请求
-  request(info: {
-    path: string
-    method: string
-    model?: string
-    accountId?: string
-  }): void {
-    this.info('Request', `${info.method} ${info.path}`, info)
-  }
-
-  // 记录响应
-  response(info: {
-    path: string
-    status: number
-    tokens?: number
-    responseTime?: number
-    error?: string
-  }): void {
-    if (info.error) {
-      this.error('Response', `${info.path} -> ${info.status}`, info)
-    } else {
-      this.info('Response', `${info.path} -> ${info.status}`, info)
-    }
-  }
-
-  // 记录 Token 刷新
-  tokenRefresh(accountId: string, success: boolean, error?: string): void {
-    if (success) {
-      this.info('TokenRefresh', `Account ${accountId} refreshed successfully`)
-    } else {
-      this.error('TokenRefresh', `Account ${accountId} refresh failed`, { error })
-    }
-  }
-
-  close(): void {
-    if (this.logStream) {
-      this.logStream.end()
-      this.logStream = null
-    }
-  }
-
-  getLogDir(): string | undefined {
-    return this.config.logDir
-  }
 }
 
-// 内存日志存储（用于 UI 显示）
-//
-// 性能修复要点：
-// 1. maxLogs 从 100万 降至 5万 — 避免序列化数百 MB 大对象阻塞主进程
-// 2. save() 改为异步 fs.promises.writeFile — 不再 freeze 主进程事件循环
-// 3. 单次写盘原子化（in-flight guard）防止并发 writeFile 导致竞态
-// 4. 写盘节流间隔从 5s 提至 30s — 大幅降低高频日志场景下的 IO 频率
-// 5. 应用退出时通过 flushSaveNow() 强制写盘，防止数据丢失
+// 有界内存日志；文件格式仍为按时间排列的 JSON 数组。
 class ProxyLogStore {
   private logs: LogEntry[] = []
   // 5 万条 × 平均 200 字节 ≈ 10 MB；既能覆盖常规调试需求，又把单次写盘成本控制在可接受范围内
   private maxLogs: number = 50000
-  private listeners: ((entry: LogEntry) => void)[] = []
+  private head = 0
+  private sequence = 0
   private storePath: string = ''
 
   private initialized = false
@@ -264,6 +107,7 @@ class ProxyLogStore {
         }) : []
         // 加载时也施加上限，避免旧版本遗留的超大日志文件导致首次启动卡顿
         this.logs = filtered.length > this.maxLogs ? filtered.slice(-this.maxLogs) : filtered
+        this.sequence = this.logs.length
         console.log(`[ProxyLogStore] Loaded ${this.logs.length} valid logs`)
       }
     } catch (error) {
@@ -272,29 +116,24 @@ class ProxyLogStore {
     }
   }
 
-  /** 异步保存日志（不阻塞主进程事件循环）。并发调用通过 in-flight 标志合并。 */
-  private writeInFlight = false
+  private saveTask: Promise<void> | null = null
   private writePending = false
 
-  async save(): Promise<void> {
-    if (this.writeInFlight) {
-      // 已有写盘进行中：标记 pending，让其完成后立即重写最新数据
-      this.writePending = true
-      return
+  save(): Promise<void> {
+    this.writePending = true
+    if (!this.saveTask) {
+      this.saveTask = this.writeSnapshots().finally(() => { this.saveTask = null })
     }
-    this.writeInFlight = true
-    try {
-      // 拷贝引用快照（不复制数组）以保证 JSON.stringify 期间数据稳定
-      const snapshot = this.logs
-      await fs.promises.writeFile(this.storePath, JSON.stringify(snapshot), 'utf-8')
-    } catch (error) {
-      console.error('[ProxyLogStore] Failed to save logs:', error)
-    } finally {
-      this.writeInFlight = false
-      if (this.writePending) {
-        this.writePending = false
-        // 用 microtask 而不是立即递归，避免栈深问题
-        queueMicrotask(() => { void this.save() })
+    return this.saveTask
+  }
+
+  private async writeSnapshots(): Promise<void> {
+    while (this.writePending) {
+      this.writePending = false
+      try {
+        await fs.promises.writeFile(this.storePath, JSON.stringify(this.getAll()), 'utf-8')
+      } catch (error) {
+        console.error('[ProxyLogStore] Failed to save logs:', error)
       }
     }
   }
@@ -302,17 +141,13 @@ class ProxyLogStore {
   private saveTimer: NodeJS.Timeout | null = null
 
   add(entry: LogEntry): void {
-    this.logs.push(entry)
-
-    // 超过最大数量时删除最旧的
-    if (this.logs.length > this.maxLogs) {
-      this.logs = this.logs.slice(-this.maxLogs)
+    if (this.logs.length < this.maxLogs) {
+      this.logs.push(entry)
+    } else {
+      this.logs[this.head] = entry
+      this.head = (this.head + 1) % this.maxLogs
     }
-
-    // 通知监听器（异常隔离）
-    for (const listener of this.listeners) {
-      try { listener(entry) } catch { /* ignore */ }
-    }
+    this.sequence++
 
     // 节流调度异步保存
     this.scheduleSave()
@@ -336,15 +171,22 @@ class ProxyLogStore {
   }
 
   getAll(): LogEntry[] {
-    return [...this.logs]
+    return this.getLast(this.logs.length)
   }
 
   getLast(count: number): LogEntry[] {
-    return this.logs.slice(-count)
+    const size = Math.min(this.logs.length, Math.max(0, Math.floor(count)))
+    const result: LogEntry[] = []
+    for (let i = this.logs.length - size; i < this.logs.length; i++) {
+      result.push(this.logs[(this.head + i) % this.logs.length])
+    }
+    return result
   }
 
   clear(): void {
     this.logs = []
+    this.head = 0
+    this.sequence++
     void this.save()
   }
 
@@ -352,15 +194,18 @@ class ProxyLogStore {
     return this.logs.length
   }
 
-  onLog(listener: (entry: LogEntry) => void): () => void {
-    this.listeners.push(listener)
-    return () => {
-      const index = this.listeners.indexOf(listener)
-      if (index >= 0) {
-        this.listeners.splice(index, 1)
-      }
+  getBatch(cursor?: number, limit = this.maxLogs): ProxyLogBatch {
+    const earliest = this.sequence - this.logs.length
+    const reset = cursor === undefined || cursor < earliest || cursor > this.sequence
+    const count = reset ? limit : Math.min(limit, this.sequence - cursor!)
+    return {
+      entries: this.getLast(count),
+      cursor: this.sequence,
+      reset,
+      total: this.logs.length
     }
   }
+
 }
 
 export const proxyLogStore = new ProxyLogStore()

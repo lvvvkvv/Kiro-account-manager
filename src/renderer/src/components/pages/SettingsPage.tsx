@@ -1,3 +1,6 @@
+import { useShallow } from 'zustand/react/shallow'
+import { ApiSettings } from '../settings/ApiSettings'
+import { shortcutKey } from '../../../../shared/shortcut'
 import { PageHeader } from '../layout/PageHeader'
 import { useAccountsStore } from '@/store/accounts'
 import { Card, CardContent, Button } from '../ui'
@@ -22,7 +25,7 @@ import {
   UserX,
   Monitor
 } from 'lucide-react'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { ExportDialog } from '../accounts/ExportDialog'
 import { useTranslation } from '@/hooks/useTranslation'
 
@@ -59,12 +62,46 @@ export function SettingsPage() {
     setTheme,
     language,
     setLanguage,
-    accounts,
     importFromExportData
-  } = useAccountsStore()
+  } = useAccountsStore(
+    useShallow((state) => ({
+      privacyMode: state.privacyMode,
+      setPrivacyMode: state.setPrivacyMode,
+      usagePrecision: state.usagePrecision,
+      setUsagePrecision: state.setUsagePrecision,
+      autoRefreshEnabled: state.autoRefreshEnabled,
+      autoRefreshInterval: state.autoRefreshInterval,
+      autoRefreshConcurrency: state.autoRefreshConcurrency,
+      autoRefreshSyncInfo: state.autoRefreshSyncInfo,
+      proactiveRenewalEnabled: state.proactiveRenewalEnabled,
+      setProactiveRenewalEnabled: state.setProactiveRenewalEnabled,
+      setAutoRefresh: state.setAutoRefresh,
+      setAutoRefreshConcurrency: state.setAutoRefreshConcurrency,
+      setAutoRefreshSyncInfo: state.setAutoRefreshSyncInfo,
+      checkAndRefreshExpiringTokens: state.checkAndRefreshExpiringTokens,
+      proxyEnabled: state.proxyEnabled,
+      proxyUrl: state.proxyUrl,
+      setProxy: state.setProxy,
+      autoSwitchEnabled: state.autoSwitchEnabled,
+      autoSwitchThreshold: state.autoSwitchThreshold,
+      autoSwitchInterval: state.autoSwitchInterval,
+      setAutoSwitch: state.setAutoSwitch,
+      batchImportConcurrency: state.batchImportConcurrency,
+      setBatchImportConcurrency: state.setBatchImportConcurrency,
+      loginPrivateMode: state.loginPrivateMode,
+      setLoginPrivateMode: state.setLoginPrivateMode,
+      switchTarget: state.switchTarget,
+      setSwitchTarget: state.setSwitchTarget,
+      theme: state.theme,
+      setTheme: state.setTheme,
+      language: state.language,
+      setLanguage: state.setLanguage,
+      importFromExportData: state.importFromExportData
+    }))
+  )
 
-  const { t } = useTranslation()
-  const isEn = t('common.unknown') === 'Unknown'
+  const { t, actualLanguage } = useTranslation()
+  const isEn = actualLanguage === 'en'
   const [showExportDialog, setShowExportDialog] = useState(false)
   const [isImporting, setIsImporting] = useState(false)
   const [tempProxyUrl, setTempProxyUrl] = useState(proxyUrl)
@@ -102,14 +139,17 @@ export function SettingsPage() {
 
   // 保存快捷键设置
   const handleShortcutChange = async (shortcut: string) => {
+    const previous = showWindowShortcut
     setShowWindowShortcut(shortcut)
     setShortcutError('')
     try {
       const result = await window.api.setShowWindowShortcut(shortcut)
       if (!result.success) {
+        setShowWindowShortcut(previous)
         setShortcutError(result.error || 'Failed to set shortcut')
       }
     } catch (error) {
+      setShowWindowShortcut(previous)
       setShortcutError(String(error))
     }
   }
@@ -129,70 +169,12 @@ export function SettingsPage() {
     const key = e.key
     if (!['Control', 'Meta', 'Alt', 'Shift'].includes(key)) {
       // 转换特殊键名
-      const keyName = key.length === 1 ? key.toUpperCase() : key
+      const keyName = shortcutKey(key)
       parts.push(keyName)
 
       const shortcut = parts.join('+')
       handleShortcutChange(shortcut)
       setIsRecordingShortcut(false)
-    }
-  }
-
-  // Usage API 类型状态
-  const [usageApiType, setUsageApiType] = useState<'rest' | 'cbor'>('rest')
-  const [usageApiLoading, setUsageApiLoading] = useState(true)
-
-  // 加载 Usage API 类型设置
-  useEffect(() => {
-    const loadUsageApiType = async () => {
-      try {
-        const type = await window.api.getUsageApiType()
-        setUsageApiType(type)
-      } catch (error) {
-        console.error('Failed to load usage API type:', error)
-      } finally {
-        setUsageApiLoading(false)
-      }
-    }
-    loadUsageApiType()
-  }, [])
-
-  // 保存 Usage API 类型
-  const handleUsageApiTypeChange = async (type: 'rest' | 'cbor') => {
-    setUsageApiType(type)
-    try {
-      await window.api.setUsageApiType(type)
-    } catch (error) {
-      console.error('Failed to save usage API type:', error)
-    }
-  }
-
-  // K-Proxy 代理设置状态
-  const [useKProxyForApi, setUseKProxyForApi] = useState(false)
-  const [kproxyLoading, setKproxyLoading] = useState(true)
-
-  // 加载 K-Proxy 代理设置
-  useEffect(() => {
-    const loadKProxySettings = async () => {
-      try {
-        const enabled = await window.api.getUseKProxyForApi()
-        setUseKProxyForApi(enabled)
-      } catch (error) {
-        console.error('Failed to load K-Proxy settings:', error)
-      } finally {
-        setKproxyLoading(false)
-      }
-    }
-    loadKProxySettings()
-  }, [])
-
-  // 保存 K-Proxy 代理设置
-  const handleKProxyChange = async (enabled: boolean) => {
-    setUseKProxyForApi(enabled)
-    try {
-      await window.api.setUseKProxyForApi(enabled)
-    } catch (error) {
-      console.error('Failed to save K-Proxy settings:', error)
     }
   }
 
@@ -219,9 +201,11 @@ export function SettingsPage() {
     const newSettings = { ...traySettings, [key]: value }
     setTraySettings(newSettings)
     try {
-      await window.api.saveTraySettings({ [key]: value })
+      const result = await window.api.saveTraySettings({ [key]: value })
+      if (!result.success) throw new Error(result.error || '托盘设置保存失败')
     } catch (error) {
-      console.error('Failed to save tray settings:', error)
+      setTraySettings(traySettings)
+      setShortcutError(String(error))
     }
   }
 
@@ -256,15 +240,38 @@ export function SettingsPage() {
     }
   }
 
-  const handleClearData = () => {
-    if (confirm('确定要清除所有账号数据吗？此操作不可恢复！')) {
-      if (confirm('再次确认：这将删除所有账号、分组和标签数据！')) {
-        // 清除所有数据
-        Array.from(accounts.keys()).forEach((id) => {
-          useAccountsStore.getState().removeAccount(id)
-        })
-        alert('所有数据已清除')
-      }
+  const clearing = useRef(false)
+  const [isClearing, setIsClearing] = useState(false)
+  const handleClearData = async (): Promise<void> => {
+    if (clearing.current) return
+    if (
+      !confirm(
+        isEn
+          ? 'Delete all accounts? This cannot be undone.'
+          : '确定要清除所有账号吗？此操作不可恢复！'
+      )
+    )
+      return
+    if (
+      !confirm(
+        isEn
+          ? 'Confirm deleting all accounts. Groups and tags will be kept.'
+          : '再次确认：删除所有账号，保留分组和标签。'
+      )
+    )
+      return
+    clearing.current = true
+    setIsClearing(true)
+    try {
+      const state = useAccountsStore.getState()
+      state.removeAccounts(Array.from(state.accounts.keys()))
+      await state.flushSaveImmediately()
+      alert(isEn ? 'All accounts cleared' : '所有账号已清除')
+    } catch (error) {
+      alert(String(error))
+    } finally {
+      clearing.current = false
+      setIsClearing(false)
     }
   }
 
@@ -502,7 +509,7 @@ export function SettingsPage() {
                 </p>
                 <p className="text-caption text-muted-foreground">
                   {isEn
-                    ? "Renew the IDE active token at a randomized time 10–30 minutes before expiry and sync it to disk."
+                    ? 'Renew the IDE active token at a randomized time 10–30 minutes before expiry and sync it to disk.'
                     : '在 IDE 激活账号的 Token 过期前 10～30 分钟随机续期，并同步写入磁盘。'}
                 </p>
               </div>
@@ -568,7 +575,9 @@ export function SettingsPage() {
                   <div className="min-w-0 flex-1 basis-[220px]">
                     <p className="font-medium">{isEn ? 'Check Interval' : '检查间隔'}</p>
                     <p className="text-caption text-muted-foreground">
-                      {isEn ? 'Account info check interval; token deadlines are scheduled independently' : '账户信息检查间隔；Token 按独立随机时间调度'}
+                      {isEn
+                        ? 'Account info check interval; token deadlines are scheduled independently'
+                        : '账户信息检查间隔；Token 按独立随机时间调度'}
                     </p>
                   </div>
                   <select
@@ -651,75 +660,7 @@ export function SettingsPage() {
           </div>
         </section>
 
-        {/* API 类型设置 */}
-        <section className="ui-section">
-          <div className="flex min-h-7 items-center gap-2">
-            <h2 className="ui-section-title flex min-w-0 items-center gap-2 [&_svg]:size-4 [&_svg]:text-muted-foreground">
-              <Database className="h-4 w-4 text-primary" />
-              {isEn ? 'API Settings' : 'API 设置'}
-            </h2>
-          </div>
-          <div className="rounded-panel border bg-card divide-y [&>div:not(.ui-setting-row)]:p-4 [&>p]:p-4">
-            <div className="ui-setting-row rounded-none [&>button]:shrink-0 [&>select]:shrink-0">
-              <div className="min-w-0 flex-1 basis-[220px]">
-                <p className="font-medium">{isEn ? 'Usage API Type' : '用量查询 API'}</p>
-                <p className="text-caption text-muted-foreground">
-                  {isEn
-                    ? 'Select API type for querying usage limits'
-                    : '选择查询账户用量的 API 类型'}
-                </p>
-              </div>
-              <select
-                className="w-[180px] border bg-background text-body focus:outline-none min-w-0 rounded-control border-input bg-card px-2.5 focus:border-ring focus:ring-[3px] focus:ring-ring/20 h-control py-1"
-                value={usageApiType}
-                onChange={(e) => handleUsageApiTypeChange(e.target.value as 'rest' | 'cbor')}
-                disabled={usageApiLoading}
-              >
-                <option value="rest">REST (GetUsageLimits)</option>
-                <option value="cbor">CBOR (GetUserUsageAndLimits)</option>
-              </select>
-            </div>
-            <div className="text-caption text-muted-foreground bg-muted/50 rounded-panel p-3 space-y-1">
-              <p>
-                • <strong>REST</strong>:{' '}
-                {isEn
-                  ? 'Official Kiro IDE format, recommended'
-                  : '官方 Kiro IDE 使用的格式，推荐使用'}
-              </p>
-              <p>
-                • <strong>CBOR</strong>:{' '}
-                {isEn
-                  ? 'Web portal format, may have different fields'
-                  : '网页端格式，字段可能有差异'}
-              </p>
-            </div>
-            <div className="ui-setting-row rounded-none [&>button]:shrink-0 [&>select]:shrink-0">
-              <div className="min-w-0 flex-1 basis-[220px]">
-                <p className="font-medium">{isEn ? 'Use K-Proxy for API' : 'API 请求走 K-Proxy'}</p>
-                <p className="text-caption text-muted-foreground">
-                  {isEn
-                    ? 'Route API requests through K-Proxy MITM proxy'
-                    : 'API 请求通过 K-Proxy MITM 代理发送'}
-                </p>
-              </div>
-              <Button
-                variant={useKProxyForApi ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => handleKProxyChange(!useKProxyForApi)}
-                disabled={kproxyLoading}
-              >
-                {useKProxyForApi ? (isEn ? 'On' : '已开启') : isEn ? 'Off' : '已关闭'}
-              </Button>
-            </div>
-            {useKProxyForApi && (
-              <div className="text-caption text-amber-500 bg-amber-500/10 rounded-panel p-3">
-                {isEn
-                  ? '⚠️ K-Proxy must be running for this to work'
-                  : '⚠️ 需要先启动 K-Proxy MITM 代理才能生效'}
-              </div>
-            )}
-          </div>
-        </section>
+        <ApiSettings />
 
         {/* 代理设置 */}
         <section className="ui-section">
@@ -1097,13 +1038,20 @@ export function SettingsPage() {
             <div className="ui-setting-row rounded-none [&>button]:shrink-0 [&>select]:shrink-0">
               <div className="min-w-0 flex-1 basis-[220px]">
                 <p className="font-medium text-destructive">
-                  {isEn ? 'Clear All Data' : '清除所有数据'}
+                  {isEn ? 'Clear All Accounts' : '清除所有账号'}
                 </p>
                 <p className="text-caption text-muted-foreground">
-                  {isEn ? 'Delete all accounts, groups and tags' : '删除所有账号、分组和标签'}
+                  {isEn
+                    ? 'Delete all accounts; keep groups and tags'
+                    : '删除所有账号，保留分组和标签'}
                 </p>
               </div>
-              <Button variant="destructive" size="sm" onClick={handleClearData}>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={handleClearData}
+                disabled={isClearing}
+              >
                 <Trash2 className="h-4 w-4 mr-0" />
                 {isEn ? 'Clear' : '清除'}
               </Button>
@@ -1115,162 +1063,59 @@ export function SettingsPage() {
         <ConfigSyncCard isEn={isEn} />
 
         {/* 导出对话框 */}
-        <ExportDialog
-          open={showExportDialog}
-          onClose={() => setShowExportDialog(false)}
-          accounts={Array.from(accounts.values())}
-          selectedCount={0}
-        />
+        {showExportDialog && (
+          <SettingsExportDialog
+            open={showExportDialog}
+            onClose={() => setShowExportDialog(false)}
+          />
+        )}
       </div>
     </div>
   )
 }
 
-/**
- * 配置同步卡片：把所有"非敏感"配置（代理池、Webhook、模板、限速、定时、各种 localStorage）打包导出/导入。
- * 不包含：账号 token / 私密凭据。
- */
+/** Share the validated import/export flow, including legacy-file compatibility. */
 function ConfigSyncCard({ isEn }: { isEn: boolean }): React.ReactNode {
-  const proxyPool = useAccountsStore((s) => s.proxyPool)
-  const proxyPoolConfig = useAccountsStore((s) => s.proxyPoolConfig)
-
-  // 收集所有可同步的 localStorage key
-  const COLLECTED_LS_KEYS = [
-    'kiro-register-config',
-    'kiro-register-history', // 可选：用户可决定要不要
-    'kiro-register-templates',
-    'kiro-register-ratelimit-enabled',
-    'kiro-register-ratelimit-max',
-    'kiro-register-autobackoff',
-    'kiro-register-dailyquota-limit',
-    'kiro-register-schedule-enabled',
-    'kiro-register-schedule-time',
-    'kiro-register-mixed-sources',
-    'kiro-webhooks',
-    'accounts_viewMode',
-    'accounts_activeGroupTab',
-    'systemLogs_displayLimit',
-    'kiro-diagnose-moemail',
-    'proxyLogs_timeRange',
-    'proxyLogs_displayLimit'
-  ]
-
-  const handleExport = (): void => {
-    const localData: Record<string, string> = {}
-    for (const key of COLLECTED_LS_KEYS) {
-      const v = localStorage.getItem(key)
-      if (v != null) localData[key] = v
-    }
-    const payload = {
-      version: 1,
-      type: 'kiro-account-manager-config',
-      exportedAt: Date.now(),
-      // 代理池条目（不含敏感账号）
-      proxyPool: Object.fromEntries(proxyPool),
-      proxyPoolConfig,
-      // 各种 localStorage
-      localStorage: localData
-    }
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `kiro-config-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
-    a.click()
-    URL.revokeObjectURL(url)
-  }
-
-  const handleImport = async (): Promise<void> => {
-    const fileData = await window.api.importFromFile()
-    if (!fileData || fileData.format !== 'json') {
-      alert(isEn ? 'Please select a JSON file' : '请选择 JSON 文件')
-      return
-    }
-    try {
-      const payload = JSON.parse(fileData.content)
-      if (payload.type !== 'kiro-account-manager-config') {
-        alert(isEn ? 'Not a valid config file' : '不是有效的配置文件')
-        return
-      }
-      if (
-        !confirm(
-          isEn
-            ? 'This will overwrite proxy pool / webhooks / templates. Continue?'
-            : '这将覆盖代理池 / Webhook / 模板等配置，确定继续？'
-        )
-      ) {
-        return
-      }
-
-      // 恢复 localStorage
-      if (payload.localStorage && typeof payload.localStorage === 'object') {
-        for (const [k, v] of Object.entries(payload.localStorage)) {
-          if (COLLECTED_LS_KEYS.includes(k) && typeof v === 'string') {
-            try {
-              localStorage.setItem(k, v)
-            } catch {
-              /* ignore */
-            }
-          }
-        }
-      }
-
-      // 恢复代理池（通过 store 接口）
-      if (payload.proxyPool && typeof payload.proxyPool === 'object') {
-        const store = useAccountsStore.getState()
-        store.clearProxyPool()
-        // 直接通过 set 重建 Map（绕过 addProxy 的解析步骤，保留原 ID）
-        useAccountsStore.setState({
-          proxyPool: new Map(
-            Object.entries(payload.proxyPool as Record<string, never>)
-          ) as Parameters<typeof useAccountsStore.setState>[0] extends infer T
-            ? T extends { proxyPool: infer P }
-              ? P
-              : never
-            : never
-        } as Parameters<typeof useAccountsStore.setState>[0])
-      }
-      if (payload.proxyPoolConfig) {
-        useAccountsStore.getState().setProxyPoolConfig(payload.proxyPoolConfig)
-      }
-
-      alert(
-        isEn
-          ? 'Config imported. Please restart the app to fully apply.'
-          : '配置已导入。建议重启应用以完全生效。'
-      )
-    } catch (e) {
-      alert(
-        (isEn ? 'Import failed: ' : '导入失败: ') + (e instanceof Error ? e.message : String(e))
-      )
-    }
-  }
-
   return (
     <section className="ui-section">
-      <div className="flex min-h-7 items-center gap-2">
-        <h2 className="ui-section-title flex min-w-0 items-center gap-2 [&_svg]:size-4 [&_svg]:text-muted-foreground">
-          <Repeat className="h-4 w-4 text-primary" />
-          {isEn ? 'Configuration Sync' : '配置同步'}
-        </h2>
-      </div>
-      <div className="rounded-panel border bg-card divide-y [&>div:not(.ui-setting-row)]:p-4 [&>p]:p-4">
+      <h2 className="ui-section-title flex items-center gap-2">
+        <Repeat />
+        {isEn ? 'Configuration Sync' : '配置同步'}
+      </h2>
+      <div className="rounded-panel border bg-card p-4 space-y-3">
         <p className="text-caption text-muted-foreground">
           {isEn
-            ? 'Export all non-sensitive settings (proxy pool, webhooks, templates, rate limits, UI preferences) to a file, for backup or multi-device sync. Does NOT include account tokens or credentials.'
-            : '导出所有"非敏感"配置（代理池、Webhook、注册模板、限速、UI 偏好等）到文件，便于备份或多设备同步。不含账号 Token 与凭据。'}
+            ? 'Import or export proxy pools, Webhooks, registration templates and preferences. Sensitive exports support password encryption; older configuration files can still be imported.'
+            : '导入或导出代理池、Webhook、注册模板和偏好；敏感配置使用密码加密，支持导入旧版配置文件。'}
         </p>
-        <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={handleExport}>
-            <Download className="h-4 w-4 mr-0" />
-            {isEn ? 'Export Config' : '导出配置'}
-          </Button>
-          <Button variant="outline" size="sm" onClick={handleImport}>
-            <Upload className="h-4 w-4 mr-0" />
-            {isEn ? 'Import Config' : '导入配置'}
-          </Button>
-        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() =>
+            window.dispatchEvent(new CustomEvent('navigate-page', { detail: 'configSync' }))
+          }
+        >
+          {isEn ? 'Open Configuration Sync' : '打开配置同步'}
+        </Button>
       </div>
     </section>
+  )
+}
+
+function SettingsExportDialog({
+  open,
+  onClose
+}: {
+  open: boolean
+  onClose: () => void
+}): React.ReactNode {
+  const accounts = useAccountsStore((state) => state.accounts)
+  return (
+    <ExportDialog
+      open={open}
+      onClose={onClose}
+      accounts={Array.from(accounts.values())}
+      selectedCount={0}
+    />
   )
 }

@@ -10,9 +10,9 @@ import { cn } from '@/lib/utils'
 
 export function UpdateSection(): JSX.Element {
   const { state, notice, check, install, setEnabled, openDownload } = useAppUpdate()
-  const { t } = useTranslation()
-  const en = t('common.unknown') === 'Unknown'
-  const { darkMode } = useAccountsStore()
+  const { actualLanguage } = useTranslation()
+  const en = actualLanguage === 'en'
+  const darkMode = useAccountsStore((state) => state.darkMode)
   const info = state.available ?? state.ready
   const busy = state.checking || state.downloading || state.installing
   const handleClick = (): Promise<void> =>

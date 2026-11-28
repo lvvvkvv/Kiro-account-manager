@@ -1,3 +1,11 @@
+import type { AccountStorageStatus } from '../shared/accountData'
+import type { OSType, MachineIdResult, MachineIdConfig, MachineIdHistoryEntry } from '../shared/machineId'
+import type { KiroSettings, KiroSettingsResult, KiroModelsResult, KiroFileResult, McpServerEdit } from '../shared/kiroSettings'
+import type { WebhookDeliveryInput, WebhookDeliveryResult } from '../shared/webhooks'
+import type { SubscriptionPlan } from '../shared/subscription'
+import type { RegistrationStartConfig, RegistrationReply, RegStepEvent } from '../shared/registration'
+import type { ChainDiagnose } from '../shared/proxyPool'
+import type { ProxyLogBatch } from '../shared/proxyLogs'
 import type { AppUpdateState } from '../shared/update'
 import { ElectronAPI } from '@electron-toolkit/preload'
 
@@ -10,6 +18,8 @@ interface AccountData {
   autoRefreshInterval: number
   autoRefreshConcurrency?: number
   autoRefreshSyncInfo?: boolean
+  batchImportConcurrency?: number
+  loginPrivateMode?: boolean
   statusCheckInterval: number
   privacyMode?: boolean
   usagePrecision?: boolean
@@ -23,23 +33,12 @@ interface AccountData {
   darkMode?: boolean
   language?: 'auto' | 'en' | 'zh'
   // 机器码管理
-  machineIdConfig?: {
-    autoSwitchOnAccountChange: boolean
-    bindMachineIdToAccount: boolean
-    useBindedMachineId: boolean
-  }
+  machineIdConfig?: MachineIdConfig
   currentMachineId?: string
   originalMachineId?: string | null
   originalBackupTime?: number | null
-  accountMachineIds?: Record<string, string>
-  machineIdHistory?: Array<{
-    id: string
-    machineId: string
-    timestamp: number
-    action: 'initial' | 'manual' | 'auto_switch' | 'restore' | 'bind'
-    accountId?: string
-    accountEmail?: string
-  }>
+  accountMachineIds?: Record<string,string>
+  machineIdHistory?: MachineIdHistoryEntry[]
   // 代理池
   proxyPool?: Record<string, unknown>
   proxyPoolConfig?: unknown
@@ -71,6 +70,8 @@ interface RefreshResult {
 interface KiroIdeTokenChangedPayload {
   accountId: string
   reason: string
+  expectedRefreshToken?: string
+  credentials?: { accessToken: string; refreshToken: string; expiresAt: number }
 }
 
 interface BonusData {
@@ -144,6 +145,9 @@ interface KiroApi {
   // 账号管理
   loadAccounts: () => Promise<AccountData | null>
   saveAccounts: (data: AccountData) => Promise<void>
+  getAccountStorageStatus: () => Promise<AccountStorageStatus>
+  retryAccountStorage: () => Promise<AccountStorageStatus>
+  onAccountStorageStatus: (callback: (status: AccountStorageStatus) => void) => () => void
   refreshAccountToken: (account: unknown) => Promise<RefreshResult>
   checkAccountStatus: (account: unknown) => Promise<StatusResult>
   
@@ -165,7 +169,7 @@ interface KiroApi {
     }
   }>, concurrency?: number, syncInfo?: boolean) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundRefreshProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
-  onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void) => () => void
+  onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string; expectedRefreshToken?: string }) => void) => () => void
   
   // 后台批量检查账号状态（不刷新 Token）
   backgroundBatchCheck: (accounts: Array<{
@@ -183,7 +187,7 @@ interface KiroApi {
     idp?: string
   }>, concurrency?: number) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundCheckProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
-  onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void) => () => void
+  onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string; expectedRefreshToken?: string }) => void) => () => void
   
   // 切换账号 - 写入凭证到本地 SSO 缓存
   switchAccount: (credentials: {
@@ -242,7 +246,10 @@ interface KiroApi {
     profileArn?: string
     provider?: string
     scopes?: string[]
-  }) => Promise<{ success: boolean; error?: string; dbPath?: string }>
+    skipRefresh?: boolean
+    expiresAt?: number
+    accountId?: string
+  }) => Promise<{ success: boolean; error?: string; dbPath?: string; refreshedCredentials?: { accessToken: string; refreshToken: string; expiresIn: number } }>
 
   // 退出登录 - 清除本地 SSO 缓存
   logoutAccount: () => Promise<{ success: boolean; deletedCount?: number; error?: string }>
@@ -253,6 +260,9 @@ interface KiroApi {
 
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {
+    accountId?: string
+    accessToken?: string
+    expiresIn?: number
     refreshToken: string
     clientId: string
     clientSecret: string
@@ -260,6 +270,7 @@ interface KiroApi {
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
   }) => Promise<{
+    refreshedCredentials?: { accessToken: string; refreshToken: string; expiresAt: number }
     success: boolean
     data?: {
       email: string
@@ -463,42 +474,16 @@ interface KiroApi {
   // ============ 机器码管理 API ============
 
   // 获取操作系统类型
-  machineIdGetOSType: () => Promise<'windows' | 'macos' | 'linux' | 'unknown'>
-
-  // 获取当前机器码
-  machineIdGetCurrent: () => Promise<{
-    success: boolean
-    machineId?: string
-    error?: string
-    requiresAdmin?: boolean
-  }>
-
-  // 设置新机器码
-  machineIdSet: (newMachineId: string) => Promise<{
-    success: boolean
-    machineId?: string
-    error?: string
-    requiresAdmin?: boolean
-  }>
-
-  // 生成随机机器码
+  machineIdGetOSType: () => Promise<OSType>
+  machineIdGetCurrent: () => Promise<MachineIdResult>
+  machineIdSet: (newMachineId: string) => Promise<MachineIdResult>
   machineIdGenerateRandom: () => Promise<string>
-
-  // 检查管理员权限
   machineIdCheckAdmin: () => Promise<boolean>
-
-  // 请求管理员权限重启
   machineIdRequestAdminRestart: () => Promise<boolean>
-
-  // 备份机器码到文件
-  machineIdBackupToFile: (machineId: string) => Promise<boolean>
-
-  // 从文件恢复机器码
-  machineIdRestoreFromFile: () => Promise<{
-    success: boolean
-    machineId?: string
-    error?: string
-  }>
+  machineIdBackupToFile: (machineId: string) => Promise<MachineIdResult>
+  machineIdRestoreFromFile: () => Promise<MachineIdResult>
+  onAppQuitPrepare: (callback: (token: string) => void) => () => void
+  appQuitReady: (token: string, error?: string) => Promise<void>
 
   getUpdateState: () => Promise<AppUpdateState>
   checkAppUpdate: () => Promise<AppUpdateState>
@@ -514,53 +499,19 @@ interface KiroApi {
   // ============ Kiro 设置管理 API ============
 
   // 获取 Kiro 设置
-  getKiroSettings: () => Promise<{
-    settings?: Record<string, unknown>
-    mcpConfig?: { mcpServers: Record<string, unknown> }
-    steeringFiles?: string[]
-    error?: string
-  }>
-
-  // 获取 Kiro 可用模型列表
-  getKiroAvailableModels: () => Promise<{
-    models: Array<{ id: string; name: string; description: string }>
-    error?: string
-  }>
-
-  // 保存 Kiro 设置
-  saveKiroSettings: (settings: Record<string, unknown>) => Promise<{ success: boolean; error?: string }>
-
-  // 打开 Kiro MCP 配置文件
-  openKiroMcpConfig: (type: 'user' | 'workspace') => Promise<{ success: boolean; error?: string }>
-
-  // 打开 Kiro Steering 目录
-  openKiroSteeringFolder: () => Promise<{ success: boolean; error?: string }>
-
-  // 打开 Kiro settings.json 文件
-  openKiroSettingsFile: () => Promise<{ success: boolean; error?: string }>
-
-  // 打开指定的 Steering 文件
-  openKiroSteeringFile: (filename: string) => Promise<{ success: boolean; error?: string }>
-
-  // 创建默认的 rules.md 文件
-  createKiroDefaultRules: () => Promise<{ success: boolean; error?: string }>
-
-  // 读取 Steering 文件内容
-  readKiroSteeringFile: (filename: string) => Promise<{ success: boolean; content?: string; error?: string }>
-
-  // 保存 Steering 文件内容
-  saveKiroSteeringFile: (filename: string, content: string) => Promise<{ success: boolean; error?: string }>
-
-  // 删除 Steering 文件
-  deleteKiroSteeringFile: (filename: string) => Promise<{ success: boolean; error?: string }>
-
-  // ============ MCP 服务器管理 ============
-
-  // 保存 MCP 服务器配置
-  saveMcpServer: (name: string, config: { command: string; args?: string[]; env?: Record<string, string> }, oldName?: string) => Promise<{ success: boolean; error?: string }>
-
-  // 删除 MCP 服务器
-  deleteMcpServer: (name: string) => Promise<{ success: boolean; error?: string }>
+  getKiroSettings: (section?: 'settings' | 'mcp' | 'steering') => Promise<KiroSettingsResult>
+  getKiroAvailableModels: (force?: boolean) => Promise<KiroModelsResult>
+  saveKiroSettings: (settings: Partial<KiroSettings>) => Promise<KiroFileResult>
+  openKiroMcpConfig: (type: 'user' | 'workspace') => Promise<KiroFileResult>
+  openKiroSteeringFolder: () => Promise<KiroFileResult>
+  openKiroSettingsFile: () => Promise<KiroFileResult>
+  openKiroSteeringFile: (filename: string) => Promise<KiroFileResult>
+  createKiroDefaultRules: () => Promise<KiroFileResult>
+  readKiroSteeringFile: (filename: string) => Promise<KiroFileResult & { content?: string }>
+  saveKiroSteeringFile: (filename: string, content: string) => Promise<KiroFileResult>
+  deleteKiroSteeringFile: (filename: string) => Promise<KiroFileResult>
+  saveMcpServer: (name: string, config: McpServerEdit, oldName?: string) => Promise<KiroFileResult>
+  deleteMcpServer: (name: string) => Promise<KiroFileResult>
 
   // ============ Kiro API 反代服务器 ============
 
@@ -571,7 +522,7 @@ interface KiroApi {
   proxyStop: () => Promise<{ success: boolean; error?: string }>
 
   // 获取反代服务器状态
-  proxyGetStatus: () => Promise<{ running: boolean; config: unknown; stats: unknown; sessionStats?: { totalRequests: number; successRequests: number; failedRequests: number; startTime: number } }>
+  proxyGetStatus: () => Promise<{ running: boolean; config: unknown; stats: unknown; pool?: { total: number; available: number }; sessionStats?: { totalRequests: number; successRequests: number; failedRequests: number; startTime: number } }>
 
   // 重置累计 credits
   proxyResetCredits: () => Promise<{ success: boolean }>
@@ -584,6 +535,8 @@ interface KiroApi {
 
   // 获取反代详细日志
   proxyGetLogs: (count?: number) => Promise<Array<{ timestamp: string; level: string; category: string; message: string; data?: unknown }>>
+
+  proxyGetLogBatch: (cursor?: number, limit?: number) => Promise<ProxyLogBatch>
 
   // 清除反代详细日志
   proxyClearLogs: () => Promise<{ success: boolean }>
@@ -631,17 +584,21 @@ interface KiroApi {
   // 获取账户可用模型列表
   accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }>
 
+  subscriptionCancel: (id: string) => Promise<void>
+  webhookSend: (input: WebhookDeliveryInput) => Promise<WebhookDeliveryResult>
+  webhookCancel: (id: string) => Promise<void>
+
   // 获取可用订阅列表
-  accountGetSubscriptions: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; plans: Array<{ name: string; qSubscriptionType: string; description: { title: string; billingInterval: string; featureHeader: string; features: string[] }; pricing: { amount: number; currency: string } }>; disclaimer?: string[] }>
+  accountGetSubscriptions: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string, requestId?: string) => Promise<{ success: boolean; error?: string; plans: SubscriptionPlan[]; disclaimer?: string[] }>
 
   // 获取订阅管理/支付链接
-  accountGetSubscriptionUrl: (accessToken: string, subscriptionType?: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; url?: string; status?: string }>
+  accountGetSubscriptionUrl: (accessToken: string, subscriptionType?: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string, requestId?: string) => Promise<{ success: boolean; error?: string; url?: string; status?: string }>
 
   // 设置用户超额偏好
-  accountSetOverage: (accessToken: string, overageStatus: 'ENABLED' | 'DISABLED', region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string }>
+  accountSetOverage: (accessToken: string, overageStatus: 'ENABLED' | 'DISABLED', region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string, requestId?: string) => Promise<{ success: boolean; error?: string }>
 
   // 在新窗口打开订阅链接
-  openSubscriptionWindow: (url: string) => Promise<{ success: boolean; error?: string }>
+  openSubscriptionWindow: (url: string, requestId?: string) => Promise<{ success: boolean; error?: string }>
 
   // 保存代理日志
   proxySaveLogs: (logs: Array<{ time: string; path: string; status: number; tokens?: number }>) => Promise<{ success: boolean; error?: string }>
@@ -665,7 +622,7 @@ interface KiroApi {
   onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void) => () => void
 
   // 监听反代账号更新事件（token 刷新 / Enterprise profileArn 自愈）
-  onProxyAccountUpdate: (callback: (info: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string }) => void) => () => void
+  onProxyAccountUpdate: (callback: (info: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string; expectedRefreshToken?: string }) => void) => () => void
 
   // ============ Usage API 类型设置 ============
 
@@ -673,13 +630,13 @@ interface KiroApi {
   getUsageApiType: () => Promise<'rest' | 'cbor'>
 
   // 设置 Usage API 类型
-  setUsageApiType: (type: 'rest' | 'cbor') => Promise<{ success: boolean; type: string }>
+  setUsageApiType: (type: 'rest' | 'cbor') => Promise<{ success: boolean; type: string; error?: string }>
 
   // 获取是否使用 K-Proxy 代理
   getUseKProxyForApi: () => Promise<boolean>
 
   // 设置是否使用 K-Proxy 代理
-  setUseKProxyForApi: (enabled: boolean) => Promise<{ success: boolean; enabled: boolean }>
+  setUseKProxyForApi: (enabled: boolean) => Promise<{ success: boolean; enabled: boolean; error?: string }>
 
   // ============ K-Proxy MITM 代理 ============
 
@@ -837,42 +794,11 @@ interface KiroApi {
 
   // ============ 注册功能 API ============
 
-  registrationStartAuto: (config: {
-    proxy?: string
-    upstreamProxy?: string
-    strictProxy?: boolean
-    moEmailBaseURL?: string
-    moEmailAPIKey?: string
-    useOutlook?: boolean
-    outlookData?: string
-    useTempMailPlus?: boolean
-    tempMailPlusEmail?: string
-    tempMailPlusEpin?: string
-    tempMailPlusDomain?: string
-    useProton?: boolean
-    protonEmail?: string
-    useGptMail?: boolean
-    gptMailBaseURL?: string
-    gptMailInboxEmail?: string
-    gptMailDomain?: string
-    gptMailPrefix?: string
-    gptMailPrivatePassword?: string
-    password?: string
-    fullName?: string
-    taskId?: string
-  }) => Promise<{ success: boolean; result?: unknown; error?: string }>
-
-  registrationManualPhase1: (config: {
-    proxy?: string
-    password?: string
-    fullName?: string
-  }) => Promise<{ success: boolean; error?: string }>
-
-  registrationManualPhase2: (email: string, fullName?: string) => Promise<{ success: boolean; error?: string }>
-
-  registrationManualPhase3: (otp: string) => Promise<{ success: boolean; result?: unknown; error?: string }>
-
-  registrationCancel: () => Promise<{ success: boolean }>
+  registrationStartAuto: (config: RegistrationStartConfig) => Promise<RegistrationReply>
+  registrationManualPhase1: (config: RegistrationStartConfig & { requestId?: string }) => Promise<{ success: boolean; error?: string }>
+  registrationManualPhase2: (email: string, fullName?: string, requestId?: string) => Promise<{ success: boolean; error?: string }>
+  registrationManualPhase3: (otp: string, requestId?: string) => Promise<RegistrationReply>
+  registrationCancel: (taskId?: string) => Promise<{ success: boolean }>
 
   registrationStatus: () => Promise<{ inProgress: boolean }>
 
@@ -898,24 +824,11 @@ interface KiroApi {
   }) => Promise<{
     success: boolean
     error?: string
-    diagnose?: {
-      upstreamReachable: boolean
-      upstreamError?: string
-      upstreamRtMs?: number
-      targetReachable: boolean
-      targetError?: string
-      targetRtMs?: number
-      targetStatus?: number
-      targetStatusText?: string
-      targetBodySnippet?: string
-      endToEndOk?: boolean
-      endToEndError?: string
-      endToEndRtMs?: number
-    }
+    diagnose?: ChainDiagnose
   }>
 
   // 诊断：通用 HTTP 探测
-  diagnoseHttpProbe: (params: { url: string; method?: 'GET' | 'HEAD'; timeoutMs?: number }) => Promise<{
+  diagnoseHttpProbe: (params: { requestId?: string; url: string; method?: 'GET' | 'HEAD'; timeoutMs?: number }) => Promise<{
     success: boolean
     latencyMs?: number
     status?: number
@@ -923,16 +836,19 @@ interface KiroApi {
   }>
 
   // 账号-代理绑定（反代分桶）
-  accountSetProxyBinding: (accountId: string, proxyUrl: string | undefined) => Promise<{ success: boolean }>
+  accountSetProxyBindings: (updates: Array<{ id: string; proxyUrl?: string }>) => Promise<{ success: boolean }>
 
   // 一键诊断
+  diagnoseCancel: (requestId: string) => Promise<void>
   diagnoseRun: (params: {
+    requestId?: string
     proxyUrl?: string
     targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
   }) => Promise<{ results: Array<{ id: string; label: string; url: string; success: boolean; httpStatus?: number; latencyMs?: number; error?: string }> }>
 
   // 账号测活：指定账号 + 模型走反代逻辑发测试消息
   diagnoseAccountLiveness: (params: {
+    requestId?: string
     account: {
       id?: string; email?: string; accessToken?: string; refreshToken?: string
       clientId?: string; clientSecret?: string; region?: string
@@ -953,36 +869,8 @@ interface KiroApi {
 
   onRegistrationLog: (callback: (msg: string) => void) => () => void
 
-  onRegistrationStep: (callback: (data: {
-    taskId?: string
-    event: {
-      name:
-        | 'init' | 'proxy-chain-ready' | 'tls-ready' | 'exit-ip'
-        | 'oidc' | 'device' | 'email-created'
-        | 'portal' | 'workflow-init' | 'submit-email'
-        | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
-        | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
-        | 'verify-alive' | 'done'
-      ts: number
-      email?: string
-      exitIp?: string
-      extra?: Record<string, unknown>
-    }
-  }) => void) => () => void
+  onRegistrationStep: (callback: (data: { taskId?: string; event: RegStepEvent }) => void) => () => void
 
-  onRegistrationComplete: (callback: (result: {
-    status: 'success' | 'failed'
-    email: string
-    password?: string
-    error?: string
-    clientId?: string
-    clientSecret?: string
-    refreshToken?: string
-    accessToken?: string
-    region?: string
-    provider?: string
-    verify?: Record<string, unknown>
-  }) => void) => () => void
 }
 
 declare global {

@@ -3,13 +3,7 @@ import { app } from 'electron'
 import * as path from 'path'
 import { CertManager, createCertManager } from './certManager'
 import { MitmProxy } from './mitmProxy'
-import type { 
-  KProxyConfig, 
-  KProxyStats, 
-  KProxyEvents,
-  CACertInfo,
-  DeviceIdMapping
-} from './types'
+import type { KProxyConfig, KProxyStats, KProxyEvents, CACertInfo, DeviceIdMapping } from './types'
 import { DEFAULT_KPROXY_CONFIG } from './types'
 
 // 导出类型
@@ -28,6 +22,7 @@ export class KProxyService {
   private deviceIdMappings: Map<string, DeviceIdMapping> = new Map()
   private dataPath: string
   private initialized: boolean = false
+  private initializeTask: Promise<CACertInfo> | null = null
   private cachedCaInfo: CACertInfo | null = null
 
   constructor(config: Partial<KProxyConfig> = {}, events: KProxyEvents = {}) {
@@ -46,17 +41,23 @@ export class KProxyService {
       return this.cachedCaInfo
     }
 
-    // 初始化证书管理器
-    this.certManager = createCertManager(this.dataPath)
-    const caInfo = await this.certManager.initialize()
+    if (!this.initializeTask)
+      this.initializeTask = (async () => {
+        // 初始化证书管理器
+        this.certManager = createCertManager(this.dataPath)
+        const caInfo = await this.certManager.initialize()
 
-    // 初始化 MITM 代理
-    this.mitmProxy = new MitmProxy(this.certManager, this.config, this.events)
+        // 初始化 MITM 代理
+        this.mitmProxy = new MitmProxy(this.certManager, this.config, this.events)
 
-    this.initialized = true
-    this.cachedCaInfo = caInfo
-    console.log('[KProxyService] Initialized')
-    return caInfo
+        this.initialized = true
+        this.cachedCaInfo = caInfo
+        console.log('[KProxyService] Initialized')
+        return caInfo
+      })().finally(() => {
+        this.initializeTask = null
+      })
+    return this.initializeTask
   }
 
   /**
@@ -148,18 +149,16 @@ export class KProxyService {
    */
   addDeviceIdMapping(mapping: DeviceIdMapping): void {
     this.deviceIdMappings.set(mapping.accountId, mapping)
+    this.events.onDeviceMappingsChange?.(this.getAllDeviceIdMappings())
   }
 
   /**
-   * 移除设备 ID 映射
+   * 恢复持久化映射，不触发重复写入
    */
-  removeDeviceIdMapping(accountId: string): void {
-    this.deviceIdMappings.delete(accountId)
+  restoreDeviceIdMappings(mappings: DeviceIdMapping[]): void {
+    for (const mapping of mappings) this.deviceIdMappings.set(mapping.accountId, mapping)
   }
 
-  /**
-   * 获取账号的设备 ID
-   */
   getDeviceIdForAccount(accountId: string): string | undefined {
     return this.deviceIdMappings.get(accountId)?.deviceId
   }
@@ -197,13 +196,6 @@ export class KProxyService {
   resetStats(): void {
     this.mitmProxy?.resetStats()
   }
-
-  /**
-   * 清除证书缓存
-   */
-  clearCertCache(): void {
-    this.certManager?.clearCache()
-  }
 }
 
 // 单例实例
@@ -236,7 +228,7 @@ export function generateDeviceId(): string {
   const bytes = new Uint8Array(32)
   crypto.getRandomValues(bytes)
   return Array.from(bytes)
-    .map(b => b.toString(16).padStart(2, '0'))
+    .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
 }
 

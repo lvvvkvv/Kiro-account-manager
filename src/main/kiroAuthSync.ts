@@ -126,9 +126,15 @@ function computeClientIdHash(startUrl?: string): string {
  * - social 与 IdC 字段顺序对齐 Kiro IDE 序列化结果，便于人工 diff
  * - IdC 同时写客户端注册文件 {clientIdHash}.json
  */
-export async function writeKiroAuthTokenFile(
-  input: WriteKiroAuthTokenInput
-): Promise<WriteKiroAuthTokenResult> {
+let authWriteQueue: Promise<unknown> = Promise.resolve()
+
+export function writeKiroAuthTokenFile(input: WriteKiroAuthTokenInput): Promise<WriteKiroAuthTokenResult> {
+  const write = authWriteQueue.then(() => writeKiroAuthTokenFileNow(input))
+  authWriteQueue = write.catch(() => undefined)
+  return write
+}
+
+async function writeKiroAuthTokenFileNow(input: WriteKiroAuthTokenInput): Promise<WriteKiroAuthTokenResult> {
   await fs.mkdir(KIRO_SSO_CACHE_DIR, { recursive: true })
 
   const clientIdHash = computeClientIdHash(input.startUrl)

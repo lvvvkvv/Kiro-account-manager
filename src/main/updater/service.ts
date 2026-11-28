@@ -1,16 +1,25 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron'
-import { autoUpdater } from 'electron-updater'
+import { autoUpdater, CancellationToken } from 'electron-updater'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { AppUpdateInfo, AppUpdateState, UpdateEnvelope } from '../../shared/update'
-import { MacUpdateBackend, request, UpdateNetworkError, type UpdateFetch } from './mac'
+import {
+  MacUpdateBackend,
+  request,
+  readUpdateText,
+  UpdateNetworkError,
+  type UpdateFetch
+} from './mac'
 import { newerThan, RELEASES_URL, UPDATE_REPO } from './manifest'
+import { withDeadline } from '../../shared/async'
 
 interface Options {
   fetch: UpdateFetch
   routingInUse: () => boolean
   prepareQuit: () => Promise<void>
+  beforeQuit?: () => Promise<void>
+  resume?: () => void
   quit: (nativeInstall?: () => void) => void
   changed: () => void
   renderer: () => BrowserWindow | null
@@ -37,10 +46,10 @@ export class AppUpdateService {
   private envelope: UpdateEnvelope | null = null
   private checking: Promise<AppUpdateState> | null = null
   private downloading: Promise<void> | null = null
+  private downloadAbort: AbortController | null = null
   private installing: Promise<void> | null = null
   private changingPreference: Promise<unknown> = Promise.resolve()
   private preferences = join(app.getPath('userData'), 'app-updates', 'preferences.json')
-  private savePreferences: Promise<void> = Promise.resolve()
   private quitAck: { token: string; resolve: () => void; reject: (error: Error) => void } | null =
     null
 
@@ -110,7 +119,9 @@ export class AppUpdateService {
         repo: 'Kiro-account-manager',
         ...(process.platform === 'win32' ? { channel: `latest-${process.arch}` } : {})
       })
-      autoUpdater.on('download-progress', (progress) => this.patch({ progress: progress.percent }))
+      autoUpdater.on('download-progress', (progress) => {
+        if (!this.downloadAbort?.signal.aborted) this.patch({ progress: progress.percent })
+      })
       autoUpdater.on('error', (error) => {
         this.error(error)
         this.patch({ installing: false })
@@ -123,29 +134,25 @@ export class AppUpdateService {
         void this.check().catch(() => {})
       }, 1000).unref()
       setTimeout(() => {
-        if (this.state.enabled) void this.download().catch(() => {})
+        if (this.state.enabled && this.state.supported) void this.download().catch(() => {})
       }, 60000).unref()
       setInterval(
         () => {
-          if (this.state.enabled) void this.download().catch(() => {})
+          if (this.state.enabled && this.state.supported) void this.download().catch(() => {})
         },
         6 * 60 * 60 * 1000
       ).unref()
     }
   }
 
-  private persist(): Promise<void> {
+  private async persist(dismissedVersion = this.state.dismissedVersion): Promise<void> {
     const value = JSON.stringify({
       enabled: this.state.enabled,
-      dismissedVersion: this.state.dismissedVersion
+      dismissedVersion
     })
-    this.savePreferences = this.savePreferences
-      .catch(() => {})
-      .then(async () => {
-        await writeFile(`${this.preferences}.tmp`, value, { mode: 0o600 })
-        await rename(`${this.preferences}.tmp`, this.preferences)
-      })
-    return this.savePreferences
+    // Both preference actions already run through changingPreference.
+    await writeFile(`${this.preferences}.tmp`, value, { mode: 0o600 })
+    await rename(`${this.preferences}.tmp`, this.preferences)
   }
 
   private async inspect(): Promise<AppUpdateInfo | null> {
@@ -176,7 +183,7 @@ export class AppUpdateService {
     )
     if (response.status === 404) return null
     if (!response.ok) throw new Error(`检查更新失败 / Update check: HTTP ${response.status}`)
-    const release = (await response.json()) as {
+    const release = JSON.parse(await readUpdateText(response)) as {
       tag_name: string
       body?: string
       published_at?: string
@@ -235,14 +242,18 @@ export class AppUpdateService {
   download(checkFirst = true): Promise<void> {
     if (this.downloading) return this.downloading
     if (this.state.installing) return Promise.resolve()
-    this.downloading = this.downloadNow(checkFirst).finally(() => {
+    const controller = new AbortController()
+    this.downloadAbort = controller
+    this.downloading = this.downloadNow(checkFirst, controller.signal).finally(() => {
+      this.downloadAbort = null
       this.downloading = null
     })
     return this.downloading
   }
-  private async downloadNow(checkFirst: boolean): Promise<void> {
+  private async downloadNow(checkFirst: boolean, signal: AbortSignal): Promise<void> {
     try {
       if (checkFirst) await this.check(false)
+      signal.throwIfAborted()
       const info = this.state.available
       if (!info) return
       if (!info.installable)
@@ -252,22 +263,44 @@ export class AppUpdateService {
       if (this.state.ready?.version === info.version) return
       this.patch({ downloading: true, progress: 0, error: null })
       if (this.mac && this.envelope)
-        await this.mac.download(info, this.envelope, (progress) => this.patch({ progress }))
-      else await autoUpdater.downloadUpdate()
+        await this.mac.download(
+          info,
+          this.envelope,
+          (progress) => {
+            if (!signal.aborted) this.patch({ progress })
+          },
+          signal
+        )
+      else {
+        const token = new CancellationToken()
+        const cancel = (): void => token.cancel()
+        signal.addEventListener('abort', cancel, { once: true })
+        try {
+          signal.throwIfAborted()
+          await autoUpdater.downloadUpdate(token)
+        } finally {
+          signal.removeEventListener('abort', cancel)
+        }
+      }
+      signal.throwIfAborted()
       this.patch({ ready: info, progress: 100 })
     } catch (error) {
+      if (signal.aborted) return
       this.error(error)
       throw error
     } finally {
-      this.patch({ downloading: false })
+      this.patch({ downloading: false, ...(signal.aborted ? { progress: null } : {}) })
     }
   }
 
   install(): Promise<void> {
     if (this.installing) return this.installing
-    this.installing = this.installNow().finally(() => {
-      this.installing = null
-    })
+    this.installing = this.changingPreference
+      .catch(() => {})
+      .then(() => this.installNow())
+      .finally(() => {
+        this.installing = null
+      })
     return this.installing
   }
   private async installNow(): Promise<void> {
@@ -287,6 +320,13 @@ export class AppUpdateService {
         throw new Error('请手动下载安装 / Please download and install manually')
       this.patch({ installing: true, error: null })
       arm = this.mac ? await this.mac.prepareInstall(info) : null
+      if (this.options.beforeQuit)
+        await withDeadline(
+          () => this.options.beforeQuit!(),
+          20000,
+          undefined,
+          '等待后台账号任务超时 / Account tasks timed out'
+        )
       await this.flushRenderer()
       if (arm) await arm('arm')
       let cleanupTimer: ReturnType<typeof setTimeout> | undefined
@@ -318,6 +358,7 @@ export class AppUpdateService {
       await arm?.('cancel').catch((cancelError) =>
         console.error('[Updater] Cancellation failed:', cancelError)
       )
+      this.options.resume?.()
       this.error(error)
       this.patch({ installing: false })
       throw error
@@ -346,6 +387,7 @@ export class AppUpdateService {
     }
     if (enabled) void this.download().catch(() => {})
     else {
+      this.downloadAbort?.abort()
       if (this.downloading) await this.downloading.catch(() => {})
       if (this.mac) await this.mac.discard()
       this.patch({ ready: null })
@@ -353,10 +395,17 @@ export class AppUpdateService {
     return this.snapshot()
   }
 
-  async dismiss(): Promise<AppUpdateState> {
-    this.patch({ dismissedVersion: this.state.ready?.version ?? null })
-    await this.persist()
-    return this.snapshot()
+  dismiss(): Promise<AppUpdateState> {
+    const operation = this.changingPreference
+      .catch(() => {})
+      .then(async () => {
+        const dismissedVersion = this.state.ready?.version ?? null
+        await this.persist(dismissedVersion)
+        this.patch({ dismissedVersion })
+        return this.snapshot()
+      })
+    this.changingPreference = operation
+    return operation
   }
 
   async openDownload(): Promise<void> {

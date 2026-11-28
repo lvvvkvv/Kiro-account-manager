@@ -1,5 +1,12 @@
 import { useMemo } from 'react'
-import { useAccountsStore, isBannedAccountError } from '@/store/accounts'
+import { useShallow } from 'zustand/react/shallow'
+import {
+  matchesAccountRisk,
+  formatAccountDate,
+  QUOTA_WARN_RATIO,
+  EXPIRE_WARN_DAYS
+} from '@/lib/account'
+import { useAccountsStore } from '@/store/accounts'
 import { Card, CardContent, CardHeader, CardTitle } from '../ui'
 import {
   Users,
@@ -22,11 +29,6 @@ import { PageHeader } from '../layout/PageHeader'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, AccountFilter } from '@/types/account'
-
-// 额度告急阈值（usage.percentUsed 为 0-1 小数）
-const QUOTA_WARN_RATIO = 0.9
-// 即将到期阈值（天）
-const EXPIRE_WARN_DAYS = 7
 
 // 订阅类型颜色映射
 const getSubscriptionColor = (type: string, title?: string): string => {
@@ -52,8 +54,20 @@ export function HomePage() {
     setActiveGroupTab,
     maskEmail,
     maskNickname
-  } = useAccountsStore()
-  const { t } = useTranslation()
+  } = useAccountsStore(
+    useShallow((state) => ({
+      accounts: state.accounts,
+      activeAccountId: state.activeAccountId,
+      getStats: state.getStats,
+      usagePrecision: state.usagePrecision,
+      setFilter: state.setFilter,
+      setActiveGroupTab: state.setActiveGroupTab,
+      maskEmail: state.maskEmail,
+      maskNickname: state.maskNickname,
+      privacyMode: state.privacyMode
+    }))
+  )
+  const { t, actualLanguage } = useTranslation()
   const stats = getStats()
 
   // 告警聚合：封禁 / 即将到期 / 额度告急（一次遍历，复用已有数据）
@@ -62,15 +76,9 @@ export function HomePage() {
     const expiring: Account[] = []
     const quotaHigh: Account[] = []
     for (const a of accounts.values()) {
-      if (isBannedAccountError(a.lastError)) {
-        banned.push(a)
-        continue // 已封禁的不再重复计入其它告警
-      }
-      const days = a.subscription.daysRemaining
-      if (days !== undefined && days <= EXPIRE_WARN_DAYS) expiring.push(a)
-      if (a.status === 'active' && a.usage.limit > 0 && a.usage.percentUsed >= QUOTA_WARN_RATIO) {
-        quotaHigh.push(a)
-      }
+      if (matchesAccountRisk(a, 'banned')) banned.push(a)
+      if (matchesAccountRisk(a, 'expiring')) expiring.push(a)
+      if (matchesAccountRisk(a, 'quota')) quotaHigh.push(a)
     }
     return { banned, expiring, quotaHigh }
   }, [accounts])
@@ -88,7 +96,7 @@ export function HomePage() {
     let totalUsed = 0
     let validAccountCount = 0
 
-    Array.from(accounts.values()).forEach((account) => {
+    for (const account of accounts.values()) {
       // 只统计正常状态的账号
       if (account.status === 'active' && account.usage) {
         const limit = account.usage.limit ?? 0
@@ -99,7 +107,7 @@ export function HomePage() {
           validAccountCount++
         }
       }
-    })
+    }
 
     const remaining = totalLimit - totalUsed
     const percentUsed = totalLimit > 0 ? (totalUsed / totalLimit) * 100 : 0
@@ -113,7 +121,7 @@ export function HomePage() {
     }
   }, [accounts])
 
-  const isEn = t('common.unknown') === 'Unknown'
+  const isEn = actualLanguage === 'en'
   const statCards = [
     {
       label: isEn ? 'Total Accounts' : '总账号数',
@@ -131,7 +139,7 @@ export function HomePage() {
     },
     {
       label: isEn ? 'Banned' : '已封禁',
-      value: stats.byStatus?.error || 0,
+      value: stats.bannedCount,
       icon: AlertTriangle,
       color: 'text-danger-text',
       bgColor: 'bg-danger-soft'
@@ -160,8 +168,7 @@ export function HomePage() {
       iconBg: 'bg-danger-soft',
       iconColor: 'text-danger-text',
       label: isEn ? 'Banned' : '已封禁',
-      hint: isEn ? 'Need manual unban' : '需人工解封',
-      onClick: () => jumpToAccounts({ bannedOnly: true })
+      onClick: () => jumpToAccounts({ risk: 'banned' })
     },
     {
       key: 'expiring',
@@ -170,8 +177,7 @@ export function HomePage() {
       iconBg: 'bg-warning-soft',
       iconColor: 'text-warning-text',
       label: isEn ? `Expiring (≤${EXPIRE_WARN_DAYS}d)` : `即将到期 (≤${EXPIRE_WARN_DAYS}天)`,
-      hint: isEn ? 'Renew soon' : '尽快续期',
-      onClick: () => jumpToAccounts({ daysRemainingMax: EXPIRE_WARN_DAYS })
+      onClick: () => jumpToAccounts({ risk: 'expiring' })
     },
     {
       key: 'quota',
@@ -182,8 +188,7 @@ export function HomePage() {
       label: isEn
         ? `Quota ≥${Math.round(QUOTA_WARN_RATIO * 100)}%`
         : `额度告急 (≥${Math.round(QUOTA_WARN_RATIO * 100)}%)`,
-      hint: isEn ? 'Almost exhausted' : '即将耗尽',
-      onClick: () => jumpToAccounts({ usageMin: QUOTA_WARN_RATIO })
+      onClick: () => jumpToAccounts({ risk: 'quota' })
     }
   ].filter((r) => r.list.length > 0)
 
@@ -670,18 +675,7 @@ export function HomePage() {
                           </span>
                           {activeAccount.usage.freeTrialExpiry && (
                             <span className="text-muted-foreground/70 text-caption">
-                              (至{' '}
-                              {(() => {
-                                const d = activeAccount.usage.freeTrialExpiry as unknown
-                                try {
-                                  return (
-                                    typeof d === 'string' ? d : new Date(d as Date).toISOString()
-                                  ).split('T')[0]
-                                } catch {
-                                  return ''
-                                }
-                              })()}
-                              )
+                              (至 {formatAccountDate(activeAccount.usage.freeTrialExpiry)})
                             </span>
                           )}
                         </div>
@@ -696,18 +690,7 @@ export function HomePage() {
                         </span>
                         {bonus.expiresAt && (
                           <span className="text-muted-foreground/70 text-caption">
-                            (至{' '}
-                            {(() => {
-                              const d = bonus.expiresAt as unknown
-                              try {
-                                return (
-                                  typeof d === 'string' ? d : new Date(d as Date).toISOString()
-                                ).split('T')[0]
-                              } catch {
-                                return ''
-                              }
-                            })()}
-                            )
+                            (至 {formatAccountDate(bonus.expiresAt)})
                           </span>
                         )}
                       </div>
@@ -738,16 +721,10 @@ export function HomePage() {
                         {isEn ? 'Reset Date:' : '重置日期:'}
                       </span>
                       <span className="font-medium">
-                        {(() => {
-                          const d = activeAccount.usage.nextResetDate as unknown
-                          try {
-                            return (
-                              typeof d === 'string' ? d : new Date(d as Date).toISOString()
-                            ).split('T')[0]
-                          } catch {
-                            return isEn ? 'Unknown' : '未知'
-                          }
-                        })()}
+                        {formatAccountDate(
+                          activeAccount.usage.nextResetDate,
+                          isEn ? 'Unknown' : '未知'
+                        )}
                       </span>
                     </div>
                   )}

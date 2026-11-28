@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, RefreshCw, Download, CheckCircle, Copy, Check } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle } from '../ui'
 import { useAccountsStore } from '@/store'
@@ -11,8 +11,15 @@ interface EditAccountDialogProps {
   account: Account | null
 }
 
-export function EditAccountDialog({ open, onOpenChange, account }: EditAccountDialogProps) {
-  const { updateAccount } = useAccountsStore()
+export function EditAccountDialog({
+  open,
+  onOpenChange,
+  account
+}: EditAccountDialogProps): React.ReactNode {
+  const updateAccount = useAccountsStore((state) => state.updateAccount)
+  const verified = useRef(false)
+  const editGeneration = useRef(0)
+  const [tokenExpiresAt, setTokenExpiresAt] = useState(0)
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
@@ -62,7 +69,11 @@ export function EditAccountDialog({ open, onOpenChange, account }: EditAccountDi
 
   // 当账号变化时更新表单
   useEffect(() => {
+    editGeneration.current++
+    setIsVerifying(false)
     if (account) {
+      verified.current = false
+      setTokenExpiresAt(account.credentials.expiresAt)
       setRefreshToken(account.credentials.refreshToken || '')
       setClientId(account.credentials.clientId || '')
       setClientSecret(account.credentials.clientSecret || '')
@@ -88,7 +99,7 @@ export function EditAccountDialog({ open, onOpenChange, account }: EditAccountDi
   }, [account])
 
   // 从本地配置导入
-  const handleImportFromLocal = async () => {
+  const handleImportFromLocal = async (): Promise<void> => {
     try {
       const result = await window.api.loadKiroCredentials()
       if (result.success && result.data) {
@@ -106,7 +117,7 @@ export function EditAccountDialog({ open, onOpenChange, account }: EditAccountDi
   }
 
   // 验证并刷新信息
-  const handleVerifyAndRefresh = async () => {
+  const handleVerifyAndRefresh = async (): Promise<void> => {
     const isSocial = account?.credentials.authMethod === 'social'
     if (!refreshToken) {
       setError('请填写 Refresh Token')
@@ -117,11 +128,13 @@ export function EditAccountDialog({ open, onOpenChange, account }: EditAccountDi
       return
     }
 
+    const generation = editGeneration.current
     setIsVerifying(true)
     setError(null)
 
     try {
       const result = await window.api.verifyAccountCredentials({
+        accountId: account?.id,
         refreshToken,
         clientId,
         clientSecret,
@@ -131,6 +144,23 @@ export function EditAccountDialog({ open, onOpenChange, account }: EditAccountDi
       })
 
       if (result.success && result.data) {
+        const expiresAt = Date.now() + (result.data.expiresIn ?? 3600) * 1000
+        const current = account && useAccountsStore.getState().accounts.get(account.id)
+        // 验证现有凭证产生的轮换即时保存，取消表单也不会丢失新 Token。
+        if (current && current.credentials.refreshToken === refreshToken) {
+          updateAccount(current.id, {
+            credentials: {
+              ...current.credentials,
+              accessToken: result.data.accessToken,
+              refreshToken: result.data.refreshToken,
+              expiresAt,
+              profileArn: result.data.profileArn || current.credentials.profileArn
+            }
+          })
+        }
+        if (generation !== editGeneration.current) return
+        verified.current = true
+        setTokenExpiresAt(expiresAt)
         setAccountInfo({
           email: result.data.email,
           userId: result.data.userId,
@@ -145,56 +175,63 @@ export function EditAccountDialog({ open, onOpenChange, account }: EditAccountDi
         if (result.data.refreshToken) {
           setRefreshToken(result.data.refreshToken)
         }
-      } else {
+      } else if (generation === editGeneration.current) {
         setError(result.error || '验证失败')
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : '验证失败')
+      if (generation === editGeneration.current)
+        setError(e instanceof Error ? e.message : '验证失败')
     } finally {
-      setIsVerifying(false)
+      if (generation === editGeneration.current) setIsVerifying(false)
     }
   }
 
   // 保存
-  const handleSave = () => {
+  const handleSave = (): void => {
     if (!account || !accountInfo) return
 
     const now = Date.now()
-
+    const current = useAccountsStore.getState().accounts.get(account.id)
+    if (!current) return
+    const credentialsChanged = verified.current || refreshToken !== account.credentials.refreshToken
     updateAccount(account.id, {
       email: accountInfo.email,
       userId: accountInfo.userId,
       nickname: nickname || undefined,
       credentials: {
-        ...account.credentials,
-        accessToken: accountInfo.accessToken,
+        ...current.credentials,
+        accessToken: credentialsChanged ? accountInfo.accessToken : current.credentials.accessToken,
         csrfToken: '',
-        refreshToken,
+        refreshToken: credentialsChanged ? refreshToken : current.credentials.refreshToken,
         clientId,
         clientSecret,
         region,
-        expiresAt: now + 3600 * 1000
+        expiresAt: credentialsChanged ? tokenExpiresAt : current.credentials.expiresAt
       },
       subscription: {
+        ...current.subscription,
         type: accountInfo.subscriptionType as SubscriptionType,
         title: accountInfo.subscriptionTitle,
         daysRemaining: accountInfo.daysRemaining,
         expiresAt: accountInfo.expiresAt
       },
-      usage: {
-        current: accountInfo.usage.current,
-        limit: accountInfo.usage.limit,
-        percentUsed:
-          accountInfo.usage.limit > 0 ? accountInfo.usage.current / accountInfo.usage.limit : 0,
-        lastUpdated: now,
-        baseLimit: accountInfo.usage.baseLimit,
-        baseCurrent: accountInfo.usage.baseCurrent,
-        freeTrialLimit: accountInfo.usage.freeTrialLimit,
-        freeTrialCurrent: accountInfo.usage.freeTrialCurrent,
-        freeTrialExpiry: accountInfo.usage.freeTrialExpiry,
-        bonuses: accountInfo.usage.bonuses,
-        nextResetDate: accountInfo.usage.nextResetDate
-      },
+      usage: verified.current
+        ? {
+            ...current.usage,
+            current: accountInfo.usage.current,
+            limit: accountInfo.usage.limit,
+            percentUsed:
+              accountInfo.usage.limit > 0 ? accountInfo.usage.current / accountInfo.usage.limit : 0,
+            lastUpdated: now,
+            baseLimit: accountInfo.usage.baseLimit,
+            baseCurrent: accountInfo.usage.baseCurrent,
+            freeTrialLimit: accountInfo.usage.freeTrialLimit,
+            freeTrialCurrent: accountInfo.usage.freeTrialCurrent,
+            freeTrialExpiry: accountInfo.usage.freeTrialExpiry,
+            bonuses: accountInfo.usage.bonuses,
+            nextResetDate: accountInfo.usage.nextResetDate
+          }
+        : current.usage,
       status: 'active'
     })
 

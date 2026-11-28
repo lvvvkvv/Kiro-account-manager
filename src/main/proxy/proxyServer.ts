@@ -9,16 +9,19 @@ import type {
   OpenAIChatRequest,
   OpenAIMessage,
   OpenAIResponsesRequest,
+  OpenAIResponseOutputItem,
   ClaudeRequest,
   ClaudeContentBlock,
   ClaudeCacheControl,
   ProxyConfig,
   ProxyStats,
   ProxyAccount,
-  TokenRefreshCallback
+  TokenRefreshCallback,
+  KiroUsage,
+  ApiKey
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, getKiroErrorStatus, getCachedKiroModels, clearKiroModelCache, setModelContextWindow, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -33,8 +36,12 @@ import {
   openAIChatToResponsesResponse
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
-import { promptCacheTracker } from './promptCacheTracker'
+import { getCachedProxyAgent, getSystemProxy } from './systemProxy'
+import { promptCacheTracker, type CacheProfile, type CacheUsage } from './promptCacheTracker'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
+import { app } from 'electron'
+import { ensureProxySelfSignedCert, type ProxySelfSignedCert } from './selfSignedCert'
+import { clearAllCaches } from './kiroApi'
 
 
 export interface ProxyServerEvents {
@@ -44,7 +51,7 @@ export interface ProxyServerEvents {
   onConfigChanged?: (config: ProxyConfig) => void  // API Key 用量更新时触发
   onStatusChange?: (running: boolean, port: number) => void
   onTokenRefresh?: TokenRefreshCallback
-  onAccountUpdate?: (account: ProxyAccount) => void
+  onAccountUpdate?: (account: ProxyAccount, expectedRefreshToken?: string) => void
   // 账号被 Kiro 后端长期封禁（如 TEMPORARILY_SUSPENDED / AccountSuspendedException）
   // 不同于临时 token 失效，需人工解封
   onAccountSuspended?: (info: { accountId: string; email?: string; reason: string; message: string }) => void
@@ -268,6 +275,9 @@ export class ProxyServer {
   private isStopping: boolean = false
   private activeRequests: Set<AbortController> = new Set()
   private sockets: Set<Socket> = new Set()
+  private activeInference = 0
+  private waitingInference = new Set<() => void>()
+  private poolSyncTask: Promise<void> | null = null
   /** P1-7 按 API Key/IP 的滑动窗口限流（每分钟桶） */
   private rateLimitBuckets: Map<string, { count: number; windowStart: number }> = new Map()
   /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
@@ -378,7 +388,17 @@ export class ProxyServer {
   }
 
   // 启动服务器
-  async start(): Promise<void> {
+  private starting: Promise<void> | undefined
+
+  isStarting(): boolean { return !!this.starting }
+
+  start(): Promise<void> {
+    if (this.starting) return this.starting
+    this.starting = this.startNow().finally(() => { this.starting = undefined })
+    return this.starting
+  }
+
+  private async startNow(): Promise<void> {
     if (this.server) {
       console.log('[ProxyServer] Server already running')
       return
@@ -401,6 +421,11 @@ export class ProxyServer {
       }
     }
 
+    let tlsOptions: https.ServerOptions | undefined
+    if (this.config.tls?.enabled) {
+      try { tlsOptions = await this.getTlsOptions() }
+      catch (error) { throw new Error(`TLS configuration error: ${(error as Error).message}`) }
+    }
     return new Promise((resolve, reject) => {
       this.isStopping = false
       const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => 
@@ -409,8 +434,7 @@ export class ProxyServer {
       // 检查是否启用 TLS
       if (this.config.tls?.enabled) {
         try {
-          const tlsOptions = this.getTlsOptions()
-          this.server = https.createServer(tlsOptions, requestHandler)
+          this.server = https.createServer(tlsOptions!, requestHandler)
           this.isHttps = true
         } catch (error) {
           reject(new Error(`TLS configuration error: ${(error as Error).message}`))
@@ -507,7 +531,7 @@ export class ProxyServer {
 
   // 获取 TLS 配置选项
   // P1-13 当 tls.enabled 但未提供 cert/key 时，自动生成自签证书
-  private getTlsOptions(): https.ServerOptions {
+  private async getTlsOptions(): Promise<https.ServerOptions> {
     const tls = this.config.tls!
     
     let cert: string
@@ -519,15 +543,15 @@ export class ProxyServer {
       key = tls.key
     } else if (tls.certPath && tls.keyPath) {
       // 从文件读取
-      cert = fs.readFileSync(tls.certPath, 'utf8')
-      key = fs.readFileSync(tls.keyPath, 'utf8')
+      ;[cert, key] = await Promise.all([
+        fs.promises.readFile(tls.certPath, 'utf8'),
+        fs.promises.readFile(tls.keyPath, 'utf8')
+      ])
     } else {
       // 自动生成自签证书（位于 userData/proxy-tls/）
       try {
-        const { app } = require('electron')
-        const { ensureProxySelfSignedCert } = require('./selfSignedCert')
         const hostnames = [this.config.host || '127.0.0.1']
-        const result = ensureProxySelfSignedCert(app.getPath('userData'), hostnames)
+        const result = await ensureProxySelfSignedCert(app.getPath('userData'), hostnames)
         proxyLogger.info('ProxyServer', `Using self-signed TLS cert (SAN=${result.altNames.join(',')}, fingerprint=${result.fingerprint.slice(0, 19)}...)`)
         cert = result.cert
         key = result.key
@@ -542,11 +566,9 @@ export class ProxyServer {
   /**
    * 获取（或生成）反代自签证书信息（供 UI 显示/导出 PEM）
    */
-  getSelfSignedCertInfo(): import('./selfSignedCert').ProxySelfSignedCert | null {
+  async getSelfSignedCertInfo(): Promise<ProxySelfSignedCert | null> {
     try {
-      const { app } = require('electron')
-      const { ensureProxySelfSignedCert } = require('./selfSignedCert')
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'])
+      return await ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'])
     } catch (err) {
       proxyLogger.warn('ProxyServer', `getSelfSignedCertInfo failed: ${(err as Error).message}`)
       return null
@@ -554,12 +576,10 @@ export class ProxyServer {
   }
 
   /** 强制重新生成自签证书（用户在 UI 上点"重新生成"） */
-  regenerateSelfSignedCert(): import('./selfSignedCert').ProxySelfSignedCert | null {
+  async regenerateSelfSignedCert(): Promise<ProxySelfSignedCert | null> {
     try {
-      const { app } = require('electron')
-      const { ensureProxySelfSignedCert } = require('./selfSignedCert')
       this.appendAuditLog('regenerate_self_signed_cert', { host: this.config.host })
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'], true)
+      return await ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'], true)
     } catch (err) {
       proxyLogger.warn('ProxyServer', `regenerateSelfSignedCert failed: ${(err as Error).message}`)
       return null
@@ -573,7 +593,9 @@ export class ProxyServer {
    * - 同时停 fallback HTTP 服务器
    */
   async stop(gracefulMs: number = 5000): Promise<void> {
+    if (this.starting) await this.starting.catch(() => {})
     if (!this.server) {
+      await Promise.allSettled(this.refreshingTokens.values())
       return
     }
 
@@ -582,11 +604,13 @@ export class ProxyServer {
     const main = this.server
     const fallback = this.fallbackServer
 
-    return new Promise((resolve) => {
+    await new Promise<void>((resolve) => {
       let done = false
+      const stoppingSockets = new Set(this.sockets)
       const finish = () => {
         if (done) return
         done = true
+        clearTimeout(forceTimer)
         proxyLogger.info('ProxyServer', 'Stopped')
         this.server = null
         this.fallbackServer = null
@@ -597,6 +621,12 @@ export class ProxyServer {
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
       }
+
+      // 超时强制 destroy
+      const forceTimer = setTimeout(() => {
+        stoppingSockets.forEach(socket => { try { socket.destroy() } catch { /* ignore */ } })
+        finish()
+      }, Math.max(0, gracefulMs))
 
       // 先停止接受新连接
       main.close(() => {
@@ -610,12 +640,9 @@ export class ProxyServer {
         try { controller.abort(new Error('Proxy server stopped')) } catch { /* ignore */ }
       })
 
-      // 超时强制 destroy
-      setTimeout(() => {
-        this.sockets.forEach(socket => { try { socket.destroy() } catch { /* ignore */ } })
-        finish()
-      }, Math.max(0, gracefulMs))
+
     })
+    await Promise.allSettled(this.refreshingTokens.values())
   }
 
   // 更新配置
@@ -631,6 +658,8 @@ export class ProxyServer {
     }
     this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
     this.config = { ...this.config, ...config }
+    if (config.workspacePath !== undefined) this.loadSteering()
+    this.events.onConfigChanged?.(this.config)
     // 同步账号选择策略到 accountPool
     if (config.accountSelectionStrategy !== undefined) {
       this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
@@ -707,21 +736,22 @@ export class ProxyServer {
       if (signal?.aborted) throw this.getAbortError(signal)
       signal?.addEventListener('abort', abort, { once: true })
       const agent = (() => {
-        const { getSystemProxy, safeCreateProxyAgent } = require('./systemProxy')
         const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-        const envAgent = safeCreateProxyAgent(envProxy)
+        const envAgent = getCachedProxyAgent(envProxy)
         if (envAgent) return envAgent
-        return safeCreateProxyAgent(getSystemProxy())
+        return getCachedProxyAgent(getSystemProxy())
       })()
       const { fetch: undiciFetch } = require('undici')
       const response = agent
         ? await undiciFetch(url, { signal: controller.signal, dispatcher: agent }) as unknown as globalThis.Response
         : await fetch(url, { signal: controller.signal })
       if (!response.ok) {
+        await response.body?.cancel()
         throw new Error(`Failed to download image: HTTP ${response.status}`)
       }
       const contentType = response.headers.get('content-type')?.split(';')[0]?.toLowerCase()
       if (!contentType || !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(contentType)) {
+        await response.body?.cancel()
         throw new Error(`Unsupported image content-type: ${contentType || 'unknown'}`)
       }
       const arrayBuffer = await response.arrayBuffer()
@@ -1035,6 +1065,7 @@ export class ProxyServer {
   // 清除模型缓存，强制下次请求重新获取
   clearModelCache(): void {
     this.modelCache = null
+    clearKiroModelCache()
     console.log('[ProxyServer] Model cache cleared')
   }
 
@@ -1086,7 +1117,7 @@ export class ProxyServer {
       }
 
       try {
-        kiroModels = await fetchKiroModels(account, signal)
+        kiroModels = await getCachedKiroModels(account, signal)
         if (kiroModels.length > 0) {
           this.modelCache = { models: kiroModels, timestamp: now }
           // 同步到 kiroApi 的 ctx cache, 供 token 裁剪逻辑使用
@@ -1146,39 +1177,38 @@ export class ProxyServer {
       }
     }
 
-    const task = this.doRefreshToken(account, signal)
+    const task = this.doRefreshToken(account).finally(() => { this.refreshingTokens.delete(account.id) })
     this.refreshingTokens.set(account.id, task)
-    try {
-      return await task
-    } finally {
-      this.refreshingTokens.delete(account.id)
-    }
+    return this.abortable(task, signal)
   }
 
   /** 实际执行 Token 刷新（由 refreshToken 包裹在途去重后调用） */
-  private async doRefreshToken(account: ProxyAccount, signal?: AbortSignal): Promise<boolean> {
+  private async doRefreshToken(account: ProxyAccount): Promise<boolean> {
     console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}`)
 
     try {
       // 随机延迟 0-3 秒，避免多账号同时刷新被识别为批量操作
       const jitter = Math.floor(Math.random() * 3000)
-      if (jitter > 0) await this.waitForRetry(jitter, signal)
+      if (jitter > 0) await this.waitForRetry(jitter)
       
-      const result = await this.abortable(this.events.onTokenRefresh!(account), signal)
+      const result = await this.events.onTokenRefresh!(account)
+      const current = this.accountPool.getAccount(account.id)
+      if (!current || current.refreshToken !== account.refreshToken) return !!current && current.isAvailable !== false
       if (result.success && result.accessToken) {
         // 更新账号池中的 Token
         this.accountPool.updateAccount(account.id, {
+          isAvailable: true,
           accessToken: result.accessToken,
           refreshToken: result.refreshToken || account.refreshToken,
           expiresAt: result.expiresAt
         })
         // 通知外部更新
         this.events.onAccountUpdate?.({
-          ...account,
+          ...current,
           accessToken: result.accessToken,
           refreshToken: result.refreshToken || account.refreshToken,
           expiresAt: result.expiresAt
-        })
+        }, account.refreshToken)
         console.log(`[ProxyServer] Token refreshed for ${account.email || account.id}`)
         return true
       } else {
@@ -1187,7 +1217,6 @@ export class ProxyServer {
         return false
       }
     } catch (error) {
-      if (this.isAbortError(error, signal)) throw error
       console.error(`[ProxyServer] Token refresh error for ${account.email || account.id}:`, error)
       this.accountPool.markNeedsRefresh(account.id)
       return false
@@ -1205,118 +1234,51 @@ export class ProxyServer {
     return new Set(bindings)
   }
 
-  // 获取可用账号（包含 Token 刷新检查）
-  // P1-8 sessionHint：相同会话尽量复用同一账号（命中 prompt cache + 防风控）
-  // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
-  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
-    const allowedIds = this.getAllowedAccountIds(apiKeyId)
-    const groupMode = this.config.multiAccountSelectionMode === 'groups'
-    const allowedGroupIds = groupMode ? new Set(this.config.multiAccountGroupIds || []) : null
-    const isAllowed = (acc: ProxyAccount | null): boolean => {
-      if (!acc) return true
-      // API Key 白名单（apiKeyAccountBindings）
-      if (allowedIds && !allowedIds.has(acc.id)) return false
-      // 分组过滤（双保险：即便前端忘了重新同步账号池，这里也能拦住非选中分组的账号）
-      if (groupMode && allowedGroupIds) {
-        const gid = acc.groupId || '__ungrouped__'
-        if (!allowedGroupIds.has(gid)) return false
-      }
-      return true
-    }
+  private getAccountFilter(apiKeyId?: string): (account: ProxyAccount) => boolean {
+    const ids = this.getAllowedAccountIds(apiKeyId)
+    const groups = this.config.enableMultiAccount && this.config.multiAccountSelectionMode === 'groups'
+      ? new Set(this.config.multiAccountGroupIds || []) : undefined
+    return (account) => (!ids || ids.has(account.id)) && (!groups || groups.has(account.groupId || '__ungrouped__'))
+  }
+
+  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string, excluded = new Set<string>()): Promise<ProxyAccount | null> {
     this.throwIfAborted(signal)
-    // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
     if (this.accountPool.size === 0 && this.events.onPoolEmpty) {
-      console.log('[ProxyServer] Account pool empty, triggering lazy sync...')
-      await this.abortable(this.events.onPoolEmpty(), signal)
+      if (!this.poolSyncTask) this.poolSyncTask = this.events.onPoolEmpty().finally(() => { this.poolSyncTask = null })
+      await this.abortable(this.poolSyncTask, signal)
     }
-    this.throwIfAborted(signal)
-
-    // P1-8 会话粘性：优先复用已绑定的账号（同时受 API Key 绑定过滤）
-    if (this.config.sessionAffinityEnabled && sessionHint) {
-      const sticky = this.pickAccountWithAffinity(sessionHint)
-      if (sticky && isAllowed(sticky)) {
-        proxyLogger.debug('ProxyServer', `Session affinity hit: ${sessionHint.slice(0, 16)} → ${sticky.email || sticky.id.slice(0, 8)}`)
-        // 仍需检查 token 是否需要刷新
-        if (this.isTokenExpiringSoon(sticky)) {
-          const refreshed = await this.refreshToken(sticky, signal)
-          if (refreshed) {
-            return this.accountPool.getAccount(sticky.id) || sticky
-          }
-        } else {
-          return sticky
-        }
-      }
+    const allowed = this.getAccountFilter(apiKeyId)
+    if (!this.config.enableMultiAccount) {
+      const selected = this.accountPool.getAccount(this.config.selectedAccountIds[0])
+      if (selected && (!allowed(selected) || (!this.accountPool.isEligible(selected) && !this.config.autoSwitchOnQuotaExhausted))) return null
     }
-
-    let account: ProxyAccount | null
-
-    if (this.config.enableMultiAccount) {
-      account = this.accountPool.getNextAccount()
-      if (account && !isAllowed(account)) {
-        // 尝试找一个允许的账号（白名单 + 分组都已合并进 isAllowed）
-        const allAccounts = this.accountPool.getAllAccounts()
-        const exclude = new Set<string>()
-        for (const a of allAccounts) {
-          if (!isAllowed(a)) exclude.add(a.id)
+    let preferred = sessionHint ? this.pickAccountWithAffinity(sessionHint) : null
+    if (!this.config.enableMultiAccount) preferred = this.accountPool.getAccount(this.config.selectedAccountIds[0])
+    while (true) {
+      this.throwIfAborted(signal)
+      let account: ProxyAccount | null = null
+      if (preferred && !excluded.has(preferred.id) && allowed(preferred) && this.accountPool.isEligible(preferred)) account = preferred
+      preferred = null
+      account ??= this.accountPool.getNextAccount(excluded, allowed)
+      if (!account) return null
+      excluded.add(account.id)
+      if (this.isTokenExpiringSoon(account)) {
+        const refreshed = await this.refreshToken(account, signal)
+        if (!refreshed) {
+          if (!this.config.enableMultiAccount && !this.config.autoSwitchOnQuotaExhausted) return null
+          continue
         }
-        account = this.accountPool.getNextAccount(exclude)
+        account = this.accountPool.getAccount(account.id)
+        if (!account || !this.getAccountFilter(apiKeyId)(account) || !this.accountPool.isEligible(account)) continue
       }
-      if (!account) {
-        const status = this.accountPool.getQuotaStatus()
-        if (status.exhausted > 0 && status.available === 0) {
-          console.log(`[ProxyServer] All accounts quota exhausted (${status.exhausted}/${status.total}), no available accounts`)
-        }
+      if (!this.config.enableMultiAccount && this.config.selectedAccountIds[0] !== account.id) {
+        this.config.selectedAccountIds = [account.id]
+        this.events.onConfigChanged?.(this.config)
       }
-    } else {
-      // 禁用多账号轮询时，优先使用指定的账号
-      if (this.config.selectedAccountIds && this.config.selectedAccountIds.length > 0) {
-        // 使用指定的第一个账号
-        account = this.accountPool.getAccount(this.config.selectedAccountIds[0])
-        // 检查指定账号是否配额耗尽，若是则尝试自动切换
-        if (account && this.accountPool.isQuotaExhausted(account) && this.config.autoSwitchOnQuotaExhausted) {
-          const nextAccount = this.accountPool.getNextAvailableAccount(account.id)
-          if (nextAccount) {
-            console.log(`[ProxyServer] Selected account ${account.email || account.id} quota exhausted, auto-switching to ${nextAccount.email || nextAccount.id}`)
-            this.config.selectedAccountIds = [nextAccount.id]
-            this.events.onAccountUpdate?.(nextAccount)
-            account = nextAccount
-          }
-        }
-        if (!account) {
-          console.log(`[ProxyServer] Selected account ${this.config.selectedAccountIds[0]} not found, using first available`)
-          const allAccounts = this.accountPool.getAllAccounts()
-          account = allAccounts.length > 0 ? allAccounts[0] : null
-        }
-      } else {
-        // 没有指定账号，使用第一个可用账号
-        const allAccounts = this.accountPool.getAllAccounts()
-        account = allAccounts.length > 0 ? allAccounts[0] : null
-      }
+      this.syncKProxyDeviceId(account)
+      if (sessionHint) this.rememberAffinity(sessionHint, account.id)
+      return account
     }
-    
-    if (!account) return null
-
-    // 自动切换 K-Proxy 设备 ID（如果 K-Proxy 服务可用）
-    this.syncKProxyDeviceId(account)
-
-    // 检查是否需要刷新 Token
-    if (this.isTokenExpiringSoon(account)) {
-      const refreshed = await this.refreshToken(account, signal)
-      if (!refreshed) {
-        // 刷新失败，如果启用多账号才尝试获取下一个账号
-        if (this.config.enableMultiAccount) {
-          return this.accountPool.getNextAccount()
-        }
-        return null
-      }
-      // 返回更新后的账号
-      const refreshedAccount = this.accountPool.getAccount(account.id)
-      if (refreshedAccount && sessionHint) this.rememberAffinity(sessionHint, refreshedAccount.id)
-      return refreshedAccount
-    }
-
-    if (sessionHint) this.rememberAffinity(sessionHint, account.id)
-    return account
   }
 
   // 同步 K-Proxy 设备 ID（根据账号自动切换）
@@ -1348,39 +1310,35 @@ export class ProxyServer {
   // 带重试的 API 调用
   private async callWithRetry<T>(
     account: ProxyAccount,
-    apiCall: (acc: ProxyAccount, endpointIndex: number) => Promise<T>,
-    _path: string,
-    signal?: AbortSignal
+    apiCall: (acc: ProxyAccount) => Promise<T>,
+    path: string,
+    signal?: AbortSignal,
+    apiKeyId?: string,
+    canRetry: () => boolean = () => true
   ): Promise<{ result: T; account: ProxyAccount }> {
-    const maxRetries = this.config.maxRetries || 3
-    const retryDelay = this.config.retryDelayMs || 1000
+    const maxRetries = Math.max(1, this.config.maxRetries ?? 3)
+    const retryDelay = this.config.retryDelayMs ?? 1000
     let lastError: Error | null = null
     let currentAccount = account
-    let endpointIndex = 0
     // 本次请求累计已尝试的账号 ID，避免重试时循环命中已经失败过的账号
     const triedIds = new Set<string>([account.id])
-    /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
-    const switchToNextAccount = (): ProxyAccount | null => {
-      if (this.config.enableMultiAccount) {
-        return this.accountPool.getNextAccount(triedIds)
-      }
-      if (this.config.autoSwitchOnQuotaExhausted) {
-        return this.accountPool.getNextAvailableAccount(triedIds)
-      }
-      return null
+    const switchToNextAccount = async (): Promise<ProxyAccount | null> => {
+      if (!this.config.enableMultiAccount && !this.config.autoSwitchOnQuotaExhausted) return null
+      return this.getAvailableAccount(signal, undefined, apiKeyId, new Set(triedIds))
     }
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       this.throwIfAborted(signal)
       try {
-        const result = await apiCall(currentAccount, endpointIndex)
+        const result = await apiCall(currentAccount)
         return { result, account: currentAccount }
       } catch (error) {
         if (this.isAbortError(error, signal)) throw error
-        lastError = error as Error
+        lastError = Object.assign(error as Error, { accountId: currentAccount.id })
+        if (!canRetry()) break
         const errMsg = lastError.message || ''
 
-        console.log(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxRetries}): ${errMsg}`)
+        console.log(`[ProxyServer] API call failed for ${path} (attempt ${attempt + 1}/${maxRetries}): ${errMsg}`)
 
         // 优先检测账号被长期封禁（不是 token 问题，刷新也没用）
         // 特征：HTTP 403 + reason: "TEMPORARILY_SUSPENDED" 或 AccountSuspendedException / 423
@@ -1413,14 +1371,15 @@ export class ProxyServer {
             })
           }
           console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
+          if (attempt + 1 >= maxRetries) break
           // 切到下个可用账号（跳过被 suspended 的 + 本请求已试过的）
-          const nextAccount = switchToNextAccount()
+          const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
             if (!this.config.enableMultiAccount) {
               this.config.selectedAccountIds = [nextAccount.id]
-              this.events.onAccountUpdate?.(nextAccount)
+              this.events.onConfigChanged?.(this.config)
             }
             continue
           }
@@ -1430,6 +1389,7 @@ export class ProxyServer {
 
         // 401/403: 尝试刷新 Token
         if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
+          if (attempt + 1 >= maxRetries) break
           console.log('[ProxyServer] Auth error, attempting token refresh')
           const refreshed = await this.refreshToken(currentAccount, signal)
           if (refreshed) {
@@ -1437,7 +1397,7 @@ export class ProxyServer {
             continue
           }
           // 刷新失败 → 切到没试过的下个账号
-          const nextAccount = switchToNextAccount()
+          const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
@@ -1449,29 +1409,21 @@ export class ProxyServer {
         if (errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')) {
           console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
           this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
-          endpointIndex = (endpointIndex + 1) % 2 // 切换端点
-          if (endpointIndex === 0) {
-            // 已尝试所有端点，切换到没试过的下个账号
-            const nextAccount = switchToNextAccount()
-            if (nextAccount && !triedIds.has(nextAccount.id)) {
-              console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
-              currentAccount = nextAccount
-              triedIds.add(nextAccount.id)
-              if (!this.config.enableMultiAccount) {
-                this.config.selectedAccountIds = [nextAccount.id]
-                this.events.onAccountUpdate?.(nextAccount)
-              }
-            }
-          }
+          if (attempt + 1 >= maxRetries) break
+          const nextAccount = await switchToNextAccount()
+          if (!nextAccount) break
+          currentAccount = nextAccount
+          triedIds.add(nextAccount.id)
           continue
         }
 
         // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
         if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')) {
+          if (attempt + 1 >= maxRetries) break
           console.log('[ProxyServer] Server error, retrying')
           // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
           if (attempt > 0) {
-            const nextAccount = switchToNextAccount()
+            const nextAccount = await switchToNextAccount()
             if (nextAccount && !triedIds.has(nextAccount.id)) {
               console.log(`[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
               currentAccount = nextAccount
@@ -1783,10 +1735,43 @@ export class ProxyServer {
     return requestedModel
   }
 
+  private acquireInference(signal: AbortSignal): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      const limit = (): number => Math.max(1, Math.floor(this.config.maxConcurrent) || 10)
+      const abort = (): void => {
+        this.waitingInference.delete(attempt)
+        signal.removeEventListener('abort', abort)
+        reject(this.getAbortError(signal))
+      }
+      const attempt = (): void => {
+        if (signal.aborted) { abort(); return }
+        if (this.activeInference >= limit()) return
+        this.waitingInference.delete(attempt)
+        signal.removeEventListener('abort', abort)
+        this.activeInference++
+        let released = false
+        resolve(() => {
+          if (released) return
+          released = true
+          this.activeInference--
+          for (const waiting of this.waitingInference) waiting()
+        })
+      }
+      if (this.waitingInference.size >= limit() * 10) {
+        reject(new Error('Proxy request queue is full'))
+        return
+      }
+      signal.addEventListener('abort', abort, { once: true })
+      this.waitingInference.add(attempt)
+      attempt()
+    })
+  }
+
   // 处理请求
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const path = req.url || '/'
     const method = req.method || 'GET'
+    let releaseInference: (() => void) | undefined
     const clientIP = this.getClientIP(req)
     const controller = new AbortController()
     const abortRequest = () => {
@@ -1856,6 +1841,14 @@ export class ProxyServer {
 
       // 路由（移除查询参数）
       const pathWithoutQuery = path.split('?')[0]
+      if (method === 'POST' && /(?:chat\/completions|responses|messages|:(?:streamGenerateContent|generateContent))$/.test(pathWithoutQuery)) {
+        try { releaseInference = await this.acquireInference(controller.signal) }
+        catch (error) {
+          if (controller.signal.aborted) throw error
+          this.sendError(res, 503, 'Proxy is busy; retry later', this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+          return
+        }
+      }
       
       if (pathWithoutQuery === '/v1/models' || pathWithoutQuery === '/models') {
         await this.handleModels(res, controller.signal)
@@ -1909,6 +1902,7 @@ export class ProxyServer {
       this.sendError(res, 500, 'Internal server error', this.isAnthropicPath(path) ? 'anthropic' : 'openai')
       this.events.onError?.(error as Error)
     } finally {
+      releaseInference?.()
       req.off('aborted', abortRequest)
       res.off('close', abortRequest)
       this.activeRequests.delete(controller)
@@ -1957,7 +1951,6 @@ export class ProxyServer {
       this.handleAdminLogs(res)
     } else if (path === '/admin/cache/clear' && method === 'POST') {
       // 清除内存缓存（conversationId 映射、模型缓存、prompt cache）
-      const { clearAllCaches } = require('./kiroApi')
       const cleared = clearAllCaches()
       const promptCacheCleared = promptCacheTracker.clear()
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -2096,13 +2089,35 @@ export class ProxyServer {
     return 'api_error'
   }
 
+  private recordUsage(account: ProxyAccount, usage: KiroUsage, path: string, model: string, startTime: number, apiKey?: ApiKey, cache?: Partial<CacheUsage>): void {
+    this.recordRequestSuccess()
+    this.stats.totalTokens += usage.inputTokens + usage.outputTokens
+    this.stats.inputTokens += usage.inputTokens
+    this.stats.outputTokens += usage.outputTokens
+    this.stats.cacheReadTokens += usage.cacheReadTokens ?? cache?.cacheReadInputTokens ?? 0
+    this.stats.cacheWriteTokens += usage.cacheWriteTokens ?? cache?.cacheCreationInputTokens ?? 0
+    this.stats.reasoningTokens += usage.reasoningTokens || 0
+    this.stats.totalCredits += usage.credits || 0
+    this.events.onCreditsUpdate?.(this.stats.totalCredits)
+    this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
+    this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+    const responseTime = Date.now() - startTime
+    this.events.onResponse?.({ path, model, status: 200, tokens: usage.inputTokens + usage.outputTokens,
+      inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens ?? cache?.cacheReadInputTokens,
+      cacheWriteTokens: usage.cacheWriteTokens ?? cache?.cacheCreationInputTokens,
+      reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime })
+    this.recordRequest({ path, model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime, success: true })
+    if (apiKey) this.recordApiKeyUsage(apiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, path)
+  }
+
   private buildClaudeUsage(
     usage: { inputTokens: number; outputTokens: number; cacheWriteTokens?: number; cacheReadTokens?: number },
     simulatedCache?: { cacheCreationInputTokens: number; cacheReadInputTokens: number }
   ): { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } {
     // 优先使用 Kiro 后端返回的真实 cache tokens，否则用模拟器的值
-    const cacheWrite = usage.cacheWriteTokens || simulatedCache?.cacheCreationInputTokens || 0
-    const cacheRead = usage.cacheReadTokens || simulatedCache?.cacheReadInputTokens || 0
+    const cacheWrite = usage.cacheWriteTokens ?? simulatedCache?.cacheCreationInputTokens ?? 0
+    const cacheRead = usage.cacheReadTokens ?? simulatedCache?.cacheReadInputTokens ?? 0
     // Kiro 的 inputTokens 是全量（含缓存），Anthropic API 规范中 input_tokens 不含缓存部分
     // 需要扣除 cache tokens 避免客户端双重计费
     const adjustedInput = Math.max(0, usage.inputTokens - cacheWrite - cacheRead)
@@ -2235,9 +2250,10 @@ export class ProxyServer {
     const startTime = Date.now()
     this.recordNewRequest()
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    const account = await this.getAvailableAccount(signal, undefined, matchedApiKey?.id)
     this.throwIfAborted(signal)
     if (!account) {
+      this.recordRequestFailed()
       this.sendError(res, 503, 'No available accounts')
       return
     }
@@ -2250,7 +2266,7 @@ export class ProxyServer {
         // SSE 流式
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
         return new Promise<void>((resolve) => {
-          callKiroApiStream(
+          this.runKiroStream(
             account as ProxyAccount,
             kiroPayload,
             (text) => {
@@ -2261,7 +2277,7 @@ export class ProxyServer {
               }
               return this.waitForDrain(res)
             },
-            (usage) => {
+            (usage, usedAccount) => {
               if (signal?.aborted || this.isResponseClosed(res)) {
                 resolve()
                 return
@@ -2269,12 +2285,8 @@ export class ProxyServer {
               const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
               res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
               res.end()
-              this.recordRequestSuccess()
-              this.stats.totalTokens += usage.inputTokens + usage.outputTokens
-              this.stats.inputTokens += usage.inputTokens
-              this.stats.outputTokens += usage.outputTokens
-              this.stats.totalCredits += usage.credits || 0
-              this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+              this.recordUsage(usedAccount, usage, '/v1beta', modelId, startTime, matchedApiKey)
+
               resolve()
             },
             (error) => {
@@ -2288,7 +2300,8 @@ export class ProxyServer {
               resolve()
             },
             signal,
-            this.config.preferredEndpoint
+            this.config.preferredEndpoint,
+        matchedApiKey?.id
           ).catch(error => {
             if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
               res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -2300,10 +2313,10 @@ export class ProxyServer {
         })
       } else {
         // 非流式
-        const result = await callKiroApi(account as ProxyAccount, kiroPayload, signal)
+        const { result, account: usedAccount } = await this.callWithRetry(account, (acc) => callKiroApi(acc, kiroPayload, signal, this.config.preferredEndpoint), '/v1beta', signal, matchedApiKey?.id)
         this.throwIfResponseClosed(res, signal)
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
+        this.recordUsage(usedAccount, result.usage, '/v1beta', modelId, startTime, matchedApiKey)
+
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({
           candidates: [{ content: { parts: [{ text: result.content }], role: 'model' }, finishReason: 'STOP' }],
@@ -2410,7 +2423,7 @@ export class ProxyServer {
       const account = this.accountPool.getNextAccount()
       if (account) {
         try {
-          kiroModels = await fetchKiroModels(account, signal)
+          kiroModels = await getCachedKiroModels(account, signal)
           if (kiroModels.length > 0) {
             this.modelCache = { models: kiroModels, timestamp: now }
             // 同步到 kiroApi 的 ctx cache, 供 token 裁剪逻辑使用
@@ -2566,37 +2579,28 @@ export class ProxyServer {
       }
 
       if (request.stream) {
-        // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, matchedApiKey, toolNameRegistry, signal)
+        // 流式响应仅在尚未输出内容时允许重试
+        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, matchedApiKey, toolNameRegistry, signal)
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, thinkingConfig)
-            return callKiroApi(acc, retryPayload, signal)
+            const retryPayload = kiroPayload
+            return callKiroApi(acc, retryPayload, signal, this.config.preferredEndpoint)
           },
           '/v1/chat/completions',
-          signal
+          signal,
+          matchedApiKey?.id
         )
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
         this.throwIfResponseClosed(res, signal)
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-        this.stats.inputTokens += result.usage.inputTokens
-        this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordUsage(usedAccount, result.usage, '/v1/chat/completions', request.model, startTime, matchedApiKey)
 
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
-        const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/chat/completions', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
-        this.recordRequest({ path: '/v1/chat/completions', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
-        // 记录 API Key 用量
-        if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/chat/completions')
-        }
+
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/chat/completions', request.model, startTime, signal)
@@ -2656,113 +2660,137 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
+      if (this.steeringPrompt) processedRequest.messages = this.injectSteeringOpenAI(processedRequest.messages)
+      const payload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
       if (processedRequest.stream) {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive'
-        })
-        const responseId = `resp_${uuidv4()}`
-        res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), model: chatRequest.model, output: [] } })}\n\n`)
-        const { result, account: usedAccount } = await this.callWithRetry(
-          account,
-          async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
-            return callKiroApi(acc, retryPayload, signal)
-          },
-          '/v1/responses',
-          signal
-        )
-        const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
-        this.throwIfResponseClosed(res, signal)
-        const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
-        const streamedResponse = { ...response, id: responseId }
-        streamedResponse.output.forEach((item, outputIndex) => {
-          this.throwIfResponseClosed(res, signal)
-          res.write(`event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', output_index: outputIndex, item })}\n\n`)
-          if (item.type === 'message') {
-            item.content.forEach((part, contentIndex) => {
-              this.throwIfResponseClosed(res, signal)
-              res.write(`event: response.content_part.added\ndata: ${JSON.stringify({ type: 'response.content_part.added', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part: { type: part.type, text: '' } })}\n\n`)
-              if (part.text) {
-                res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: item.id, output_index: outputIndex, content_index: contentIndex, delta: part.text })}\n\n`)
-              }
-              res.write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, text: part.text })}\n\n`)
-              res.write(`event: response.content_part.done\ndata: ${JSON.stringify({ type: 'response.content_part.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part })}\n\n`)
-            })
-          } else {
-            if (item.arguments) {
-              res.write(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: item.arguments })}\n\n`)
-            }
-            res.write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: item.arguments })}\n\n`)
-          }
-          this.throwIfResponseClosed(res, signal)
-          res.write(`event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: outputIndex, item })}\n\n`)
-        })
-        this.throwIfResponseClosed(res, signal)
-        res.write(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: streamedResponse })}\n\n`)
-        res.end()
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-        this.stats.inputTokens += result.usage.inputTokens
-        this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
-        const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
-        this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
-        if (matchedApiKey) {
-          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
-        }
+        await this.handleResponsesStream(res, account, payload, chatRequest.model, startTime, matchedApiKey, toolNameRegistry, responseRequest.previous_response_id, signal)
         return
       }
 
       const { result, account: usedAccount } = await this.callWithRetry(
         account,
         async (acc) => {
-          const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
-          return callKiroApi(acc, retryPayload, signal)
+          const retryPayload = payload
+          return callKiroApi(acc, retryPayload, signal, this.config.preferredEndpoint)
         },
         '/v1/responses',
-        signal
+        signal,
+        matchedApiKey?.id
       )
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
       this.throwIfResponseClosed(res, signal)
       const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
 
-      this.recordRequestSuccess()
-      this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-      this.stats.inputTokens += result.usage.inputTokens
-      this.stats.outputTokens += result.usage.outputTokens
-      this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+      this.recordUsage(usedAccount, result.usage, '/v1/responses', chatRequest.model, startTime, matchedApiKey)
 
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(response))
-      const respTime = Date.now() - startTime
-      this.events.onResponse?.({ path: '/v1/responses', model: chatRequest.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
-      this.recordRequest({ path: '/v1/responses', model: chatRequest.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
-      if (matchedApiKey) {
-        this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
-      }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/responses', chatRequest.model, startTime, signal)
+    }
+  }
+
+  private async handleResponsesStream(
+    res: http.ServerResponse, account: ProxyAccount, payload: Parameters<typeof callKiroApiStream>[1],
+    model: string, startTime: number, apiKey: ApiKey | undefined, registry: ToolNameRegistry,
+    previousResponseId?: string, signal?: AbortSignal
+  ): Promise<void> {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' })
+    const id = `resp_${uuidv4()}`
+    const createdAt = Math.floor(Date.now() / 1000)
+    const output: OpenAIResponseOutputItem[] = []
+    let message: Extract<OpenAIResponseOutputItem, { type: 'message' }> | undefined
+    let sequence = 0
+    const send = (type: string, data: Record<string, unknown>): void => {
+      this.throwIfResponseClosed(res, signal)
+      res.write(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequence++, ...data })}\n\n`)
+    }
+    send('response.created', { response: { id, object: 'response', created_at: createdAt, model, output: [] } })
+    const ensureMessage = (): NonNullable<typeof message> => {
+      if (!message) {
+        message = { type: 'message', id: `msg_${uuidv4()}`, role: 'assistant', content: [{ type: 'output_text', text: '' }] }
+        output.push(message)
+        const output_index = output.indexOf(message)
+        send('response.output_item.added', { output_index, item: message })
+        send('response.content_part.added', { item_id: message.id, output_index, content_index: 0, part: { type: 'output_text', text: '' } })
+      }
+      return message
+    }
+    await this.runKiroStream(account, payload, (text, toolUse, thinking) => {
+      if (text && !thinking) {
+        const item = ensureMessage()
+        item.content[0].text += text
+        send('response.output_text.delta', { item_id: item.id, output_index: output.indexOf(item), content_index: 0, delta: text })
+      }
+      if (toolUse) {
+        const item: Extract<OpenAIResponseOutputItem, { type: 'function_call' }> = {
+          type: 'function_call', id: `fc_${uuidv4()}`, call_id: toolUse.toolUseId,
+          name: registry.toClientName(toolUse.name), arguments: JSON.stringify(toolUse.input)
+        }
+        const output_index = output.length
+        output.push(item)
+        send('response.output_item.added', { output_index, item: { ...item, arguments: '' } })
+        send('response.function_call_arguments.delta', { item_id: item.id, output_index, delta: item.arguments })
+      }
+      return this.waitForDrain(res)
+    }, async (usage, usedAccount) => {
+      if (!output.length) ensureMessage()
+      for (const [output_index, item] of output.entries()) {
+        if (item.type === 'message') {
+          send('response.output_text.done', { item_id: item.id, output_index, content_index: 0, text: item.content[0].text })
+          send('response.content_part.done', { item_id: item.id, output_index, content_index: 0, part: item.content[0] })
+        } else send('response.function_call_arguments.done', { item_id: item.id, output_index, arguments: item.arguments })
+        send('response.output_item.done', { output_index, item })
+        await this.waitForDrain(res)
+      }
+      send('response.completed', { response: {
+        id, object: 'response', created_at: createdAt, model, output,
+        ...(previousResponseId !== undefined ? { previous_response_id: previousResponseId } : {}),
+        usage: { input_tokens: usage.inputTokens, output_tokens: usage.outputTokens, total_tokens: usage.inputTokens + usage.outputTokens,
+          ...(usage.cacheReadTokens !== undefined ? { input_tokens_details: { cached_tokens: usage.cacheReadTokens } } : {}),
+          ...(usage.reasoningTokens !== undefined ? { output_tokens_details: { reasoning_tokens: usage.reasoningTokens } } : {}) }
+      } })
+      res.end()
+      this.recordUsage(usedAccount, usage, '/v1/responses', model, startTime, apiKey)
+    }, (error) => this.handleApiError(res, account, error, '/v1/responses', model, startTime, signal), signal, this.config.preferredEndpoint, apiKey?.id)
+  }
+
+  private async runKiroStream(
+    account: ProxyAccount,
+    payload: Parameters<typeof callKiroApiStream>[1],
+    onChunk: Parameters<typeof callKiroApiStream>[2],
+    onComplete: (usage: KiroUsage, account: ProxyAccount) => void | Promise<void>,
+    onError: (error: Error) => void,
+    signal?: AbortSignal,
+    preferredEndpoint?: ProxyConfig['preferredEndpoint'],
+    apiKeyId?: string
+  ): Promise<void> {
+    let emitted = false
+    try {
+      const { result, account: usedAccount } = await this.callWithRetry(account, (candidate) => new Promise<KiroUsage>((resolve, reject) => {
+        callKiroApiStream(candidate, payload, (...args) => {
+          emitted = true
+          return onChunk(...args)
+        }, resolve, reject, signal, preferredEndpoint).catch(reject)
+      }), '/stream', signal, apiKeyId, () => !emitted)
+      await onComplete(result, usedAccount)
+    } catch (error) {
+      onError(error as Error)
     }
   }
 
   // 处理 OpenAI 流式响应
   private async handleOpenAIStream(
     res: http.ServerResponse,
-    account: { id: string; accessToken: string; profileArn?: string },
+    account: ProxyAccount,
     kiroPayload: ReturnType<typeof openaiToKiro>,
     model: string,
     startTime: number,
-    currentRound: number = 0,
-    streamId?: string,
-    headersSent: boolean = false,
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal
   ): Promise<void> {
-    if (!headersSent) {
+    {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -2770,19 +2798,18 @@ export class ProxyServer {
       })
     }
 
-    const id = streamId || `chatcmpl-${uuidv4()}`
+    const id = `chatcmpl-${uuidv4()}`
     let toolCallIndex = 0
-    const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> = new Map()
-    let collectedContent = ''
+    let hasToolCalls = false
     // 发送初始 chunk（仅首轮）
-    if (currentRound === 0) {
+    {
       const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
       res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
     }
 
     return new Promise((resolve) => {
-      callKiroApiStream(
-        account as any,
+      this.runKiroStream(
+        account,
         kiroPayload,
         (text, toolUse, isThinking) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
@@ -2793,7 +2820,6 @@ export class ProxyServer {
               res.write(`data: ${JSON.stringify(chunk)}\n\n`)
             } else {
               // 普通文本内容
-              collectedContent += text
               const chunk = createOpenaiStreamChunk(id, model, { content: text })
               res.write(`data: ${JSON.stringify(chunk)}\n\n`)
             }
@@ -2801,11 +2827,7 @@ export class ProxyServer {
           if (toolUse) {
             const idx = toolCallIndex++
             const restoredToolUse = toolNameRegistry.restoreToolUse(toolUse)
-            pendingToolCalls.set(toolUse.toolUseId, {
-              index: idx,
-              name: toolUse.name,
-              arguments: JSON.stringify(toolUse.input)
-            })
+            hasToolCalls = true
             const toolChunk = createOpenaiStreamChunk(id, model, {
               tool_calls: [{
                 index: idx,
@@ -2821,33 +2843,16 @@ export class ProxyServer {
           }
           return this.waitForDrain(res)
         },
-        async (usage) => {
+        async (usage, usedAccount) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
             resolve()
             return
           }
           
-          this.recordRequestSuccess()
-          this.stats.totalTokens += usage.inputTokens + usage.outputTokens
-          this.stats.inputTokens += usage.inputTokens
-          this.stats.outputTokens += usage.outputTokens
-          this.stats.cacheReadTokens += usage.cacheReadTokens || 0
-          this.stats.cacheWriteTokens += usage.cacheWriteTokens || 0
-          this.stats.reasoningTokens += usage.reasoningTokens || 0
-          this.stats.totalCredits += usage.credits || 0
-          this.events.onCreditsUpdate?.(this.stats.totalCredits)
-          this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
-          const oaiRespTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime })
-          this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
-          // 记录 API Key 用量
-          if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions')
-          }
+          this.recordUsage(usedAccount, usage, '/v1/chat/completions', model, startTime, matchedApiKey)
+
 
           // 发送结束 chunk（包含完整 usage 信息）
-          const hasToolCalls = pendingToolCalls.size > 0
           const finishReason = hasToolCalls ? 'tool_calls' : 'stop'
           const usageInfo: {
             prompt_tokens: number
@@ -2884,14 +2889,15 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          const errStatusCode = getKiroErrorStatus(error)
+          this.accountPool.recordError((error as Error & { accountId?: string }).accountId || account.id, errStatusCode ? classifyError(errStatusCode) : ErrorType.RECOVERABLE, errStatusCode)
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
         },
         signal,
-        this.config.preferredEndpoint
+        this.config.preferredEndpoint,
+        matchedApiKey?.id
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -2970,7 +2976,7 @@ export class ProxyServer {
       const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, claudeThinkingConfig)
 
       // 构建 prompt cache profile（用于模拟缓存 usage）
-      const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3))
+      const estimatedInputTokens = (): number => Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3))
       const cacheProfile = promptCacheTracker.buildClaudeProfile(
         processedRequest.system,
         processedRequest.messages,
@@ -3004,41 +3010,33 @@ export class ProxyServer {
       }
 
       if (request.stream) {
-        // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
-          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined)
+        // 流式响应仅在尚未输出内容时允许重试
+        await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, matchedApiKey, toolNameRegistry, signal,
+          cacheProfile || undefined)
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)
-            return callKiroApi(acc, retryPayload, signal)
+            const retryPayload = kiroPayload
+            return callKiroApi(acc, retryPayload, signal, this.config.preferredEndpoint)
           },
           '/v1/messages',
-          signal
+          signal,
+          matchedApiKey?.id
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
-        // 用缓存模拟的 usage 覆盖（如果有 cache profile）
-        if (cacheProfile && cacheUsage) {
-          if (cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
-          if (cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
-          promptCacheTracker.update(usedAccount.id, cacheProfile)
-        }
+        const successfulCacheUsage = promptCacheTracker.compute(usedAccount.id, cacheProfile)
+        response.usage = { ...response.usage, ...this.buildClaudeUsage(result.usage, successfulCacheUsage) }
+        if (cacheProfile) promptCacheTracker.update(usedAccount.id, cacheProfile)
 
         this.throwIfResponseClosed(res, signal)
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
-        this.stats.inputTokens += result.usage.inputTokens
-        this.stats.outputTokens += result.usage.outputTokens
-        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        this.recordUsage(usedAccount, result.usage, '/v1/messages', request.model, startTime, matchedApiKey, successfulCacheUsage)
 
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(response))
-        const respTime = Date.now() - startTime
-        this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
-        this.recordRequest({ path: '/v1/messages', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
+
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime, signal)
@@ -3048,20 +3046,16 @@ export class ProxyServer {
   // 处理 Claude 流式响应
   private async handleClaudeStream(
     res: http.ServerResponse,
-    account: { id: string; accessToken: string; profileArn?: string },
+    account: ProxyAccount,
     kiroPayload: ReturnType<typeof claudeToKiro>,
     model: string,
     startTime: number,
-    currentRound: number = 0,
-    msgId?: string,
-    headersSent: boolean = false,
-    contentBlockIndex: number = 0,
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal,
-    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
+    cacheProfile?: CacheProfile
   ): Promise<void> {
-    if (!headersSent) {
+    {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -3069,13 +3063,12 @@ export class ProxyServer {
       })
     }
 
-    const id = msgId || `msg_${uuidv4()}`
-    let currentBlockIndex = contentBlockIndex
+    const id = `msg_${uuidv4()}`
+    let currentBlockIndex = 0
     let hasStartedTextBlock = false
     let hasStartedThinkingBlock = false
     let pendingThinkingSignature: string | undefined
-    let collectedContent = ''
-    const pendingToolCalls: Map<string, { name: string; input: Record<string, unknown> }> = new Map()
+    let hasToolCalls = false
 
     const flushThinkingSignature = () => {
       if (!pendingThinkingSignature) return
@@ -3091,7 +3084,7 @@ export class ProxyServer {
     const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3))
     
     // 发送 message_start（仅首轮）
-    if (currentRound === 0) {
+    {
       const messageStart = createClaudeStreamEvent('message_start', {
         message: {
           id,
@@ -3108,8 +3101,8 @@ export class ProxyServer {
     }
 
     return new Promise((resolve) => {
-      callKiroApiStream(
-        account as any,
+      this.runKiroStream(
+        account,
         kiroPayload,
         (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
@@ -3172,7 +3165,6 @@ export class ProxyServer {
                 currentBlockIndex++
                 hasStartedThinkingBlock = false
               }
-              collectedContent += text
               if (!hasStartedTextBlock) {
                 const blockStart = createClaudeStreamEvent('content_block_start', {
                   index: currentBlockIndex,
@@ -3215,8 +3207,7 @@ export class ProxyServer {
               hasStartedTextBlock = false
             }
             // 记录工具调用
-            pendingToolCalls.set(toolUse.toolUseId, { name: toolUse.name, input: toolUse.input })
-            // 开始工具块
+            hasToolCalls = true
             const toolBlockStart = createClaudeStreamEvent('content_block_start', {
               index: currentBlockIndex,
               content_block: { type: 'tool_use', id: toolUse.toolUseId, name: restoredToolUse.name, input: {} }
@@ -3225,7 +3216,7 @@ export class ProxyServer {
             // 发送工具输入
             const toolDelta = createClaudeStreamEvent('content_block_delta', {
               index: currentBlockIndex,
-              delta: { type: 'input_json_delta', partial_json: JSON.stringify(toolUse.input) } as any
+              delta: { type: 'input_json_delta', partial_json: JSON.stringify(toolUse.input) }
             })
             res.write(`event: content_block_delta\ndata: ${JSON.stringify(toolDelta)}\n\n`)
             // 结束工具块
@@ -3235,7 +3226,7 @@ export class ProxyServer {
           }
           return this.waitForDrain(res)
         },
-        async (usage) => {
+        async (usage, usedAccount) => {
           if (signal?.aborted || this.isResponseClosed(res)) {
             resolve()
             return
@@ -3255,35 +3246,19 @@ export class ProxyServer {
             currentBlockIndex++
           }
 
-          this.recordRequestSuccess()
-          this.stats.totalTokens += usage.inputTokens + usage.outputTokens
-          this.stats.inputTokens += usage.inputTokens
-          this.stats.outputTokens += usage.outputTokens
-          this.stats.totalCredits += usage.credits || 0
-          this.events.onCreditsUpdate?.(this.stats.totalCredits)
-          this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
-          this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
-          this.stats.cacheReadTokens += usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens || 0
-          this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
-          this.stats.reasoningTokens += usage.reasoningTokens || 0
-          const respTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
-          this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
-          // 记录 API Key 用量
-          if (matchedApiKey) {
-            this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages')
-          }
+          const successfulCacheUsage = promptCacheTracker.compute(usedAccount.id, cacheProfile || null)
+          this.recordUsage(usedAccount, usage, '/v1/messages', model, startTime, matchedApiKey, successfulCacheUsage)
+
 
           // 成功后更新 prompt cache tracker
-          if (simulatedCacheUsage?.cacheProfile && simulatedCacheUsage?.accountId) {
-            promptCacheTracker.update(simulatedCacheUsage.accountId, simulatedCacheUsage.cacheProfile as any)
+          if (cacheProfile) {
+            promptCacheTracker.update(usedAccount.id, cacheProfile)
           }
           // 发送 message_delta（包含完整 usage 信息）
-          const hasToolCalls = pendingToolCalls.size > 0
           const stopReason = hasToolCalls ? 'tool_use' : 'end_turn'
           const messageDelta = createClaudeStreamEvent('message_delta', {
-            delta: { stop_reason: stopReason, stop_sequence: null } as any,
-            usage: this.buildClaudeUsage(usage, simulatedCacheUsage)
+            delta: { stop_reason: stopReason, stop_sequence: null },
+            usage: this.buildClaudeUsage(usage, successfulCacheUsage)
           })
           res.write(`event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`)
           // 发送 message_stop
@@ -3305,14 +3280,15 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          const errStatusCode2 = getKiroErrorStatus(error)
+          this.accountPool.recordError((error as Error & { accountId?: string }).accountId || account.id, errStatusCode2 ? classifyError(errStatusCode2) : ErrorType.RECOVERABLE, errStatusCode2)
           this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
         },
         signal,
-        this.config.preferredEndpoint
+        this.config.preferredEndpoint,
+        matchedApiKey?.id
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           const errorEvent = createClaudeStreamEvent('error', {
@@ -3331,8 +3307,9 @@ export class ProxyServer {
   private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
-    const errCode = error.message.match(/(\d{3})/)?.[1]
-    const parsedCode = errCode ? parseInt(errCode) : 500
+    const failedId = (error as Error & { accountId?: string }).accountId
+    if (failedId) account = { id: failedId }
+    const parsedCode = getKiroErrorStatus(error) || 500
     const errorType = classifyError(parsedCode)
     const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
 
@@ -3516,7 +3493,7 @@ export class ProxyServer {
     if (entry) {
       const account = this.accountPool.getAccount(entry.accountId)
       // 校验账号仍可用且未被封禁
-      if (account && !this.accountPool.isSuspended(account) && account.isAvailable !== false) {
+      if (account && this.accountPool.isEligible(account) && (!account.cooldownUntil || account.cooldownUntil <= Date.now())) {
         entry.lastAt = Date.now()
         return account
       }

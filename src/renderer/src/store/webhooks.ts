@@ -1,3 +1,4 @@
+import { isRecord } from '../../../shared/kiroSettings'
 import { create } from 'zustand'
 
 /**
@@ -7,7 +8,8 @@ import { create } from 'zustand'
  * 内置常见 IM 的消息模板：钉钉 / 企微 / Telegram / Discord / 自定义 JSON。
  */
 
-export type WebhookKind = 'dingtalk' | 'wechat-work' | 'telegram' | 'discord' | 'feishu' | 'custom'
+import type { WebhookKind } from '../../../shared/webhooks'
+export type { WebhookKind } from '../../../shared/webhooks'
 
 export interface WebhookEntry {
   id: string
@@ -25,13 +27,13 @@ export interface WebhookEntry {
 }
 
 export type WebhookEvent =
-  | 'batch-completed'      // 批量任务完成
-  | 'batch-error'          // 批量任务严重错误
-  | 'risk-warning'         // 风控警告触发
-  | 'account-banned'       // 账号被封禁
-  | 'register-success'     // 单账号注册成功
-  | 'register-failed'      // 单账号注册失败
-  | 'token-expired'        // Token 过期/刷新失败
+  | 'batch-completed' // 批量任务完成
+  | 'batch-error' // 批量任务严重错误
+  | 'risk-warning' // 风控警告触发
+  | 'account-banned' // 账号被封禁
+  | 'register-success' // 单账号注册成功
+  | 'register-failed' // 单账号注册失败
+  | 'token-expired' // Token 过期/刷新失败
 
 export const ALL_WEBHOOK_EVENTS: { value: WebhookEvent; label: string; labelEn: string }[] = [
   { value: 'batch-completed', label: '批量任务完成', labelEn: 'Batch completed' },
@@ -51,12 +53,15 @@ export interface WebhookMessage {
   fields?: Record<string, string | number>
 }
 
+export type WebhookInput = Omit<WebhookEntry, 'id' | 'createdAt'>
+
 interface WebhooksState {
   webhooks: Map<string, WebhookEntry>
 }
 
 interface WebhooksActions {
-  addWebhook: (input: Omit<WebhookEntry, 'id' | 'createdAt'>) => string
+  addWebhook: (input: WebhookInput) => string
+  importWebhooks: (entries: WebhookInput[]) => { added: number; skipped: number }
   updateWebhook: (id: string, updates: Partial<WebhookEntry>) => void
   removeWebhook: (id: string) => void
   toggleWebhook: (id: string) => void
@@ -92,7 +97,39 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
     return id
   },
 
+  importWebhooks: (inputs) => {
+    const next = new Map(get().webhooks)
+    const keys = new Set(Array.from(next.values(), webhookIdentity))
+    let added = 0
+    for (const input of inputs) {
+      const entry = parseWebhookInput(input)
+      const key = webhookIdentity(entry)
+      if (keys.has(key)) continue
+      keys.add(key)
+      const id = crypto.randomUUID()
+      next.set(id, { ...entry, id, createdAt: Date.now() })
+      added++
+    }
+    if (added) {
+      // Persist before publishing; a quota error must not be reported as a successful import.
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(Array.from(next.values())))
+      set({ webhooks: next })
+    }
+    return { added, skipped: inputs.length - added }
+  },
+
   updateWebhook: (id, updates) => {
+    const existing = get().webhooks.get(id)
+    if (
+      existing &&
+      (updates.enabled === false ||
+        ['url', 'kind', 'telegramChatId', 'customTemplate'].some(
+          (key) =>
+            key in updates &&
+            updates[key as keyof WebhookEntry] !== existing[key as keyof WebhookEntry]
+        ))
+    )
+      cancelDelivery(id)
     set((state) => {
       const next = new Map(state.webhooks)
       const existing = next.get(id)
@@ -103,6 +140,7 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
   },
 
   removeWebhook: (id) => {
+    cancelDelivery(id)
     set((state) => {
       const next = new Map(state.webhooks)
       next.delete(id)
@@ -112,6 +150,7 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
   },
 
   toggleWebhook: (id) => {
+    if (get().webhooks.get(id)?.enabled) cancelDelivery(id)
     set((state) => {
       const next = new Map(state.webhooks)
       const existing = next.get(id)
@@ -122,8 +161,9 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
   },
 
   triggerEvent: async (event, payload) => {
-    const webhooks = Array.from(get().webhooks.values())
-      .filter((w) => w.enabled && w.events.includes(event))
+    const webhooks = Array.from(get().webhooks.values()).filter(
+      (w) => w.enabled && w.events.includes(event)
+    )
     if (webhooks.length === 0) return
     await Promise.allSettled(webhooks.map((w) => sendWebhook(w, payload)))
   },
@@ -132,13 +172,12 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
     const webhook = get().webhooks.get(id)
     if (!webhook) return { success: false, error: 'Webhook 不存在' }
     try {
-      await sendWebhook(webhook, {
+      return await sendWebhook(webhook, {
         title: '🧪 测试通知',
         message: '这是来自 Kiro 账号管理器的测试消息。如果你看到这条消息，说明 Webhook 配置正确。',
         level: 'info',
         fields: { 时间: new Date().toLocaleString('zh-CN') }
       })
-      return { success: true }
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err) }
     }
@@ -151,7 +190,26 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
       const arr = JSON.parse(raw) as WebhookEntry[]
       if (!Array.isArray(arr)) return
       const map = new Map<string, WebhookEntry>()
-      for (const w of arr) map.set(w.id, w)
+      for (const w of arr) {
+        if (
+          !w ||
+          typeof w.id !== 'string' ||
+          typeof w.url !== 'string' ||
+          !['dingtalk', 'wechat-work', 'telegram', 'discord', 'feishu', 'custom'].includes(
+            w.kind
+          ) ||
+          !Array.isArray(w.events)
+        )
+          continue
+        map.set(w.id, {
+          ...w,
+          enabled: w.enabled === true,
+          createdAt: Number.isFinite(w.createdAt) ? w.createdAt : Date.now(),
+          events: w.events.filter((event) =>
+            ALL_WEBHOOK_EVENTS.some((item) => item.value === event)
+          )
+        })
+      }
       set({ webhooks: map })
     } catch (err) {
       console.warn('[Webhook] Load failed:', err)
@@ -170,94 +228,53 @@ export const useWebhookStore = create<WebhooksStore>()((set, get) => ({
 
 // ==================== Webhook 发送实现 ====================
 
-/** C9: 每个 webhook 的最近发送时间戳队列（用于本地速率限制） */
-const sendTimestamps = new Map<string, number[]>()
-const MAX_PER_MINUTE = 20  // 每个 webhook 最多每分钟 20 条
-const RETRY_COUNT = 3
-const RETRY_DELAY_BASE_MS = 1500  // 指数退避基数
-
-/**
- * 检查并记录速率：超过阈值时返回 false，调用方应跳过本次发送
- */
-function checkAndRecordRate(webhookId: string): boolean {
-  const now = Date.now()
-  const arr = sendTimestamps.get(webhookId) || []
-  // 清理 1 分钟外
-  const filtered = arr.filter((t) => now - t < 60_000)
-  if (filtered.length >= MAX_PER_MINUTE) {
-    sendTimestamps.set(webhookId, filtered)
-    return false
+/** The main process owns transport, deadlines, retry limits and cancellation. */
+async function sendWebhook(
+  webhook: WebhookEntry,
+  payload: WebhookMessage
+): Promise<{ success: boolean; error?: string }> {
+  const url = webhook.kind === 'telegram' ? buildTelegramUrl(webhook) : webhook.url
+  try {
+    const result = await window.api.webhookSend({
+      id: webhook.id,
+      kind: webhook.kind,
+      url,
+      body: JSON.stringify(buildWebhookBody(webhook, payload))
+    })
+    if (!result.success)
+      console.warn(
+        `[Webhook] ${webhook.kind} ${webhook.label || webhook.id}: ${result.error || '发送失败'}`
+      )
+    return result
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
   }
-  filtered.push(now)
-  sendTimestamps.set(webhookId, filtered)
-  return true
 }
 
-/**
- * 按 webhook 类型构造消息体并 POST（含重试 + 速率限制）
- * 网络错误不会抛到调用方（仅 console.warn），避免影响主业务流程
- */
-async function sendWebhook(webhook: WebhookEntry, payload: WebhookMessage): Promise<void> {
-  // C9: 速率限制
-  if (!checkAndRecordRate(webhook.id)) {
-    console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} rate limit exceeded (>${MAX_PER_MINUTE}/min), drop`)
-    return
-  }
-
-  const body = buildWebhookBody(webhook, payload)
-  const url = webhook.kind === 'telegram'
-    ? buildTelegramUrl(webhook)
-    : webhook.url
-
-  // C9: 重试逻辑（指数退避）
-  let lastError: unknown
-  for (let attempt = 0; attempt <= RETRY_COUNT; attempt++) {
-    if (attempt > 0) {
-      const delay = RETRY_DELAY_BASE_MS * Math.pow(2, attempt - 1)
-      await new Promise((resolve) => setTimeout(resolve, delay))
-      console.log(`[Webhook] Retry ${attempt}/${RETRY_COUNT} for ${webhook.kind} ${webhook.label || webhook.id}`)
-    }
-    try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 8000)
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      })
-      clearTimeout(timer)
-      if (resp.ok) {
-        if (attempt > 0) {
-          console.log(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} succeeded on retry ${attempt}`)
-        }
-        return
-      }
-      // 4xx 客户端错误（除 408/429）不重试
-      if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
-        console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} HTTP ${resp.status} (no retry)`)
-        return
-      }
-      lastError = new Error(`HTTP ${resp.status}`)
-    } catch (err) {
-      lastError = err
-    }
-  }
-  console.warn(`[Webhook] ${webhook.kind} ${webhook.label || webhook.id} failed after ${RETRY_COUNT} retries:`, lastError)
+function cancelDelivery(id: string): void {
+  void window.api.webhookCancel(id).catch(() => {})
 }
 
 function buildTelegramUrl(webhook: WebhookEntry): string {
   // Telegram 的 URL 直接是 https://api.telegram.org/bot<token>/sendMessage
-  return webhook.url.endsWith('/sendMessage') ? webhook.url : `${webhook.url.replace(/\/$/, '')}/sendMessage`
+  return webhook.url.endsWith('/sendMessage')
+    ? webhook.url
+    : `${webhook.url.replace(/\/$/, '')}/sendMessage`
 }
 
 function buildWebhookBody(webhook: WebhookEntry, payload: WebhookMessage): unknown {
   const icon = ({ info: 'ℹ️', warn: '⚠️', error: '❌', success: '✅' } as const)[payload.level]
   const fieldsText = payload.fields
-    ? '\n' + Object.entries(payload.fields).map(([k, v]) => `**${k}**: ${v}`).join('\n')
+    ? '\n' +
+      Object.entries(payload.fields)
+        .map(([k, v]) => `**${k}**: ${v}`)
+        .join('\n')
     : ''
   const plainFields = payload.fields
-    ? '\n' + Object.entries(payload.fields).map(([k, v]) => `${k}: ${v}`).join('\n')
+    ? '\n' +
+      Object.entries(payload.fields)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\n')
     : ''
   const fullText = `${icon} ${payload.title}\n\n${payload.message}${plainFields}`
 
@@ -295,18 +312,28 @@ function buildWebhookBody(webhook: WebhookEntry, payload: WebhookMessage): unkno
       // Discord webhook
       return {
         username: 'Kiro Account Manager',
-        embeds: [{
-          title: `${icon} ${payload.title}`,
-          description: payload.message,
-          color: payload.level === 'error' ? 0xff0000
-            : payload.level === 'warn' ? 0xffaa00
-            : payload.level === 'success' ? 0x00ff00
-            : 0x4a9eff,
-          fields: payload.fields
-            ? Object.entries(payload.fields).map(([name, value]) => ({ name, value: String(value), inline: true }))
-            : undefined,
-          timestamp: new Date().toISOString()
-        }]
+        embeds: [
+          {
+            title: `${icon} ${payload.title}`,
+            description: payload.message,
+            color:
+              payload.level === 'error'
+                ? 0xff0000
+                : payload.level === 'warn'
+                  ? 0xffaa00
+                  : payload.level === 'success'
+                    ? 0x00ff00
+                    : 0x4a9eff,
+            fields: payload.fields
+              ? Object.entries(payload.fields).map(([name, value]) => ({
+                  name,
+                  value: String(value),
+                  inline: true
+                }))
+              : undefined,
+            timestamp: new Date().toISOString()
+          }
+        ]
       }
     case 'custom':
     default: {
@@ -335,5 +362,50 @@ function buildWebhookBody(webhook: WebhookEntry, payload: WebhookMessage): unkno
 }
 
 function escapeJsonString(s: string): string {
-  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')
+  return s
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+}
+
+export function parseWebhookInput(value: unknown): WebhookInput {
+  if (
+    !isRecord(value) ||
+    !['dingtalk', 'wechat-work', 'telegram', 'discord', 'feishu', 'custom'].includes(
+      String(value.kind)
+    ) ||
+    typeof value.url !== 'string' ||
+    !Array.isArray(value.events) ||
+    !value.events.every((event) => ALL_WEBHOOK_EVENTS.some((item) => item.value === event))
+  )
+    throw new Error('Webhook 配置无效')
+  const url = new URL(value.url)
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Webhook 地址无效')
+  const result: WebhookInput = {
+    kind: value.kind as WebhookKind,
+    url: value.url,
+    enabled: value.enabled === true,
+    events: [...new Set(value.events)]
+  }
+  if (value.enabled !== undefined && typeof value.enabled !== 'boolean')
+    throw new Error('Webhook 启用状态无效')
+  for (const key of ['label', 'telegramChatId', 'customTemplate'] as const) {
+    if (value[key] === undefined) continue
+    if (typeof value[key] !== 'string') throw new Error(`Webhook 字段无效: ${key}`)
+    result[key] = value[key]
+  }
+  return result
+}
+function webhookIdentity(entry: WebhookInput): string {
+  return JSON.stringify([
+    entry.kind,
+    entry.url,
+    entry.enabled,
+    entry.label || '',
+    entry.telegramChatId || '',
+    entry.customTemplate || '',
+    [...entry.events].sort()
+  ])
 }

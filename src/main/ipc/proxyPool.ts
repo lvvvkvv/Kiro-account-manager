@@ -43,8 +43,9 @@ function registerValidateHandler(): void {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     const start = Date.now()
+    let response: Awaited<ReturnType<typeof undiciFetch>> | undefined
     try {
-      const resp = await undiciFetch(testUrl, {
+      const resp = response = await undiciFetch(testUrl, {
         method: 'GET',
         dispatcher: agent,
         signal: controller.signal,
@@ -83,9 +84,11 @@ function registerValidateHandler(): void {
         error: isAbort ? `请求超时 (${timeoutMs}ms)` : errMsg
       }
     } finally {
+      controller.abort()
+      await response?.body?.cancel().catch(() => {})
       clearTimeout(timer)
       // 释放 agent 连接池：批量验活时不关闭会累积大量空闲连接/句柄直到 GC
-      try { await agent.close() } catch { /* ignore */ }
+      try { await agent.destroy() } catch { /* ignore */ }
       if (chainRelay) await chainRelay.stop()
     }
   })

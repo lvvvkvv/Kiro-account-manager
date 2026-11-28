@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react'
 import {
   UserPlus,
   Mail,
@@ -29,9 +29,6 @@ import {
 } from 'lucide-react'
 import { useTranslation } from '@/hooks/useTranslation'
 import { useAccountsStore } from '@/store/accounts'
-import { useTaskStore } from '@/store/tasks'
-import { createRateLimiter, type RateLimiter, type RateLimiterSnapshot } from '@/store/rateLimiter'
-import { useWebhookStore } from '@/store/webhooks'
 import {
   Card,
   CardContent,
@@ -47,7 +44,6 @@ import {
 import { cn } from '@/lib/utils'
 import { PageHeader } from '../layout/PageHeader'
 import { TemplateMenu } from '../registration/TemplateMenu'
-import { appendSubscriptionLink, updateSubscriptionLink } from './SubscriptionPage'
 import {
   generateNextDotVariant,
   countSameRootVariants,
@@ -55,440 +51,68 @@ import {
   splitEmail
 } from '@/lib/dotVariants'
 
-// 失败错误码归类：用于失败重试队列的过滤
-type ErrCategory =
-  | 'risk_control'
-  | 'proxy_chain'
-  | 'strict_proxy'
-  | 'proxy_whitelist'
-  | 'eof'
-  | 'otp_timeout'
-  | 'network'
-  | 'email_used'
-  | 'rate_limit'
-  | 'auth'
-  | 'suspended'
-  | 'unknown'
+import { useShallow } from 'zustand/react/shallow'
+import {
+  type RegMode,
+  type AutoEmailSource,
+  type ProPlanType,
+  type RegisterConfig,
+  type RegisterTemplate,
+  type BatchItem,
+  type HistoryItem,
+  diagnoseRegError,
+  classifyError,
+  fmtMs,
+  STEP_LABEL_CN,
+  buildManualSteps,
+  phaseToStep,
+  loadConfig,
+  saveConfig,
+  loadTemplates,
+  saveTemplates,
+  parseTemplates,
+  loadEmailBlacklist,
+  saveEmailBlacklist,
+  clearEmailBlacklist,
+  boundedInteger
+} from '@/lib/registration'
+import {
+  eligibleRegistrationSources,
+  useRegistrationStore,
+  initializeRegistration,
+  addRegistrationLog as addLog,
+  clearRegistrationLogs,
+  collectRegistrationEmails,
+  startRegistrationBatch,
+  startSingleRegistration,
+  cancelSingleRegistration,
+  resetRegistration,
+  submitRegistrationEmail,
+  submitRegistrationOTP,
+  toggleRegistrationPause,
+  stopRegistrationBatch,
+  importRegistrationResult,
+  importRegistrationHistory,
+  setRegistrationHistory as setHistory,
+  resetRegistrationQuota,
+  type RegistrationOptions
+} from '@/registration/runtime'
+import { setRegistrationOptions } from '@/hooks/useRegistrationSchedule'
 
-interface ErrorDiagnosis {
-  category: ErrCategory
-  title: string
-  reasons: string[]
-  suggestions: string[]
-}
-
-/**
- * 把失败原因翻译成"普通话"的诊断 + 建议，覆盖批量注册里最常见的几类失败。
- * 优先级：风控 > 代理白名单 > 代理链 > 严格代理 > EOF > OTP超时 > 网络 > 邮箱已用 > 限流 > 鉴权 > suspended > unknown
- */
-function diagnoseRegError(err: string | undefined): ErrorDiagnosis {
-  const e = (err || '').toLowerCase()
-  if (!e) {
-    return {
-      category: 'unknown',
-      title: '未知错误',
-      reasons: ['未捕获到具体错误信息'],
-      suggestions: ['查看完整日志']
-    }
-  }
-  // AWS 风控
-  if (
-    e.includes('aws-risk-control') ||
-    e.includes('风控') ||
-    e.includes('请稍后再试') ||
-    e.includes('try again later')
-  ) {
-    return {
-      category: 'risk_control',
-      title: 'AWS 风控触发',
-      reasons: [
-        '注册请求被 AWS 安全策略拦截',
-        '常见诱因：同 IP 短时注册多账号、行为节奏机械化、邮箱域名被关联'
-      ],
-      suggestions: [
-        '启用代理池 + 每号唯一 session（每号一个 IP）',
-        '降低速率（限速 10/分钟或更低）',
-        '邮箱用多域名轮换',
-        '若用 bestproxy 类住宅代理，确保来源 IP 非大陆'
-      ]
-    }
-  }
-  // bestproxy 610 / IP 白名单类
-  if (
-    e.includes('610') ||
-    e.includes('whitelist') ||
-    (e.includes('connect') && e.includes('http 4'))
-  ) {
-    return {
-      category: 'proxy_whitelist',
-      title: '代理认证 / 白名单失败',
-      reasons: [
-        '目标代理拒绝认证（账密错或来源 IP 不在白名单）',
-        'bestproxy 的 610 = 来源 IP 未授权'
-      ],
-      suggestions: [
-        '在代理后台把当前出口 IP 加入白名单',
-        '或改用账密直连模式 + 确保来源是允许地区',
-        '配合"上游中转代理"用非大陆中转'
-      ]
-    }
-  }
-  // 代理链失败
-  if (e.includes('proxychain') || e.includes('代理链') || e.includes('上游中转')) {
-    return {
-      category: 'proxy_chain',
-      title: '代理链建立失败',
-      reasons: ['"上游中转 → 目标代理"链路握手未通过'],
-      suggestions: [
-        '到「代理池」页面点「诊断」定位哪一层挂了',
-        '确认上游中转端口（如 socks5://127.0.0.1:7890）已在跑',
-        '若目标代理要求白名单，确保中转出口 IP 已加白'
-      ]
-    }
-  }
-  // 严格代理（无可用代理拒绝裸奔）
-  if (e.includes('严格代理') || (e.includes('strict') && e.includes('proxy'))) {
-    return {
-      category: 'strict_proxy',
-      title: '严格代理模式拦截',
-      reasons: ['代理池启用了"绝不裸奔直连"，但当前无可用代理'],
-      suggestions: [
-        '到代理池验活，确认至少 1 条 alive',
-        '检查代理是否被自动停用',
-        '临时可手动启用所有代理 / 关掉"失败自动停用"'
-      ]
-    }
-  }
-  // EOF / status=0 网络抖动
-  if (
-    e.includes('eof') ||
-    (e.includes('status=0') && e.includes('failed to do request')) ||
-    e.includes('connection reset')
-  ) {
-    return {
-      category: 'eof',
-      title: '网络瞬时断开（EOF）',
-      reasons: [
-        'TLS 连接在握手或传输中被对端 RST/关闭',
-        '常见于代理不稳定 / 高并发挤压 / 中间网络抖动'
-      ],
-      suggestions: [
-        '降低并发数',
-        '换代理 / 加上游中转',
-        '已内置重试，偶发可忽略；连续大量则更换出口'
-      ]
-    }
-  }
-  // OTP 超时
-  if (
-    (e.includes('timeout') || e.includes('超时')) &&
-    (e.includes('otp') || e.includes('验证码') || e.includes('code'))
-  ) {
-    return {
-      category: 'otp_timeout',
-      title: '等待验证码超时',
-      reasons: [
-        '临时邮箱未在期限内收到 AWS 验证邮件',
-        '可能 AWS 没发（风控拦截）/ 邮件落到垃圾 / 临时邮箱服务延迟'
-      ],
-      suggestions: [
-        '确认临时邮箱服务可用',
-        '该邮箱域名可能被 AWS 标黑，换域名重试',
-        '若反复出现，多半是 AWS 静默风控，需换 IP/换节奏'
-      ]
-    }
-  }
-  // 一般网络
-  if (
-    e.includes('timeout') ||
-    e.includes('超时') ||
-    e.includes('etimedout') ||
-    e.includes('fetch failed') ||
-    e.includes('econnreset') ||
-    e.includes('econnrefused') ||
-    e.includes('enotfound') ||
-    e.includes('network')
-  ) {
-    return {
-      category: 'network',
-      title: '网络错误',
-      reasons: ['连接 / DNS / 超时类失败'],
-      suggestions: ['检查本机网络与代理可达性', '降低并发再试']
-    }
-  }
-  // 邮箱已被注册
-  if (
-    e.includes('已注册') ||
-    (e.includes('email') &&
-      (e.includes('already') ||
-        e.includes('exists') ||
-        e.includes('used') ||
-        e.includes('已存在') ||
-        e.includes('已被')))
-  ) {
-    return {
-      category: 'email_used',
-      title: '邮箱已被注册',
-      reasons: ['该邮箱地址 AWS 侧已存在'],
-      suggestions: [
-        '前缀生成器近期已增强随机性（中间名/双姓），再跑一次几乎不会撞',
-        '使用多域名进一步降低冲突'
-      ]
-    }
-  }
-  // 限流
-  if (
-    e.includes('rate') ||
-    e.includes('limit') ||
-    e.includes('too many') ||
-    e.includes('限流') ||
-    e.includes('429')
-  ) {
-    return {
-      category: 'rate_limit',
-      title: '触发限流',
-      reasons: ['短时请求次数超出 AWS 接受范围'],
-      suggestions: ['降低 maxPerMinute 与并发', '启用风控自动暂停']
-    }
-  }
-  // suspended
-  if (e.includes('suspended')) {
-    return {
-      category: 'suspended',
-      title: '账号已被停用',
-      reasons: [
-        '注册流程跑完但 AWS 在最后一步把账号标为 suspended',
-        '通常是风控级判定（域名/IP/指纹综合）'
-      ],
-      suggestions: ['换出口 IP / 换邮箱域名 / 降低速率', '可看作"软风控"信号，应立刻放慢']
-    }
-  }
-  // 鉴权
-  if (e.includes('unauthorized') || e.includes('401') || e.includes('403')) {
-    return {
-      category: 'auth',
-      title: '鉴权失败',
-      reasons: ['上游接口返回 401/403'],
-      suggestions: ['检查凭据 / 看接口侧响应体']
-    }
-  }
-  return {
-    category: 'unknown',
-    title: '其他错误',
-    reasons: [err || ''],
-    suggestions: ['查看完整日志定位']
-  }
-}
-
-/** 旧 API 兼容：现有 retryFailed 等用 classifyError 做筛选 */
-function classifyError(
-  err: string | undefined
-): 'network' | 'otp_timeout' | 'email_used' | 'rate_limit' | 'auth' | 'risk_control' | 'unknown' {
-  const cat = diagnoseRegError(err).category
-  if (cat === 'risk_control') return 'risk_control'
-  if (cat === 'otp_timeout') return 'otp_timeout'
-  if (cat === 'email_used') return 'email_used'
-  if (cat === 'rate_limit') return 'rate_limit'
-  if (cat === 'auth') return 'auth'
-  if (
-    cat === 'eof' ||
-    cat === 'network' ||
-    cat === 'proxy_chain' ||
-    cat === 'proxy_whitelist' ||
-    cat === 'strict_proxy'
-  )
-    return 'network'
-  return 'unknown'
-}
-
-// 随机 session 值（字母数字），用于代理「会话粘性」——同值保持同一出口 IP
-function randomSession(len = 8): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-  let s = ''
-  for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)]
-  return s
-}
-
-/**
- * 为代理 URL 注入「每账号唯一 session」，让同一账号整个注册流程走同一出口 IP、不同账号用不同 IP。
- * 1) url 含 {session} 占位符 → 替换为随机值（通用，适配任意服务商）；
- * 2) 参数化用户名（bestproxy 等，含 _area-/_life-/_city-/_state- 等）且未写 _session- → 自动补一个；
- * 其余情况（普通代理、已写 session）原样返回，不干扰。
- */
-function injectProxySession(url: string): string {
-  if (!url) return url
-  const session = randomSession()
-  if (url.includes('{session}')) {
-    return url.replace(/\{session\}/g, session)
-  }
-  const m = url.match(/^(\w+:\/\/)([^@/]+)@(.+)$/)
-  if (m) {
-    const [, scheme, userinfo, hostpart] = m
-    const ci = userinfo.indexOf(':')
-    const username = ci >= 0 ? userinfo.slice(0, ci) : userinfo
-    const password = ci >= 0 ? userinfo.slice(ci + 1) : ''
-    const isParamStyle = /_(area|life|city|state|session|region|country)-/i.test(username)
-    if (isParamStyle && !/_session-/i.test(username)) {
-      const newUser = `${username}_session-${session}`
-      return `${scheme}${newUser}${ci >= 0 ? ':' + password : ''}@${hostpart}`
-    }
-  }
-  return url
-}
-
-type RegMode = 'manual' | 'outlook' | 'tempmail' | 'proton' | 'gptmail' | 'mixed'
-type AutoEmailSource = 'outlook' | 'tempmail' | 'proton' | 'gptmail'
-/**
- * Phase 状态机：
- * - idle：未开始
- * - initializing：OIDC 设备授权初始化
- * - email：等待用户输入邮箱
- * - otp：等待用户输入验证码
- * - running：注册流程进行中（Verify/Password/Token 由日志关键字推断）
- * - done：核心注册流程完成（含 Token），未启用任何后处理时即为最终态
- * - importing：正在自动导入账号
- * - fetching-link：正在获取 Pro 订阅链接
- * - finalized：包含所有后处理在内的最终完成
- */
-type Phase =
-  | 'idle'
-  | 'initializing'
-  | 'email'
-  | 'otp'
-  | 'running'
-  | 'done'
-  | 'importing'
-  | 'fetching-link'
-  | 'finalized'
-
-interface FingerprintSnapshot {
-  chromeVer: string
-  ua: string
-  gpuVendor: string
-  gpuModel: string
-  canvasHash: number
-  screen: { width: number; height: number }
-  proxyUrl?: string
-  exitIP?: string
-}
-
-interface RegResult {
-  status: 'success' | 'failed'
-  email: string
-  password?: string
-  error?: string
-  clientId?: string
-  clientSecret?: string
-  refreshToken?: string
-  accessToken?: string
-  region?: string
-  provider?: string
-  verify?: Record<string, unknown>
-  fingerprint?: FingerprintSnapshot
-}
-
-type BatchItemStatus =
-  | 'pending'
-  | 'running'
-  | 'retrying'
-  | 'success'
-  | 'failed'
-  | 'imported'
-  | 'import_failed'
-
-interface HistoryItem {
-  id: string
-  time: number
-  email: string
-  status: 'success' | 'failed'
-  error?: string
-  password?: string
-  result?: RegResult
-  imported: boolean
-  subscriptionUrl?: string
-}
-
-type RegStepName =
-  | 'init'
-  | 'proxy-chain-ready'
-  | 'tls-ready'
-  | 'exit-ip'
-  | 'oidc'
-  | 'device'
-  | 'email-created'
-  | 'portal'
-  | 'workflow-init'
-  | 'submit-email'
-  | 'signup'
-  | 'send-otp'
-  | 'waiting-otp'
-  | 'otp-received'
-  | 'create-identity'
-  | 'set-password'
-  | 'sso-workflow'
-  | 'sso-token'
-  | 'verify-alive'
-  | 'done'
-
-/** step → 简短中文标签，给 UI 显示用 */
-const STEP_LABEL_CN: Record<RegStepName, string> = {
-  init: '初始化',
-  'proxy-chain-ready': '代理链就绪',
-  'tls-ready': 'TLS 就绪',
-  'exit-ip': '探出口 IP',
-  oidc: 'OIDC',
-  device: '设备授权',
-  'email-created': '邮箱已创建',
-  portal: 'Portal',
-  'workflow-init': '工作流',
-  'submit-email': '提交邮箱',
-  signup: 'Signup',
-  'send-otp': '发送验证码',
-  'waiting-otp': '等验证码',
-  'otp-received': '验证码到',
-  'create-identity': '建身份',
-  'set-password': '设密码',
-  'sso-workflow': 'SSO 工作流',
-  'sso-token': '取 Token',
-  'verify-alive': '验活',
-  done: '完成'
-}
-
-interface BatchItem {
-  id: string
-  index: number
-  status: BatchItemStatus
-  email: string
-  error?: string
-  retryCount: number
-  /** 实时进度：当前 step、起步时间、当前 step 起步时间、出口 IP */
-  currentStep?: RegStepName
-  startedAt?: number
-  stepStartedAt?: number
-  exitIp?: string
-}
-
-function fmtMs(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-  const m = Math.floor(ms / 60_000)
-  const s = Math.floor((ms % 60_000) / 1000)
-  return `${m}m${s.toString().padStart(2, '0')}s`
-}
-
-/** 单行批量任务的展示：状态图标 + 邮箱 + 当前步骤 + 总耗时 + 出口 IP / 错误 + 失败诊断展开。
- * 拆为子组件可减少父组件重渲染时的工作量，并配合 batchClock 让总耗时随秒滚动。
- */
-function BatchItemRow({
+const BatchItemRow = memo(function BatchItemRow({
   item,
-  t,
-  batchClock
+  t
 }: {
   item: BatchItem
   t: (k: string) => string
-  batchClock: number
 }): React.ReactNode {
   const isActive = item.status === 'running' || item.status === 'retrying'
+  const [batchClock, setClock] = useState(Date.now)
+  useEffect(() => {
+    if (!isActive) return
+    const timer = setInterval(() => setClock(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [isActive])
   const now = isActive ? batchClock : item.stepStartedAt || item.startedAt || 0
   const totalMs = item.startedAt ? Math.max(0, now - item.startedAt) : undefined
   const stepLabel = item.currentStep ? STEP_LABEL_CN[item.currentStep] : ''
@@ -501,7 +125,9 @@ function BatchItemRow({
       <div className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-[9px]">
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="text-muted-foreground w-6 text-right shrink-0">#{item.index}</span>
-          {item.status === 'pending' && <span className="text-muted-foreground shrink-0">—</span>}
+          {(item.status === 'pending' || item.status === 'cancelled') && (
+            <span className="text-muted-foreground shrink-0">—</span>
+          )}
           {item.status === 'running' && (
             <Loader2 className="h-3 w-3 animate-spin text-primary shrink-0" />
           )}
@@ -547,21 +173,25 @@ function BatchItemRow({
               (item.status === 'pending' || item.status === 'running') && 'text-muted-foreground'
             )}
           >
-            {item.status === 'pending'
-              ? ''
-              : item.status === 'running'
+            {item.status === 'cancelled'
+              ? t('common.unknown') === 'Unknown'
+                ? 'Cancelled'
+                : '已取消'
+              : item.status === 'pending'
                 ? ''
-                : item.status === 'retrying'
-                  ? `${t('register.batchItemRetrying')} (${item.retryCount})`
-                  : item.status === 'success'
-                    ? t('register.batchItemSuccess')
-                    : item.status === 'imported'
-                      ? t('register.batchItemImported')
-                      : item.status === 'import_failed'
-                        ? t('register.batchItemImportFailed')
-                        : diag
-                          ? diag.title
-                          : item.error || t('register.batchItemFailed')}
+                : item.status === 'running'
+                  ? ''
+                  : item.status === 'retrying'
+                    ? `${t('register.batchItemRetrying')} (${item.retryCount})`
+                    : item.status === 'success'
+                      ? t('register.batchItemSuccess')
+                      : item.status === 'imported'
+                        ? t('register.batchItemImported')
+                        : item.status === 'import_failed'
+                          ? t('register.batchItemImportFailed')
+                          : diag
+                            ? diag.title
+                            : item.error || t('register.batchItemFailed')}
           </span>
           {diag && (
             <button
@@ -608,335 +238,63 @@ function BatchItemRow({
       )}
     </div>
   )
-}
+})
 
 /**
  * 注册进度的核心 6 步：OIDC → Email → Verify → Password → Token → Done
  * 后处理可选追加：Import（自动导入开启时）、ProLink（自动获取 Pro 链接开启时）
  */
-const CORE_STEPS = ['OIDC', 'Email', 'Verify', 'Password', 'Token', 'Done'] as const
-
-/**
- * 根据用户开关动态构建步骤列表
- * @param hasImport 是否启用了自动导入
- * @param hasProLink 是否启用了自动获取 Pro 链接
- */
-function buildManualSteps(hasImport: boolean, hasProLink: boolean): readonly string[] {
-  const extras: string[] = []
-  if (hasImport) extras.push('Import')
-  if (hasProLink) extras.push('ProLink')
-  if (extras.length === 0) return CORE_STEPS
-  // 在 Done 之前插入额外步骤；'Done' 永远在最后
-  return [...CORE_STEPS.slice(0, -1), ...extras, 'Done']
-}
-
-/**
- * 将 phase + 最近日志推断到当前步骤索引（基于动态步骤数组）
- * @param phase 后端发出的注册阶段（含后处理阶段）
- * @param lastLog 最近一条日志（用于在 running 阶段细分到 Verify/Password/Token）
- * @param steps 通过 buildManualSteps 构造的动态步骤数组
- */
-function phaseToStep(phase: Phase, lastLog: string | undefined, steps: readonly string[]): number {
-  // 步骤索引辅助：找具体步骤名在动态数组中的位置
-  const idxOf = (name: string): number => steps.indexOf(name)
-  const lastIdx = steps.length - 1
-
-  switch (phase) {
-    case 'idle':
-      return -1
-    case 'initializing':
-      return idxOf('OIDC')
-    case 'email':
-      return idxOf('Email')
-    case 'otp':
-      return idxOf('Verify')
-    case 'done':
-      return idxOf('Done') // 核心流程完成（未启用后处理时即最终态）
-    case 'importing': {
-      const i = idxOf('Import')
-      return i >= 0 ? i : idxOf('Done')
-    }
-    case 'fetching-link': {
-      const i = idxOf('ProLink')
-      return i >= 0 ? i : idxOf('Done')
-    }
-    case 'finalized':
-      return lastIdx
-    case 'running': {
-      if (!lastLog) return Math.max(0, idxOf('Email'))
-      const log = lastLog.toLowerCase()
-      // 自动模式 OTP 提交时也走 running，这里识别后处理消息
-      if (
-        log.includes('正在获取 pro') ||
-        log.includes('pro link') ||
-        log.includes('fetching pro')
-      ) {
-        const i = idxOf('ProLink')
-        if (i >= 0) return i
-      }
-      if (log.includes('正在导入') || log.includes('importing') || log.includes('已导入')) {
-        const i = idxOf('Import')
-        if (i >= 0) return i
-      }
-      // [13] SSO Token / [12.5] complete-signup / 验活成功
-      if (
-        log.includes('sso') ||
-        log.includes('token') ||
-        log.includes('验活') ||
-        log.includes('complete') ||
-        log.includes('end-of-workflow')
-      )
-        return idxOf('Token')
-      // [12] 设置密码 / SetPassword / 加密公钥
-      if (log.includes('密码') || log.includes('password') || log.includes('加密公钥'))
-        return idxOf('Password')
-      // [9] OTP / [10] verify-email / signup verify
-      if (log.includes('验证码') || log.includes('otp') || log.includes('verify'))
-        return idxOf('Verify')
-      // [7-8] Signup / SignupInit / Profile
-      if (log.includes('signup') || log.includes('profile') || log.includes('注册初始化'))
-        return idxOf('Verify')
-      // [6] 提交邮箱 / SubmitEmail
-      if (log.includes('提交邮箱') || log.includes('submit') || log.includes('邮箱'))
-        return idxOf('Email')
-      return Math.max(0, idxOf('Email'))
-    }
-  }
-}
-
-const STORAGE_KEY = 'kiro-register-config'
-const HISTORY_KEY = 'kiro-register-history'
-/** 已知占用邮箱黑名单：注册失败为 email_used 时加入，下次自动跳过 */
-const EMAIL_BLACKLIST_KEY = 'kiro-register-email-blacklist'
-/** 注册策略模板：完整 RegisterConfig 命名快照，便于一键切换场景 */
-const TEMPLATES_KEY = 'kiro-register-templates'
-
-interface RegisterTemplate {
-  id: string
-  name: string
-  config: RegisterConfig
-  createdAt: number
-}
-
-function loadTemplates(): RegisterTemplate[] {
-  try {
-    const raw = localStorage.getItem(TEMPLATES_KEY)
-    return raw ? (JSON.parse(raw) as RegisterTemplate[]) : []
-  } catch {
-    return []
-  }
-}
-
-function saveTemplates(items: RegisterTemplate[]): void {
-  try {
-    localStorage.setItem(TEMPLATES_KEY, JSON.stringify(items))
-  } catch {
-    /* ignore */
-  }
-}
-
-function loadEmailBlacklist(): Set<string> {
-  try {
-    const raw = localStorage.getItem(EMAIL_BLACKLIST_KEY)
-    if (!raw) return new Set()
-    const arr = JSON.parse(raw) as string[]
-    return new Set(arr.map((e) => e.toLowerCase()))
-  } catch {
-    return new Set()
-  }
-}
-
-function saveEmailBlacklist(set: Set<string>): void {
-  try {
-    // 限制最多 5000 条，避免无限增长
-    const arr = Array.from(set).slice(-5000)
-    localStorage.setItem(EMAIL_BLACKLIST_KEY, JSON.stringify(arr))
-  } catch {
-    /* ignore */
-  }
-}
-
-function clearEmailBlacklist(): void {
-  try {
-    localStorage.removeItem(EMAIL_BLACKLIST_KEY)
-  } catch {
-    /* ignore */
-  }
-}
-
-// 模块级状态：组件卸载后仍保留（同一会话内）
-let _logs: string[] = []
-let _phase: Phase = 'idle'
-let _result: RegResult | null = null
-let _batchRunning = false
-let _batchDone = 0
-let _batchSuccess = 0
-let _batchFail = 0
-let _batchItems: BatchItem[] = []
-// Proton 登录态缓存到模块级：切换页面回来不丢失显示（真实登录态持久化在 persist:proton session）
-let _protonLoggedIn = false
-/**
- * 模块级映射：taskId(后端) → batchItem.id(前端)，用于把 step 事件路由到对应行。
- * 必须放模块级 — 之前用 useRef 会在切换页面 unmount 时丢失，导致重新挂载后
- * 仍在跑的任务的 step/IP/耗时不再更新（页面回来后看起来"信息没保存"）。
- */
-const _taskIdToItemId = new Map<string, string>()
-
-/**
- * 模块级 step 事件订阅：注册一次后永不取消。
- * 旧实现把订阅放 useEffect，切到其它页面 unmount 时被 cleanup 取消，
- * 期间发生的所有 step 事件全部丢失，切回来后 UI 信息缺失。
- */
-let _stepListenerRegistered = false
-function ensureStepListenerRegistered(): void {
-  if (_stepListenerRegistered) return
-  _stepListenerRegistered = true
-  window.api.onRegistrationStep(({ taskId, event }) => {
-    if (!taskId) return
-    const itemId = _taskIdToItemId.get(taskId)
-    if (!itemId) return
-    const now = event.ts || Date.now()
-    // 写模块级数据 + 通知挂载中的 React 组件刷新（用 _refSetBatchItems）
-    _batchItems = _batchItems.map((it) => {
-      if (it.id !== itemId) return it
-      return {
-        ...it,
-        currentStep: event.name as RegStepName,
-        startedAt: it.startedAt ?? now,
-        stepStartedAt: now,
-        email: event.email || it.email,
-        exitIp: event.exitIp || it.exitIp
-      }
-    })
-    _refSetBatchItems?.([..._batchItems])
-  })
-}
-
-/**
- * 模块级 log 订阅同理：切页面期间发生的日志也不会丢。
- * 行为对齐 addLog：加时间戳前缀。
- */
-let _logListenerRegistered = false
-function ensureLogListenerRegistered(): void {
-  if (_logListenerRegistered) return
-  _logListenerRegistered = true
-  window.api.onRegistrationLog((msg) => {
-    const next = [..._logs, `[${new Date().toLocaleTimeString()}] ${msg}`]
-    if (next.length > 500) next.splice(0, next.length - 500)
-    _logs = next
-    _refSetLogs?.(next)
-  })
-}
-
-// 模块级 React setter refs：异步代码跨组件生命周期调用最新 setter
-let _refSetPhase: ((v: Phase) => void) | null = null
-let _refSetResult: ((v: RegResult | null) => void) | null = null
-let _refSetLogs: ((v: string[]) => void) | null = null
-let _refSetBatchRunning: ((v: boolean) => void) | null = null
-let _refSetBatchDone: ((v: number) => void) | null = null
-let _refSetBatchSuccess: ((v: number) => void) | null = null
-let _refSetBatchFail: ((v: number) => void) | null = null
-let _refSetBatchItems: ((v: BatchItem[]) => void) | null = null
-let _refSetHistory: ((v: HistoryItem[] | ((prev: HistoryItem[]) => HistoryItem[])) => void) | null =
-  null
-
-function loadHistory(): HistoryItem[] {
-  try {
-    const raw = localStorage.getItem(HISTORY_KEY)
-    return raw ? JSON.parse(raw) : []
-  } catch {
-    return []
-  }
-}
-
-function saveHistory(items: HistoryItem[]): void {
-  try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, 100)))
-  } catch {
-    /* ignore */
-  }
-}
-
-/** 订阅计划类型（对应 Kiro 后端 qSubscriptionType）*/
-export type ProPlanType =
-  | 'Q_DEVELOPER_STANDALONE_PRO'
-  | 'Q_DEVELOPER_STANDALONE_PRO_PLUS'
-  | 'Q_DEVELOPER_STANDALONE_POWER'
-
-interface RegisterConfig {
-  mode: RegMode
-  outlookData: string
-  fullName: string
-  batchCount: number
-  batchInterval: number
-  batchAutoImport: boolean
-  batchRetries: number
-  batchConcurrency: number
-  autoFetchProLink: boolean
-  proPlanType: ProPlanType
-  tempMailEmail: string
-  tempMailEpin: string
-  tempMailDomain: string
-  /** Proton 母邮箱（点号别名母号，如 evanbartellchae@protonmail.com）*/
-  protonBaseEmail: string
-  /** GPTmail (mail.chatgpt.org.uk) — 支持两种模式：私有域名直收（inbox 留空）或 CF 转发（填 inbox）；
-   *   私有域名设了密码时填 privatePassword */
-  gptMailBaseURL: string
-  gptMailInboxEmail: string
-  gptMailDomain: string
-  gptMailPrefix: string
-  gptMailPrivatePassword: string
-  /** 手动模式 — 母邮箱（收验证码的真实邮箱）*/
-  manualParentEmail: string
-  /** 手动模式 — 启用匿名邮箱（点号变体）*/
-  manualAnonymousEmail: boolean
-  /** 混合模式 — 启用的邮箱源 */
-  mixedEnabledSources?: AutoEmailSource[]
-}
-
-function loadConfig(): Partial<RegisterConfig> {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    return raw ? JSON.parse(raw) : {}
-  } catch {
-    return {}
-  }
-}
-
-function saveConfig(cfg: RegisterConfig): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg))
-  } catch {
-    /* ignore */
-  }
-}
 
 export function RegisterPage(): React.JSX.Element {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
-  const saved = useRef(loadConfig()).current
-
+  const [saved] = useState(loadConfig)
+  const {
+    phase,
+    logs,
+    result,
+    imported,
+    batchRunning,
+    batchDone,
+    batchSuccess,
+    batchFail,
+    batchItems,
+    history,
+    isPaused,
+    rateSnapshot,
+    dailyQuotaUsed,
+    protonLoggedIn
+  } = useRegistrationStore(
+    useShallow((state) => ({
+      phase: state.phase,
+      logs: state.logs,
+      result: state.result,
+      imported: state.imported,
+      batchRunning: state.batchRunning,
+      batchDone: state.batchDone,
+      batchSuccess: state.batchSuccess,
+      batchFail: state.batchFail,
+      batchItems: state.batchItems,
+      history: state.history,
+      isPaused: state.isPaused,
+      rateSnapshot: state.rateSnapshot,
+      dailyQuotaUsed: state.dailyQuotaUsed,
+      protonLoggedIn: state.protonLoggedIn
+    }))
+  )
   const [mode, setMode] = useState<RegMode>(saved.mode || 'manual')
-  const [phase, _setPhase] = useState<Phase>(_phase)
-  const [logs, setLogs] = useState<string[]>(_logs)
-  const [result, _setResult] = useState<RegResult | null>(_result)
-  const [imported, setImported] = useState(false)
-
-  const setPhase = useCallback((p: Phase) => {
-    _phase = p
-    _refSetPhase?.(p)
+  const setProtonLoggedIn = (value: boolean): void =>
+    useRegistrationStore.setState({ protonLoggedIn: value })
+  useEffect(() => {
+    initializeRegistration()
   }, [])
-  const setResult = useCallback((r: RegResult | null) => {
-    _result = r
-    _refSetResult?.(r)
-  }, [])
-
   // 手动模式
   const [email, setEmail] = useState('')
   const [fullName, setFullName] = useState(saved.fullName || '')
   const [otp, setOtp] = useState('')
   const [parentEmail, setParentEmail] = useState(saved.manualParentEmail || '')
   const [anonymousEmail, setAnonymousEmail] = useState(saved.manualAnonymousEmail ?? false)
+  const accounts = useAccountsStore((state) => (anonymousEmail ? state.accounts : undefined))
 
   // Outlook 配置
   const [outlookData, setOutlookData] = useState(saved.outlookData || '')
@@ -948,12 +306,6 @@ export function RegisterPage(): React.JSX.Element {
 
   // Proton 配置（点号别名，webview 借壳官方网页取码，需先登录一次）
   const [protonBaseEmail, setProtonBaseEmail] = useState(saved.protonBaseEmail || '')
-  // 初始值取模块级缓存：切到别的页面再回来仍保持登录态显示
-  const [protonLoggedIn, _setProtonLoggedIn] = useState(_protonLoggedIn)
-  const setProtonLoggedIn = useCallback((v: boolean): void => {
-    _protonLoggedIn = v
-    _setProtonLoggedIn(v)
-  }, [])
   const [protonChecking, setProtonChecking] = useState(false)
 
   // GPTmail (mail.chatgpt.org.uk) 配置 —— 同时支持两种模式：
@@ -968,434 +320,13 @@ export function RegisterPage(): React.JSX.Element {
   )
 
   const logContainerRef = useRef<HTMLDivElement>(null)
-  const { addAccount, accounts } = useAccountsStore()
-
-  /** 从代理池取下一个可用代理（如果启用），返回 proxy + upstreamProxy 供注册配置注入 */
-  const getRegistrationProxy = useCallback((): {
-    proxy: string
-    upstreamProxy: string
-    proxyId: string
-    label: string
-  } | null => {
-    const { pickNextProxy, proxyPoolConfig } = useAccountsStore.getState()
-    const entry = pickNextProxy()
-    if (!entry) return null
-    const masked = entry.url.replace(/:([^:@/]+)@/, ':***@')
-    return {
-      proxy: entry.url,
-      upstreamProxy: proxyPoolConfig.upstreamProxy || '',
-      proxyId: entry.id,
-      label: masked
-    }
-  }, [])
-
-  const addLog = useCallback((msg: string) => {
-    const next = [..._logs, `[${new Date().toLocaleTimeString()}] ${msg}`]
-    _logs = next
-    _refSetLogs?.(next)
-  }, [])
-
   useEffect(() => {
-    const el = logContainerRef.current
-    if (el) el.scrollTop = el.scrollHeight
+    const element = logContainerRef.current
+    if (element) element.scrollTop = element.scrollHeight
   }, [logs])
-
-  // 注册一次性的 log / step IPC 监听器：模块级注册，永不取消，
-  // 避免切到其它页面时丢失中间的事件（之前用 useEffect 在 unmount 时取消会丢事件）
-  useEffect(() => {
-    ensureLogListenerRegistered()
-    ensureStepListenerRegistered()
-  }, [])
-
-  // 页面挂载时检测注册流程状态
-  useEffect(() => {
-    window.api.registrationStatus().then((res) => {
-      if (res.inProgress && _phase === 'idle') {
-        // 后端有流程但前端无状态（应用重启场景），取消残留
-        window.api.registrationCancel()
-      }
-    })
-  }, [])
-
-  const reset = (): void => {
-    _phase = 'idle'
-    _logs = []
-    _result = null
-    setPhase('idle')
-    setLogs([])
-    setResult(null)
-    setImported(false)
-    setOtp('')
-  }
-
-  // ============ 手动模式 ============
-
-  /** 收集本地已使用过的邮箱集合（帐号库存 + 注册历史 + 已知占用黑名单）*/
-  const collectUsedEmails = useCallback((): Set<string> => {
-    const used = new Set<string>()
-    for (const acc of accounts.values()) {
-      if (acc.email) used.add(acc.email.toLowerCase())
-    }
-    // 注册历史（包括未导入账号的历史记录）
-    for (const item of loadHistory()) {
-      if (item.email) used.add(item.email.toLowerCase())
-    }
-    // 已知占用邮箱黑名单
-    for (const e of loadEmailBlacklist()) {
-      used.add(e)
-    }
-    return used
-  }, [accounts])
-
-  // Proton 点号变体分配：会话级已分配集合，避免并发/连续注册生成重复变体
-  const protonAllocatedRef = useRef<Set<string>>(new Set())
-  /** 生成下一个未使用的 Proton 点号变体地址；母邮箱未填或变体用尽返回 null */
-  const generateProtonEmail = useCallback((): string | null => {
-    const base = protonBaseEmail.trim()
-    if (!base || !splitEmail(base)) return null
-    const used = new Set(collectUsedEmails())
-    for (const e of protonAllocatedRef.current) used.add(e.toLowerCase())
-    const result = generateNextDotVariant(base, used)
-    if (result.variant) protonAllocatedRef.current.add(result.variant.toLowerCase())
-    return result.variant
-  }, [protonBaseEmail, collectUsedEmails])
-
-  const startManual = async (): Promise<void> => {
-    // 1. 预生成邮箱：开启匿名时从母邮箱生成点号变体；否则使用母邮箱本身（如果填了）
-    let preEmail = ''
-    if (anonymousEmail) {
-      const parent = parentEmail.trim()
-      if (!parent || !splitEmail(parent)) {
-        addLog(t('register.logAnonymousNoParent'))
-        return
-      }
-      const result = generateNextDotVariant(parent, collectUsedEmails())
-      if (!result.variant) {
-        addLog(t('register.logAnonymousExhausted'))
-        return
-      }
-      preEmail = result.variant
-      setEmail(preEmail)
-      addLog(
-        t('register.logAnonymousGenerated')
-          .replace('{email}', preEmail)
-          .replace('{dots}', String(result.dotCount))
-      )
-    } else if (parentEmail.trim()) {
-      preEmail = parentEmail.trim()
-      setEmail(preEmail)
-    }
-
-    setPhase('initializing')
-    _logs = []
-    setLogs([])
-    setResult(null)
-    setImported(false)
-    addLog(t('register.logManualInit'))
-
-    const config: Record<string, string> = {}
-    if (fullName.trim()) config.fullName = fullName.trim()
-
-    // 代理池注入：如果代理池启用且有可用代理，自动取一个并传入 config
-    const proxyInfo = getRegistrationProxy()
-    if (proxyInfo) {
-      config.proxy = injectProxySession(proxyInfo.proxy)
-      config.upstreamProxy = proxyInfo.upstreamProxy
-      addLog(
-        `[Proxy] ${isEn ? 'Using proxy pool' : '使用代理池'}: ${config.proxy.replace(/:([^:@/]+)@/, ':***@')}`
-      )
-    }
-
-    const res = await window.api.registrationManualPhase1(config)
-    if (!res.success) {
-      addLog(`${t('register.logInitFailed')} ${res.error}`)
-      setPhase('idle')
-      return
-    }
-    addLog(t('register.logInitDone'))
-    setPhase('email')
-
-    // 2. 如果预填了邮箱，自动提交 phase2跳过手动输入阶段
-    if (preEmail) {
-      setPhase('running')
-      addLog(`${t('register.logSubmitEmail')} ${preEmail}`)
-      const phase2Res = await window.api.registrationManualPhase2(
-        preEmail,
-        fullName.trim() || undefined
-      )
-      if (phase2Res.success) {
-        addLog(t('register.logOtpSent'))
-        setPhase('otp')
-      } else {
-        addLog(`${t('register.logFailed')} ${phase2Res.error}`)
-        setPhase('idle')
-      }
-    }
-  }
-
-  const submitEmail = async (): Promise<void> => {
-    if (!email.trim()) return
-    setPhase('running')
-    addLog(`${t('register.logSubmitEmail')} ${email}`)
-
-    const res = await window.api.registrationManualPhase2(
-      email.trim(),
-      fullName.trim() || undefined
-    )
-    if (res.success) {
-      addLog(t('register.logOtpSent'))
-      setPhase('otp')
-    } else {
-      addLog(`${t('register.logFailed')} ${res.error}`)
-      setPhase('idle')
-    }
-  }
-
-  const submitOTP = async (): Promise<void> => {
-    if (!otp.trim()) return
-    setPhase('running')
-    addLog(`${t('register.logSubmitOtp')} ${otp}`)
-
-    const res = await window.api.registrationManualPhase3(otp.trim())
-    if (res.success) {
-      const regResult = res.result as RegResult
-      setResult(regResult)
-      setPhase('done')
-      addHistory({
-        email: regResult.email,
-        status: regResult.status,
-        password: regResult.password,
-        result: regResult
-      })
-      const isSuccess = regResult.status === 'success'
-      const needImport = batchAutoImport && isSuccess
-      const needProLink = autoFetchProLink && isSuccess
-
-      if (needImport) {
-        setPhase('importing')
-        const ok = await autoImportResult(regResult)
-        if (ok) {
-          setImported(true)
-          addLog(t('register.logImported'))
-          setHistory((prev) => {
-            const idx = prev.findIndex((h) => h.email === regResult.email && !h.imported)
-            if (idx >= 0) {
-              const u = [...prev]
-              u[idx] = { ...u[idx], imported: true }
-              return u
-            }
-            return prev
-          })
-        }
-      }
-      if (needProLink) {
-        setPhase('fetching-link')
-        await fetchProSubscriptionUrl(regResult, regResult.email)
-      }
-      // 后处理全部完成 → finalized；未启用任何后处理时保持 done（语义等价）
-      if (needImport || needProLink) {
-        setPhase('finalized')
-      }
-    } else {
-      addLog(`${t('register.logFailed')} ${res.error}`)
-      setPhase('idle')
-    }
-  }
-
-  // ============ 自动模式 (MoEmail / Outlook) ============
-
-  const startAuto = async (): Promise<void> => {
-    setPhase('running')
-    _logs = []
-    setLogs([])
-    setResult(null)
-    setImported(false)
-    const modeLabel =
-      mode === 'tempmail'
-        ? 'TempMail.Plus'
-        : mode === 'proton'
-          ? 'Proton'
-          : mode === 'gptmail'
-            ? 'GPTmail'
-            : 'Outlook'
-    addLog(t('register.logAutoStart').replace('{mode}', modeLabel))
-
-    const config: Record<string, unknown> = {}
-    if (mode === 'outlook') {
-      config.useOutlook = true
-      config.outlookData = outlookData
-    } else if (mode === 'tempmail') {
-      config.useTempMailPlus = true
-      config.tempMailPlusEmail = tempMailEmail
-      config.tempMailPlusEpin = tempMailEpin
-      config.tempMailPlusDomain = tempMailDomain
-    } else if (mode === 'proton') {
-      const variant = generateProtonEmail()
-      if (!variant) {
-        addLog(
-          isEn
-            ? '[Proton] Base email not set or all dot-variants used up'
-            : '[Proton] 未配置母邮箱或点号变体已用尽'
-        )
-        setPhase('idle')
-        return
-      }
-      config.useProton = true
-      config.protonEmail = variant
-      addLog(`[Proton] ${isEn ? 'Using dot-variant' : '使用点号变体'}: ${variant}`)
-    } else if (mode === 'gptmail') {
-      if (!gptMailDomain.trim()) {
-        addLog(isEn ? '[GPTmail] Domain not configured' : '[GPTmail] 未配置域名')
-        setPhase('idle')
-        return
-      }
-      config.useGptMail = true
-      config.gptMailBaseURL = gptMailBaseURL.trim()
-      config.gptMailInboxEmail = gptMailInboxEmail.trim() // 留空 → 私有域名直收；填了 → CF 转发
-      config.gptMailDomain = gptMailDomain
-      config.gptMailPrefix = gptMailPrefix.trim()
-      config.gptMailPrivatePassword = gptMailPrivatePassword // 私有域名设了密码才填
-    }
-
-    // 代理池注入
-    const proxyInfo = getRegistrationProxy()
-    if (proxyInfo) {
-      config.proxy = injectProxySession(proxyInfo.proxy)
-      config.upstreamProxy = proxyInfo.upstreamProxy
-      addLog(
-        `[Proxy] ${isEn ? 'Using proxy pool' : '使用代理池'}: ${String(config.proxy).replace(/:([^:@/]+)@/, ':***@')}`
-      )
-    }
-
-    const res = await window.api.registrationStartAuto(
-      config as Parameters<typeof window.api.registrationStartAuto>[0]
-    )
-    if (!res.success) {
-      addLog(`${t('register.logStartFailed')} ${res.error}`)
-      setPhase('idle')
-    }
-  }
-
-  // ============ 取消 ============
-
-  const cancel = async (): Promise<void> => {
-    await window.api.registrationCancel()
-    addLog(t('register.logCancelled'))
-    setPhase('idle')
-  }
-
-  // ============ 导入账号 ============
-
-  const importAccount = async (): Promise<void> => {
-    if (!result || result.status !== 'success' || !result.refreshToken) return
-
-    try {
-      const verifyResult = await window.api.verifyAccountCredentials({
-        refreshToken: result.refreshToken,
-        clientId: result.clientId!,
-        clientSecret: result.clientSecret!,
-        region: result.region || 'us-east-1',
-        authMethod: 'IdC',
-        provider: 'BuilderId'
-      })
-
-      const now = Date.now()
-      const defaultUsage = { current: 0, limit: 0, percentUsed: 0, lastUpdated: now }
-
-      if (verifyResult.success && verifyResult.data) {
-        const expiresAt = verifyResult.data.expiresIn
-          ? now + verifyResult.data.expiresIn * 1000
-          : now + 3600000
-        const usage = verifyResult.data.usage
-          ? {
-              ...verifyResult.data.usage,
-              percentUsed:
-                verifyResult.data.usage.limit > 0
-                  ? Math.round(
-                      (verifyResult.data.usage.current / verifyResult.data.usage.limit) * 100
-                    )
-                  : 0,
-              lastUpdated: now
-            }
-          : defaultUsage
-
-        addAccount({
-          email: verifyResult.data.email || result.email,
-          idp: 'BuilderId',
-          status: 'active',
-          credentials: {
-            refreshToken: result.refreshToken,
-            clientId: result.clientId!,
-            clientSecret: result.clientSecret!,
-            accessToken: verifyResult.data.accessToken || result.accessToken || '',
-            csrfToken: '',
-            region: result.region || 'us-east-1',
-            authMethod: 'IdC' as const,
-            provider: 'BuilderId' as const,
-            expiresAt
-          },
-          subscription: {
-            type:
-              (verifyResult.data.subscriptionType as
-                | 'Free'
-                | 'Pro'
-                | 'Pro_Plus'
-                | 'Enterprise'
-                | 'Teams') || 'Free',
-            title: verifyResult.data.subscriptionTitle || 'Free Tier'
-          },
-          usage,
-          tags: [],
-          lastUsedAt: now
-        })
-        setImported(true)
-        addLog(t('register.logImported'))
-      } else {
-        addLog(`${t('register.logVerifyFailed')} ${verifyResult.error}`)
-        addAccount({
-          email: result.email,
-          idp: 'BuilderId',
-          status: 'active',
-          credentials: {
-            refreshToken: result.refreshToken,
-            clientId: result.clientId!,
-            clientSecret: result.clientSecret!,
-            accessToken: result.accessToken || '',
-            csrfToken: '',
-            region: result.region || 'us-east-1',
-            authMethod: 'IdC' as const,
-            provider: 'BuilderId' as const,
-            expiresAt: now + 3600000
-          },
-          subscription: { type: 'Free', title: 'Free Tier' },
-          usage: defaultUsage,
-          tags: [],
-          lastUsedAt: now
-        })
-        setImported(true)
-        addLog(t('register.logDirectImport'))
-      }
-    } catch (err) {
-      addLog(`${t('register.logImportFailed')} ${err instanceof Error ? err.message : String(err)}`)
-    }
-  }
-
-  // 'isRunning' 表示注册流程主线进行中（不含 idle/email/otp 等待用户输入态、也不含完成态）
-  const isRunning =
-    phase === 'initializing' ||
-    phase === 'running' ||
-    phase === 'importing' ||
-    phase === 'fetching-link'
-  // manualSteps / currentStep 在下方"批量注册"区块的 state 定义之后计算
-
-  // ============ 批量注册 ============
-
+  const isRunning = ['initializing', 'running', 'importing', 'fetching-link'].includes(phase)
   const [batchCount, setBatchCount] = useState(saved.batchCount ?? 1)
   const [batchInterval, setBatchInterval] = useState(saved.batchInterval ?? 5)
-  const [batchRunning, _setBatchRunning] = useState(_batchRunning)
-  const [batchDone, _setBatchDone] = useState(_batchDone)
-  const [batchSuccess, _setBatchSuccess] = useState(_batchSuccess)
-  const [batchFail, _setBatchFail] = useState(_batchFail)
   const [batchAutoImport, setBatchAutoImport] = useState(saved.batchAutoImport ?? true)
   const [batchRetries, setBatchRetries] = useState(saved.batchRetries ?? 1)
   const [batchConcurrency, setBatchConcurrency] = useState(saved.batchConcurrency ?? 1)
@@ -1403,18 +334,6 @@ export function RegisterPage(): React.JSX.Element {
   const [proPlanType, setProPlanType] = useState<ProPlanType>(
     saved.proPlanType ?? 'Q_DEVELOPER_STANDALONE_PRO'
   )
-  const [batchItems, _setBatchItems] = useState<BatchItem[]>(_batchItems)
-
-  // taskId → batchItem.id 映射：直接引用模块级 Map，组件 unmount/remount 不影响
-  const taskIdToItemId = useRef(_taskIdToItemId)
-
-  /** 1Hz 心跳，让运行中任务的"总耗时"实时跳动（仅 batchRunning 时启用，省电） */
-  const [batchClock, setBatchClock] = useState(Date.now())
-  useEffect(() => {
-    if (!batchRunning) return
-    const id = setInterval(() => setBatchClock(Date.now()), 1000)
-    return () => clearInterval(id)
-  }, [batchRunning])
 
   // 动态构建注册步骤（根据是否启用自动导入 / Pro 链接）
   const manualSteps = useMemo(
@@ -1424,189 +343,8 @@ export function RegisterPage(): React.JSX.Element {
   const lastLogText = logs.length > 0 ? logs[logs.length - 1] : undefined
   const currentStep = phaseToStep(phase, lastLogText, manualSteps)
 
-  const setBatchRunning = (v: boolean) => {
-    _batchRunning = v
-    _refSetBatchRunning?.(v)
-  }
-  const setBatchDone = (v: number | ((p: number) => number)) => {
-    const next = typeof v === 'function' ? v(_batchDone) : v
-    _batchDone = next
-    _refSetBatchDone?.(next)
-  }
-  const setBatchSuccess = (v: number | ((p: number) => number)) => {
-    const next = typeof v === 'function' ? v(_batchSuccess) : v
-    _batchSuccess = next
-    _refSetBatchSuccess?.(next)
-  }
-  const setBatchFail = (v: number | ((p: number) => number)) => {
-    const next = typeof v === 'function' ? v(_batchFail) : v
-    _batchFail = next
-    _refSetBatchFail?.(next)
-  }
-  const setBatchItems = (v: BatchItem[] | ((p: BatchItem[]) => BatchItem[])) => {
-    const next = typeof v === 'function' ? v(_batchItems) : v
-    _batchItems = next
-    _refSetBatchItems?.(next)
-  }
-  const batchAbort = useRef(false)
-  // 暂停状态：仅暂停"启动新任务"，已并发执行的会跑完
-  const batchPause = useRef(false)
-  const [isPaused, setIsPaused] = useState(false)
-  // 当前批量任务在任务中心的 ID（用于更新进度）
-  const currentTaskCenterId = useRef<string | null>(null)
-
-  // ============ 注册策略模板 ============
   const [templates, setTemplates] = useState<RegisterTemplate[]>(loadTemplates)
   const [showTemplatesMenu, setShowTemplatesMenu] = useState(false)
-
-  const collectCurrentConfig = useCallback((): RegisterConfig => {
-    // mixedEnabledSources 在本组件内声明在更下方，避免 hoisting 限制：从 localStorage 读取最新值
-    let mixed: AutoEmailSource[] = ['outlook', 'tempmail']
-    try {
-      const raw = localStorage.getItem('kiro-register-mixed-sources')
-      if (raw) {
-        const arr = JSON.parse(raw) as string[]
-        mixed = arr.filter(
-          (x): x is AutoEmailSource =>
-            x === 'outlook' || x === 'tempmail' || x === 'proton' || x === 'gptmail'
-        )
-        if (mixed.length === 0) mixed = ['outlook', 'tempmail']
-      }
-    } catch {
-      /* ignore */
-    }
-    return {
-      mode,
-      outlookData,
-      fullName,
-      batchCount,
-      batchInterval,
-      batchAutoImport,
-      batchRetries,
-      batchConcurrency,
-      autoFetchProLink,
-      proPlanType,
-      tempMailEmail,
-      tempMailEpin,
-      tempMailDomain,
-      protonBaseEmail,
-      gptMailBaseURL,
-      gptMailInboxEmail,
-      gptMailDomain,
-      gptMailPrefix,
-      gptMailPrivatePassword,
-      manualParentEmail: parentEmail,
-      manualAnonymousEmail: anonymousEmail,
-      mixedEnabledSources: mixed
-    }
-  }, [
-    mode,
-    outlookData,
-    fullName,
-    batchCount,
-    batchInterval,
-    batchAutoImport,
-    batchRetries,
-    batchConcurrency,
-    autoFetchProLink,
-    proPlanType,
-    tempMailEmail,
-    tempMailEpin,
-    tempMailDomain,
-    protonBaseEmail,
-    gptMailBaseURL,
-    gptMailInboxEmail,
-    gptMailDomain,
-    gptMailPrefix,
-    gptMailPrivatePassword,
-    parentEmail,
-    anonymousEmail
-  ])
-
-  const applyTemplate = useCallback(
-    (tpl: RegisterTemplate) => {
-      const c = tpl.config
-      // 兼容老模板：mode === 'moemail' 时回退到 outlook
-      setMode((c.mode === ('moemail' as RegMode) ? 'outlook' : c.mode) as RegMode)
-      setOutlookData(c.outlookData || '')
-      setFullName(c.fullName || '')
-      setBatchCount(c.batchCount ?? 1)
-      setBatchInterval(c.batchInterval ?? 5)
-      setBatchAutoImport(c.batchAutoImport ?? true)
-      setBatchRetries(c.batchRetries ?? 1)
-      setBatchConcurrency(c.batchConcurrency ?? 1)
-      setAutoFetchProLink(c.autoFetchProLink ?? false)
-      setProPlanType(c.proPlanType ?? 'Q_DEVELOPER_STANDALONE_PRO')
-      setTempMailEmail(c.tempMailEmail || '')
-      setTempMailEpin(c.tempMailEpin || '')
-      setTempMailDomain(c.tempMailDomain || '')
-      setProtonBaseEmail(c.protonBaseEmail || '')
-      setGptMailBaseURL(c.gptMailBaseURL || '')
-      setGptMailInboxEmail(c.gptMailInboxEmail || '')
-      setGptMailDomain(c.gptMailDomain || '')
-      setGptMailPrefix(c.gptMailPrefix || '')
-      setGptMailPrivatePassword(c.gptMailPrivatePassword || '')
-      setParentEmail(c.manualParentEmail || '')
-      setAnonymousEmail(c.manualAnonymousEmail ?? false)
-      if (c.mixedEnabledSources) setMixedEnabledSources(c.mixedEnabledSources)
-      addLog(`[Template] 已应用模板：${tpl.name}`)
-      setShowTemplatesMenu(false)
-    },
-    [addLog]
-  )
-
-  const saveCurrentAsTemplate = useCallback(() => {
-    const name = prompt('为当前配置保存为模板，请输入模板名称：')?.trim()
-    if (!name) return
-    const tpl: RegisterTemplate = {
-      id: crypto.randomUUID(),
-      name,
-      config: collectCurrentConfig(),
-      createdAt: Date.now()
-    }
-    const next = [tpl, ...templates]
-    setTemplates(next)
-    saveTemplates(next)
-    addLog(`[Template] 已保存模板：${name}`)
-  }, [collectCurrentConfig, templates, addLog])
-
-  const removeTemplate = useCallback(
-    (id: string) => {
-      if (!confirm('确定删除这个模板？')) return
-      const next = templates.filter((t) => t.id !== id)
-      setTemplates(next)
-      saveTemplates(next)
-    },
-    [templates]
-  )
-
-  // ============ 定时任务 + 每日配额 ============
-  // 每日已注册成功数（按本地日期聚合，跨日自动重置）
-  const dailyQuotaKey = useMemo(() => {
-    const d = new Date()
-    return `kiro-register-quota-${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`
-  }, [])
-  const [dailyQuotaUsed, setDailyQuotaUsedState] = useState<number>(() => {
-    try {
-      return parseInt(localStorage.getItem(dailyQuotaKey) || '0', 10) || 0
-    } catch {
-      return 0
-    }
-  })
-  const incrementDailyQuota = useCallback(
-    (n: number) => {
-      setDailyQuotaUsedState((prev) => {
-        const next = prev + n
-        try {
-          localStorage.setItem(dailyQuotaKey, String(next))
-        } catch {
-          /* ignore */
-        }
-        return next
-      })
-    },
-    [dailyQuotaKey]
-  )
 
   const [dailyQuotaLimit, setDailyQuotaLimit] = useState<number>(() => {
     try {
@@ -1667,34 +405,6 @@ export function RegisterPage(): React.JSX.Element {
     }
   }, [scheduleWeekMask])
 
-  // 定时任务：每分钟检查一次是否到点（含星期过滤）
-  const scheduleTriggered = useRef<string>('') // 标记今日是否已触发，防止重复
-  useEffect(() => {
-    if (!scheduleEnabled) return
-    const tick = (): void => {
-      if (batchRunning) return
-      const now = new Date()
-      const todayKey = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`
-      if (scheduleTriggered.current === todayKey) return
-      // C6: 星期掩码过滤（位 0=周日 ... 位 6=周六）
-      const dow = now.getDay()
-      if (!(scheduleWeekMask & (1 << dow))) return
-      const [hh, mm] = scheduleTime.split(':').map((s) => parseInt(s, 10))
-      if (now.getHours() === hh && now.getMinutes() === mm) {
-        scheduleTriggered.current = todayKey
-        addLog(`[Schedule] 到达定时启动时间 ${scheduleTime}，自动开始批量注册`)
-        void startBatch()
-      }
-    }
-    const timer = setInterval(tick, 60_000)
-    tick()
-    return () => clearInterval(timer)
-    // 故意忽略 startBatch 依赖（它依赖太多 state，引用每次都变化；scheduleTriggered 防止重入）
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scheduleEnabled, scheduleTime, scheduleWeekMask, batchRunning])
-
-  // ============ 限速 + 风控 ============
-  // 持久化用户的限速配置
   const [rateLimitEnabled, setRateLimitEnabled] = useState<boolean>(() => {
     try {
       const v = localStorage.getItem('kiro-register-ratelimit-enabled')
@@ -1796,455 +506,6 @@ export function RegisterPage(): React.JSX.Element {
     }
   }, [autoPauseOnRisk])
 
-  // 限速器实例（单例 ref）
-  const rateLimiterRef = useRef<RateLimiter | null>(null)
-  // 限速器快照（每秒刷新一次到 React state）
-  const [rateSnapshot, setRateSnapshot] = useState<RateLimiterSnapshot | null>(null)
-  // 跟踪上次风控状态，避免持续触发 webhook
-  const lastRiskWarningRef = useRef(false)
-  useEffect(() => {
-    if (!batchRunning) {
-      setRateSnapshot(null)
-      lastRiskWarningRef.current = false
-      return
-    }
-    const timer = setInterval(() => {
-      if (rateLimiterRef.current) {
-        const snap = rateLimiterRef.current.snapshot()
-        setRateSnapshot(snap)
-        // 风控信号上升沿：从未警告 → 警告，触发 webhook + 可能自动暂停
-        if (snap.riskWarning && !lastRiskWarningRef.current) {
-          lastRiskWarningRef.current = true
-          // 自动暂停
-          if (autoPauseOnRisk && !batchPause.current) {
-            batchPause.current = true
-            setIsPaused(true)
-            if (currentTaskCenterId.current) {
-              useTaskStore.getState().updateTask(currentTaskCenterId.current, { status: 'paused' })
-            }
-            addLog(
-              `[RiskControl] 风控触发，自动暂停（成功率 ${Math.round(snap.successRate * 100)}%）`
-            )
-          }
-          void useWebhookStore.getState().triggerEvent('risk-warning', {
-            title: '风控信号触发',
-            message: `批量注册成功率降至 ${Math.round(snap.successRate * 100)}%${autoPauseOnRisk ? '，已自动暂停' : '，建议暂停检查'}`,
-            level: 'warn',
-            fields: {
-              成功率: `${Math.round(snap.successRate * 100)}%`,
-              连续失败: snap.consecutiveFailures,
-              吞吐: `${snap.throughputPerMinute}/min`,
-              动作: autoPauseOnRisk ? '已自动暂停' : '请手动检查'
-            }
-          })
-        } else if (!snap.riskWarning && lastRiskWarningRef.current) {
-          // 风控恢复
-          lastRiskWarningRef.current = false
-        }
-      }
-    }, 1000)
-    return () => clearInterval(timer)
-  }, [batchRunning])
-
-  // 自动保存配置到 localStorage
-  useEffect(() => {
-    saveConfig({
-      mode,
-      outlookData,
-      fullName,
-      batchCount,
-      batchInterval,
-      batchAutoImport,
-      batchRetries,
-      batchConcurrency,
-      autoFetchProLink,
-      proPlanType,
-      tempMailEmail,
-      tempMailEpin,
-      tempMailDomain,
-      protonBaseEmail,
-      gptMailBaseURL,
-      gptMailInboxEmail,
-      gptMailDomain,
-      gptMailPrefix,
-      gptMailPrivatePassword,
-      manualParentEmail: parentEmail,
-      manualAnonymousEmail: anonymousEmail
-    })
-  }, [
-    mode,
-    outlookData,
-    fullName,
-    batchCount,
-    batchInterval,
-    batchAutoImport,
-    batchRetries,
-    batchConcurrency,
-    autoFetchProLink,
-    proPlanType,
-    tempMailEmail,
-    tempMailEpin,
-    tempMailDomain,
-    protonBaseEmail,
-    gptMailBaseURL,
-    gptMailInboxEmail,
-    gptMailDomain,
-    gptMailPrefix,
-    gptMailPrivatePassword,
-    parentEmail,
-    anonymousEmail
-  ])
-
-  // 匿名邮箱预览计算 — 以 anonymousEmail/parentEmail/accounts 为依赖实时冷算下一个变体
-  const anonymousPreview = useMemo(() => {
-    if (!anonymousEmail) return null
-    const parent = parentEmail.trim()
-    if (!parent) return { error: 'empty' as const }
-    const split = splitEmail(parent)
-    if (!split) return { error: 'invalid' as const }
-    const used = new Set<string>()
-    for (const acc of accounts.values()) {
-      if (acc.email) used.add(acc.email.toLowerCase())
-    }
-    for (const item of loadHistory()) {
-      if (item.email) used.add(item.email.toLowerCase())
-    }
-    const result = generateNextDotVariant(parent, used)
-    const sameRootCount = countSameRootVariants(parent, used)
-    const localLen = split[0].replace(/\./g, '').length
-    // 上限估算到 5 个点，足以应付绝大多数场景（避免大二项式造成 UI 误导）
-    const totalCapacity = totalVariantCount(localLen, 5)
-    return {
-      ...result,
-      sameRootCount,
-      totalCapacity,
-      localLen,
-      error: null as null | 'empty' | 'invalid'
-    }
-  }, [anonymousEmail, parentEmail, accounts])
-
-  // ============ 注册历史 ============
-
-  const [history, _setHistory] = useState<HistoryItem[]>(loadHistory)
-
-  const setHistory = useCallback(
-    (updater: HistoryItem[] | ((prev: HistoryItem[]) => HistoryItem[])) => {
-      _refSetHistory?.((prev) => {
-        const next = typeof updater === 'function' ? updater(prev) : updater
-        saveHistory(next)
-        return next
-      })
-    },
-    []
-  )
-
-  const addHistory = useCallback(
-    (item: Omit<HistoryItem, 'id' | 'time' | 'imported'>) => {
-      setHistory((prev) => [
-        {
-          ...item,
-          id: crypto.randomUUID(),
-          time: Date.now(),
-          imported: false
-        },
-        ...prev
-      ])
-    },
-    [setHistory]
-  )
-
-  // 注册模块级 setter refs，确保异步代码跨组件生命周期调用最新 setter
-  useEffect(() => {
-    _refSetPhase = _setPhase
-    _refSetResult = _setResult
-    _refSetLogs = setLogs
-    _refSetBatchRunning = _setBatchRunning
-    _refSetBatchDone = _setBatchDone
-    _refSetBatchSuccess = _setBatchSuccess
-    _refSetBatchFail = _setBatchFail
-    _refSetBatchItems = _setBatchItems
-    _refSetHistory = _setHistory
-    // 组件重新挂载时同步模块级状态到 React state
-    _setPhase(_phase)
-    _setResult(_result)
-    setLogs([..._logs])
-    _setBatchRunning(_batchRunning)
-    _setBatchDone(_batchDone)
-    _setBatchSuccess(_batchSuccess)
-    _setBatchFail(_batchFail)
-    _setBatchItems([..._batchItems])
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  // 自动导入单个成功结果
-  const autoImportResult = useCallback(
-    async (regResult: RegResult): Promise<boolean> => {
-      if (!regResult.refreshToken || !regResult.clientId || !regResult.clientSecret) return false
-      const now = Date.now()
-      const defaultUsage = { current: 0, limit: 0, percentUsed: 0, lastUpdated: now }
-
-      // 快速路径：后端 verifyAlive 已返回完整信息（verify.alive=true），直接用它导入
-      // 避免重新调 verifyAccountCredentials 花 30-60 秒（网络请求冗余）
-      const v = regResult.verify as Record<string, unknown> | undefined
-      if (v && v.alive) {
-        const sub = String(v.subscription || 'KIRO FREE')
-        const creditUsed = Number(v.credit_used) || 0
-        const creditLimit = Number(v.credit_limit) || 0
-        const subType = sub.includes('PRO_PLUS')
-          ? ('Pro_Plus' as const)
-          : sub.includes('PRO')
-            ? ('Pro' as const)
-            : sub.includes('POWER')
-              ? ('Pro_Plus' as const)
-              : ('Free' as const)
-        addAccount({
-          email: String(v.email || regResult.email),
-          password: regResult.password,
-          idp: 'BuilderId',
-          status: 'active',
-          credentials: {
-            refreshToken: regResult.refreshToken,
-            clientId: regResult.clientId,
-            clientSecret: regResult.clientSecret,
-            accessToken: regResult.accessToken || '',
-            csrfToken: '',
-            region: regResult.region || 'us-east-1',
-            authMethod: 'IdC' as const,
-            provider: 'BuilderId' as const,
-            expiresAt: now + 3600000
-          },
-          subscription: { type: subType, title: sub },
-          usage:
-            creditLimit > 0
-              ? {
-                  current: creditUsed,
-                  limit: creditLimit,
-                  percentUsed: Math.round((creditUsed / creditLimit) * 100),
-                  lastUpdated: now
-                }
-              : defaultUsage,
-          tags: [],
-          lastUsedAt: now
-        })
-        return true
-      }
-
-      // 降级路径：后端 verify 信息缺失时走网络验证（兜底）
-      try {
-        const verifyResult = await window.api.verifyAccountCredentials({
-          refreshToken: regResult.refreshToken,
-          clientId: regResult.clientId,
-          clientSecret: regResult.clientSecret,
-          region: regResult.region || 'us-east-1',
-          authMethod: 'IdC',
-          provider: 'BuilderId'
-        })
-
-        if (verifyResult.success && verifyResult.data) {
-          const expiresAt = verifyResult.data.expiresIn
-            ? now + verifyResult.data.expiresIn * 1000
-            : now + 3600000
-          const usage = verifyResult.data.usage
-            ? {
-                ...verifyResult.data.usage,
-                percentUsed:
-                  verifyResult.data.usage.limit > 0
-                    ? Math.round(
-                        (verifyResult.data.usage.current / verifyResult.data.usage.limit) * 100
-                      )
-                    : 0,
-                lastUpdated: now
-              }
-            : defaultUsage
-          addAccount({
-            email: verifyResult.data.email || regResult.email,
-            password: regResult.password,
-            idp: 'BuilderId',
-            status: 'active',
-            credentials: {
-              refreshToken: regResult.refreshToken,
-              clientId: regResult.clientId,
-              clientSecret: regResult.clientSecret,
-              accessToken: verifyResult.data.accessToken || regResult.accessToken || '',
-              csrfToken: '',
-              region: regResult.region || 'us-east-1',
-              authMethod: 'IdC' as const,
-              provider: 'BuilderId' as const,
-              expiresAt
-            },
-            subscription: {
-              type:
-                (verifyResult.data.subscriptionType as
-                  | 'Free'
-                  | 'Pro'
-                  | 'Pro_Plus'
-                  | 'Enterprise'
-                  | 'Teams') || 'Free',
-              title: verifyResult.data.subscriptionTitle || 'Free Tier'
-            },
-            usage,
-            tags: [],
-            lastUsedAt: now
-          })
-        } else {
-          addAccount({
-            email: regResult.email,
-            password: regResult.password,
-            idp: 'BuilderId',
-            status: 'active',
-            credentials: {
-              refreshToken: regResult.refreshToken,
-              clientId: regResult.clientId,
-              clientSecret: regResult.clientSecret,
-              accessToken: regResult.accessToken || '',
-              csrfToken: '',
-              region: regResult.region || 'us-east-1',
-              authMethod: 'IdC' as const,
-              provider: 'BuilderId' as const,
-              expiresAt: now + 3600000
-            },
-            subscription: { type: 'Free', title: 'Free Tier' },
-            usage: defaultUsage,
-            tags: [],
-            lastUsedAt: now
-          })
-        }
-        return true
-      } catch {
-        return false
-      }
-    },
-    [addAccount]
-  )
-
-  // 获取 Pro 订阅链接并写入订阅页面链接列表
-  const fetchProSubscriptionUrl = useCallback(
-    async (regResult: RegResult, email: string): Promise<string | undefined> => {
-      const accessToken = regResult.accessToken
-      if (!accessToken) return undefined
-      const linkId = crypto.randomUUID()
-      appendSubscriptionLink({ accountId: linkId, email, status: 'loading' })
-      try {
-        addLog(
-          `[Pro Link] ${email}: ${t('register.fetchingProLink')} (${proPlanType.replace('Q_DEVELOPER_STANDALONE_', '')})...`
-        )
-        const result = await window.api.accountGetSubscriptionUrl(
-          accessToken,
-          proPlanType,
-          regResult.region || 'us-east-1',
-          undefined,
-          undefined,
-          'BuilderId',
-          'IdC',
-          undefined
-        )
-        if (result.success && result.url) {
-          addLog(`[Pro Link] ${email}: ${result.url}`)
-          updateSubscriptionLink(linkId, { status: 'success', url: result.url })
-          return result.url
-        }
-        const errMsg = result.error || 'Failed to get link'
-        addLog(`[Pro Link] ${email}: ${errMsg}`)
-        updateSubscriptionLink(linkId, { status: 'error', error: errMsg })
-        return undefined
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err)
-        addLog(`[Pro Link] ${email}: ${errMsg}`)
-        updateSubscriptionLink(linkId, { status: 'error', error: errMsg })
-        return undefined
-      }
-    },
-    [addLog, t]
-  )
-
-  // 监听注册完成 - 同时记录到历史 + 自动导入
-  const onRegComplete = useCallback(
-    async (res: RegResult) => {
-      setResult(res)
-      setPhase('done')
-      if (res.status === 'success') {
-        addLog(`${t('register.logRegSuccess')} ${res.email}`)
-        addHistory({ email: res.email, status: 'success', password: res.password, result: res })
-        // 触发 Webhook
-        void useWebhookStore.getState().triggerEvent('register-success', {
-          title: '账号注册成功',
-          message: `新账号 ${res.email} 注册完成`,
-          level: 'success',
-          fields: { 邮箱: res.email, 模式: mode }
-        })
-        // 与手动模式 submitOTP 状态机保持一致：后处理期间推进 phase，
-        // 避免后处理仍在跑时 phase 提前变 'done' 导致"新注册"按钮提前出现 + reset 竞态
-        const needImport = batchAutoImport
-        const needProLink = autoFetchProLink
-        if (needImport) {
-          setPhase('importing')
-          const ok = await autoImportResult(res)
-          if (ok) {
-            setImported(true)
-            addLog(t('register.logImported'))
-            setHistory((prev) => {
-              const idx = prev.findIndex((h) => h.email === res.email && !h.imported)
-              if (idx >= 0) {
-                const u = [...prev]
-                u[idx] = { ...u[idx], imported: true }
-                return u
-              }
-              return prev
-            })
-          }
-        }
-        if (needProLink) {
-          setPhase('fetching-link')
-          await fetchProSubscriptionUrl(res, res.email)
-        }
-        // 后处理全部完成 → finalized；未启用任何后处理时保持 done（语义等价）
-        if (needImport || needProLink) {
-          setPhase('finalized')
-        }
-      } else {
-        addLog(`${t('register.logRegFailed')} ${res.error}`)
-        addHistory({
-          email: res.email,
-          status: res.status,
-          error: res.error,
-          password: res.password,
-          result: res
-        })
-        // 单次模式失败补偿：邮箱已占用时加入黑名单（与批量 runSingleWithRetry 逻辑对齐），
-        // 下次 generateProtonEmail / 匿名变体经 collectUsedEmails 自动跳过
-        if (res.email && classifyError(res.error) === 'email_used') {
-          const set = loadEmailBlacklist()
-          set.add(res.email.toLowerCase())
-          saveEmailBlacklist(set)
-          addLog(`[Precheck] 邮箱 ${res.email} 已加入占用黑名单`)
-        }
-        // 触发 Webhook
-        void useWebhookStore.getState().triggerEvent('register-failed', {
-          title: '账号注册失败',
-          message: `${res.email || '(未知邮箱)'} 注册失败`,
-          level: 'error',
-          fields: { 邮箱: res.email || '-', 错误: res.error || '-', 模式: mode }
-        })
-      }
-    },
-    [
-      addLog,
-      addHistory,
-      t,
-      batchAutoImport,
-      autoImportResult,
-      autoFetchProLink,
-      fetchProSubscriptionUrl,
-      mode
-    ]
-  )
-
-  // 覆盖原有的 onRegistrationComplete 监听
-  useEffect(() => {
-    const unsub = window.api.onRegistrationComplete(onRegComplete)
-    return () => unsub()
-  }, [onRegComplete])
-
-  // 混合模式：启用的子源 + 权重 + 累积调度状态
   const [mixedEnabledSources, setMixedEnabledSources] = useState<AutoEmailSource[]>(() => {
     try {
       const raw = localStorage.getItem('kiro-register-mixed-sources')
@@ -2295,709 +556,204 @@ export function RegisterPage(): React.JSX.Element {
     }
   }, [mixedWeights])
 
-  // 加权轮询调度：维护各源的"信用"分数，每次选信用最高的，扣除后累积
-  // 这是 Smooth Weighted Round-Robin 算法（nginx 用的同款）
-  const mixedCredits = useRef<Record<AutoEmailSource, number>>({
-    outlook: 0,
-    tempmail: 0,
-    proton: 0,
-    gptmail: 0
-  })
-
-  /** 在混合模式下按加权轮询挑选下一个有效子源 */
-  const pickNextSource = useCallback((): AutoEmailSource | null => {
-    const candidates = mixedEnabledSources.filter((src) => {
-      // 子源必须填了对应的配置
-      if (src === 'outlook') return !!outlookData.trim()
-      if (src === 'tempmail')
-        return !!(tempMailDomain.trim() && tempMailEmail.trim() && tempMailEpin.trim())
-      if (src === 'proton') return !!protonBaseEmail.trim()
-      // GPTmail：只要有域名就 OK（inboxEmail 留空 = 私有直收模式）
-      if (src === 'gptmail') return !!gptMailDomain.trim()
-      return false
-    })
-    if (candidates.length === 0) return null
-    if (candidates.length === 1) return candidates[0]
-
-    // SWRR：每次给所有候选 credit += weight，挑选 credit 最高的，然后该项 credit -= totalWeight
-    let totalWeight = 0
-    for (const c of candidates) totalWeight += Math.max(0, mixedWeights[c] || 0)
-    if (totalWeight === 0) totalWeight = candidates.length // 兜底：全 0 权重时退化为简单轮询
-
-    let best: AutoEmailSource | null = null
-    let bestCredit = -Infinity
-    for (const c of candidates) {
-      const w = Math.max(0, mixedWeights[c] || 0) || 1
-      mixedCredits.current[c] = (mixedCredits.current[c] || 0) + w
-      if (mixedCredits.current[c] > bestCredit) {
-        best = c
-        bestCredit = mixedCredits.current[c]
-      }
+  const collectCurrentConfig = useCallback((): RegisterConfig => {
+    return {
+      mode,
+      outlookData,
+      fullName,
+      batchCount,
+      batchInterval,
+      batchAutoImport,
+      batchRetries,
+      batchConcurrency,
+      autoFetchProLink,
+      proPlanType,
+      tempMailEmail,
+      tempMailEpin,
+      tempMailDomain,
+      protonBaseEmail,
+      gptMailBaseURL,
+      gptMailInboxEmail,
+      gptMailDomain,
+      gptMailPrefix,
+      gptMailPrivatePassword,
+      manualParentEmail: parentEmail,
+      manualAnonymousEmail: anonymousEmail,
+      mixedEnabledSources
     }
-    if (best) {
-      mixedCredits.current[best] -= totalWeight
-    }
-    return best
-  }, [
-    mixedEnabledSources,
-    mixedWeights,
-    outlookData,
-    tempMailDomain,
-    tempMailEmail,
-    tempMailEpin,
-    protonBaseEmail,
-    gptMailDomain,
-    gptMailInboxEmail
-  ])
-
-  // 构建自动模式配置
-  const buildAutoConfig = useCallback((): Parameters<
-    typeof window.api.registrationStartAuto
-  >[0] => {
-    const config: Record<string, unknown> = {}
-
-    // 混合模式：每次调用挑一个子源
-    const effectiveMode: AutoEmailSource | null =
-      mode === 'mixed' ? pickNextSource() : mode === 'manual' ? null : (mode as AutoEmailSource)
-
-    if (effectiveMode === 'tempmail') {
-      config.useTempMailPlus = true
-      config.tempMailPlusEmail = tempMailEmail
-      config.tempMailPlusEpin = tempMailEpin
-      config.tempMailPlusDomain = tempMailDomain
-    } else if (effectiveMode === 'outlook') {
-      config.useOutlook = true
-      config.outlookData = outlookData
-    } else if (effectiveMode === 'proton') {
-      config.useProton = true
-      const variant = generateProtonEmail()
-      if (variant) config.protonEmail = variant
-    } else if (effectiveMode === 'gptmail') {
-      config.useGptMail = true
-      config.gptMailBaseURL = gptMailBaseURL.trim()
-      config.gptMailInboxEmail = gptMailInboxEmail.trim()
-      config.gptMailDomain = gptMailDomain
-      config.gptMailPrefix = gptMailPrefix.trim()
-      config.gptMailPrivatePassword = gptMailPrivatePassword
-    }
-    return config as Parameters<typeof window.api.registrationStartAuto>[0]
   }, [
     mode,
-    pickNextSource,
     outlookData,
+    fullName,
+    batchCount,
+    batchInterval,
+    batchAutoImport,
+    batchRetries,
+    batchConcurrency,
+    autoFetchProLink,
+    proPlanType,
     tempMailEmail,
     tempMailEpin,
     tempMailDomain,
-    generateProtonEmail,
+    protonBaseEmail,
     gptMailBaseURL,
     gptMailInboxEmail,
     gptMailDomain,
     gptMailPrefix,
-    gptMailPrivatePassword
+    gptMailPrivatePassword,
+    parentEmail,
+    anonymousEmail,
+    mixedEnabledSources
   ])
 
-  // 代理池：注册时为每个任务自动挑选一个出口代理（启用后生效）
-  const { proxyPool, proxyPoolConfig, pickNextProxy, reportProxyResult } = useAccountsStore()
+  const applyTemplate = useCallback((tpl: RegisterTemplate) => {
+    const c = tpl.config
+    // 兼容老模板：mode === 'moemail' 时回退到 outlook
+    setMode((c.mode === ('moemail' as RegMode) ? 'outlook' : c.mode) as RegMode)
+    setOutlookData(c.outlookData || '')
+    setFullName(c.fullName || '')
+    setBatchCount(c.batchCount ?? 1)
+    setBatchInterval(c.batchInterval ?? 5)
+    setBatchAutoImport(c.batchAutoImport ?? true)
+    setBatchRetries(c.batchRetries ?? 1)
+    setBatchConcurrency(c.batchConcurrency ?? 1)
+    setAutoFetchProLink(c.autoFetchProLink ?? false)
+    setProPlanType(c.proPlanType ?? 'Q_DEVELOPER_STANDALONE_PRO')
+    setTempMailEmail(c.tempMailEmail || '')
+    setTempMailEpin(c.tempMailEpin || '')
+    setTempMailDomain(c.tempMailDomain || '')
+    setProtonBaseEmail(c.protonBaseEmail || '')
+    setGptMailBaseURL(c.gptMailBaseURL || '')
+    setGptMailInboxEmail(c.gptMailInboxEmail || '')
+    setGptMailDomain(c.gptMailDomain || '')
+    setGptMailPrefix(c.gptMailPrefix || '')
+    setGptMailPrivatePassword(c.gptMailPrivatePassword || '')
+    setParentEmail(c.manualParentEmail || '')
+    setAnonymousEmail(c.manualAnonymousEmail ?? false)
+    if (c.mixedEnabledSources) setMixedEnabledSources(c.mixedEnabledSources)
+    addLog(`[Template] 已应用模板：${tpl.name}`)
+    setShowTemplatesMenu(false)
+  }, [])
 
-  /**
-   * Outlook 单行池：批量启动时 shuffle 一次，每个 task 独占一行避免并发抢占。
-   * 之前的 bug：所有 task 共享同一份 outlookData，主进程用 Math.random() 挑选 → 并发任务可能撞同一个邮箱。
-   */
-  const outlookPoolRef = useRef<string[]>([])
+  const saveCurrentAsTemplate = useCallback(() => {
+    const name = prompt('为当前配置保存为模板，请输入模板名称：')?.trim()
+    if (!name) return
+    const tpl: RegisterTemplate = {
+      id: crypto.randomUUID(),
+      name,
+      config: collectCurrentConfig(),
+      createdAt: Date.now()
+    }
+    const next = [tpl, ...templates]
+    setTemplates(next)
+    saveTemplates(next)
+    addLog(`[Template] 已保存模板：${name}`)
+  }, [collectCurrentConfig, templates])
 
-  // 执行单次注册（含重试）— 每次都重新 buildAutoConfig，让 mixed 模式权重正确生效
-  const runSingleWithRetry = useCallback(
-    async (
-      itemId: string,
-      taskId: string,
-      maxRetries: number
-    ): Promise<{ success: boolean; result?: RegResult }> => {
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        // 暂停时阻塞等待恢复；停止时立即退出 —— 让暂停/停止对"重试"也即时生效
-        while (batchPause.current && !batchAbort.current) {
-          await new Promise((r) => setTimeout(r, 300))
-        }
-        if (batchAbort.current) return { success: false }
-
-        if (attempt > 0) {
-          setBatchItems((prev) =>
-            prev.map((it) =>
-              it.id === itemId
-                ? { ...it, status: 'retrying' as BatchItemStatus, retryCount: attempt }
-                : it
-            )
-          )
-          addLog(
-            t('register.batchRetrying')
-              .replace('{current}', String(attempt))
-              .replace('{max}', String(maxRetries))
-          )
-          // 可中断的重试等待（每 100ms 检查一次 abort，最多 3s）
-          for (let w = 0; w < 30 && !batchAbort.current; w++) {
-            await new Promise((r) => setTimeout(r, 100))
-          }
-          if (batchAbort.current) return { success: false }
-        } else {
-          setBatchItems((prev) =>
-            prev.map((it) =>
-              it.id === itemId ? { ...it, status: 'running' as BatchItemStatus } : it
-            )
-          )
-        }
-
-        // 每次都重新 build：混合模式下每个 task / 每次重试都独立挑源（权重正确生效）
-        const config = buildAutoConfig()
-        const enrichedConfig: Record<string, unknown> = { ...config, taskId }
-
-        // Outlook 模式：从 shuffle 后的池里取单行（不同 task 不会抢同一个邮箱）
-        // 池空时回退到完整列表（主进程 random pick，兼容兜底）
-        if (config.useOutlook && outlookPoolRef.current.length > 0) {
-          const line = outlookPoolRef.current.shift()
-          if (line) {
-            enrichedConfig.outlookData = line
-            addLog(`[Outlook] 分配邮箱: ${line.split('----')[0]}`)
-          }
-        }
-
-        // 从代理池挑一个代理（仅在启用时）；每次重试也重新挑，让失效代理自动回避
-        let pickedProxy: ReturnType<typeof pickNextProxy> = null
-        if (proxyPoolConfig.enabled) {
-          // 严格代理模式：代理池启用就绝不允许裸奔直连（暴露本机真实 IP 给 AWS 是大忌）
-          if (proxyPool.size === 0) {
-            addLog(
-              '[Proxy] 代理池已启用但池中无任何代理，已中止注册（请先在「代理池」页面添加代理）'
-            )
-            return {
-              success: false,
-              result: { status: 'failed', email: '', error: '代理池已启用但池为空' } as RegResult
-            }
-          }
-          pickedProxy = pickNextProxy()
-          if (!pickedProxy) {
-            addLog(
-              '[Proxy] 代理池已启用但当前无可用代理（全部 dead/disabled），已中止注册以防裸奔直连'
-            )
-            return {
-              success: false,
-              result: { status: 'failed', email: '', error: '代理池无可用代理' } as RegResult
-            }
-          }
-          const proxyUrl = injectProxySession(pickedProxy.url)
-          enrichedConfig.proxy = proxyUrl
-          enrichedConfig.strictProxy = true
-          if (proxyPoolConfig.upstreamProxy && proxyPoolConfig.upstreamProxy.trim()) {
-            enrichedConfig.upstreamProxy = proxyPoolConfig.upstreamProxy.trim()
-          }
-          const sessionTag = proxyUrl !== pickedProxy.url ? ' (session 已注入)' : ''
-          addLog(
-            `[Proxy] Using ${pickedProxy.protocol}://${pickedProxy.host}:${pickedProxy.port}${sessionTag}`
-          )
-        }
-
-        const res = await window.api.registrationStartAuto(enrichedConfig as typeof config)
-
-        // 上报代理使用结果
-        if (pickedProxy) {
-          const ok = res.success && (res.result as RegResult | undefined)?.status === 'success'
-          const emailUsed = (res.result as RegResult | undefined)?.email
-          const errMsg = res.error || (res.result as RegResult | undefined)?.error
-          reportProxyResult(pickedProxy.id, ok, emailUsed, errMsg)
-        }
-
-        if (res.success && res.result) {
-          const regResult = res.result as RegResult
-          if (regResult.status === 'success') {
-            return { success: true, result: regResult }
-          }
-          if (attempt === maxRetries) {
-            return { success: false, result: regResult }
-          }
-        } else if (!res.success) {
-          if (attempt === maxRetries) return { success: false }
-        }
-      }
-      return { success: false }
+  const removeTemplate = useCallback(
+    (id: string) => {
+      if (!confirm('确定删除这个模板？')) return
+      const next = templates.filter((t) => t.id !== id)
+      setTemplates(next)
+      saveTemplates(next)
     },
-    [
-      addLog,
-      t,
-      proxyPool,
-      proxyPoolConfig.enabled,
-      pickNextProxy,
-      reportProxyResult,
-      buildAutoConfig
-    ]
+    [templates]
   )
 
-  // 处理单个批量注册任务完成
-  const handleBatchOutcome = async (
-    itemId: string,
-    outcome: { success: boolean; result?: RegResult }
-  ): Promise<void> => {
-    if (outcome.success && outcome.result) {
-      setBatchSuccess((p) => p + 1)
-      // 每日配额计数（仅成功才扣减）
-      if (dailyQuotaLimit > 0) incrementDailyQuota(1)
-      setBatchItems((prev) =>
-        prev.map((it) =>
-          it.id === itemId ? { ...it, status: 'success', email: outcome.result!.email } : it
-        )
-      )
-      addHistory({
-        email: outcome.result.email,
-        status: 'success',
-        password: outcome.result.password,
-        result: outcome.result
-      })
-
-      if (batchAutoImport) {
-        const imported = await autoImportResult(outcome.result)
-        setBatchItems((prev) =>
-          prev.map((it) =>
-            it.id === itemId ? { ...it, status: imported ? 'imported' : 'import_failed' } : it
-          )
-        )
-        if (imported) {
-          addLog(t('register.logImported'))
-          setHistory((prev) => {
-            const idx = prev.findIndex((h) => h.email === outcome.result!.email && !h.imported)
-            if (idx >= 0) {
-              const updated = [...prev]
-              updated[idx] = { ...updated[idx], imported: true }
-              return updated
-            }
-            return prev
-          })
-        }
-      }
-      if (autoFetchProLink) {
-        await fetchProSubscriptionUrl(outcome.result, outcome.result.email)
-      }
-    } else {
-      setBatchFail((p) => p + 1)
-      const errEmail = outcome.result?.email || ''
-      const errMsg = outcome.result?.error || 'unknown'
-      setBatchItems((prev) =>
-        prev.map((it) =>
-          it.id === itemId ? { ...it, status: 'failed', email: errEmail, error: errMsg } : it
-        )
-      )
-      if (outcome.result) {
-        addHistory({ email: errEmail, status: 'failed', error: errMsg })
-      }
-      const errCategory = classifyError(errMsg)
-      // 经验型预校验：邮箱已占用错误加入黑名单
-      if (errEmail && errCategory === 'email_used') {
-        const set = loadEmailBlacklist()
-        set.add(errEmail.toLowerCase())
-        saveEmailBlacklist(set)
-        addLog(`[Precheck] 邮箱 ${errEmail} 已加入占用黑名单`)
-      }
-      // AWS 风控触发：立即暂停（如启用自动暂停）
-      if (errCategory === 'risk_control' && autoPauseOnRisk && !batchPause.current) {
-        batchPause.current = true
-        setIsPaused(true)
-        if (currentTaskCenterId.current) {
-          useTaskStore.getState().updateTask(currentTaskCenterId.current, { status: 'paused' })
-        }
-        addLog(`[RiskControl] 检测到 AWS 风控（${errEmail || '账号'}），自动暂停批量注册`)
-        void useWebhookStore.getState().triggerEvent('risk-warning', {
-          title: 'AWS 风控触发，已自动暂停',
-          message: `账号 ${errEmail || '(创建中)'} 触发 AWS 风控限流。建议启用代理池 + 验活，或换 IP 后再恢复。`,
-          level: 'error',
-          fields: { 邮箱: errEmail || '-', 错误: errMsg }
-        })
-      }
+  const collectOptions = useCallback(
+    (): RegistrationOptions => ({
+      ...collectCurrentConfig(),
+      dailyQuotaLimit,
+      rateLimitEnabled,
+      maxPerMinute,
+      burstSize,
+      backoffBaseSec,
+      backoffMaxSec,
+      autoBackoff,
+      autoPauseOnRisk,
+      mixedWeights
+    }),
+    [
+      collectCurrentConfig,
+      dailyQuotaLimit,
+      rateLimitEnabled,
+      maxPerMinute,
+      burstSize,
+      backoffBaseSec,
+      backoffMaxSec,
+      autoBackoff,
+      autoPauseOnRisk,
+      mixedWeights
+    ]
+  )
+  const pendingConfig = useRef<RegisterConfig | undefined>(undefined)
+  useEffect(() => {
+    const options = collectOptions()
+    pendingConfig.current = options
+    setRegistrationOptions(options)
+    const timer = setTimeout(() => saveConfig(options), 300)
+    return () => clearTimeout(timer)
+  }, [collectOptions])
+  useEffect(
+    () => () => {
+      if (pendingConfig.current) saveConfig(pendingConfig.current)
+    },
+    []
+  )
+  const anonymousPreview = useMemo(() => {
+    if (!anonymousEmail) return null
+    const parent = parentEmail.trim()
+    if (!parent) return { error: 'empty' as const }
+    const split = splitEmail(parent)
+    if (!split) return { error: 'invalid' as const }
+    const used = collectRegistrationEmails(accounts?.values(), history)
+    const localLen = split[0].replace(/\./g, '').length
+    return {
+      ...generateNextDotVariant(parent, used),
+      sameRootCount: countSameRootVariants(parent, used),
+      totalCapacity: totalVariantCount(localLen, 5),
+      localLen,
+      error: null as null | 'empty' | 'invalid'
     }
-    setBatchDone((p) => p + 1)
+  }, [anonymousEmail, parentEmail, accounts, history])
+  const reset = (): void => {
+    resetRegistration()
+    setOtp('')
   }
-
-  // 批量注册主逻辑（支持并发 + 暂停/恢复 + 任务中心进度上报）
-  // 第二个参数 retryItems 用于"从失败重试队列"启动：仅重跑指定 items 而非创建新 N 个
-  const startBatch = async (retryItems?: BatchItem[]): Promise<void> => {
-    if (mode === 'manual') return
-
-    // 每日配额检查
-    if (dailyQuotaLimit > 0) {
-      const remainingQuota = Math.max(0, dailyQuotaLimit - dailyQuotaUsed)
-      if (remainingQuota === 0) {
-        addLog(`[Quota] 今日配额已满 (${dailyQuotaUsed}/${dailyQuotaLimit})，跳过启动`)
-        alert(`今日注册配额已用完 (${dailyQuotaUsed}/${dailyQuotaLimit})`)
+  const startManual = async (): Promise<void> => {
+    let address = parentEmail.trim()
+    if (anonymousEmail) {
+      const generated = generateNextDotVariant(address, collectRegistrationEmails()).variant
+      if (!generated) {
+        addLog(t('register.logAnonymousExhausted'))
         return
       }
-      const want = retryItems ? retryItems.length : batchCount
-      if (want > remainingQuota) {
-        addLog(
-          `[Quota] 本次申请 ${want} 个，今日剩余配额 ${remainingQuota}，自动缩减到 ${remainingQuota}`
-        )
-        if (!retryItems) {
-          setBatchCount(remainingQuota)
-        }
-      }
+      address = generated
     }
-
-    setBatchRunning(true)
-    batchAbort.current = false
-    batchPause.current = false
-    setIsPaused(false)
-
-    let items: BatchItem[]
-    if (retryItems && retryItems.length > 0) {
-      // 仅重置传入项的状态
-      items = retryItems.map((it) => ({
-        ...it,
-        status: 'pending' as BatchItemStatus,
-        error: undefined,
-        retryCount: 0
-      }))
-      // 合并回完整列表，保持其它成功项可见
-      const ids = new Set(items.map((i) => i.id))
-      setBatchItems((prev) => [...prev.filter((it) => !ids.has(it.id)), ...items])
-      // 重试模式下统计仅重置失败计数
-      setBatchFail(0)
-      setBatchDone((prev) => Math.max(0, prev - items.length))
-    } else {
-      setBatchDone(0)
-      setBatchSuccess(0)
-      setBatchFail(0)
-      items = Array.from({ length: batchCount }, (_, i) => ({
-        id: crypto.randomUUID(),
-        index: i + 1,
-        status: 'pending' as BatchItemStatus,
-        email: '',
-        retryCount: 0
-      }))
-      setBatchItems(items)
-    }
-
-    const concurrency = Math.max(1, batchConcurrency)
-    const totalCount = items.length
-
-    // 初始化 Outlook 单行池（avoid 并发抢占）—— 仅当 outlook / mixed 启用且填了 outlookData
-    const needsOutlook =
-      mode === 'outlook' || (mode === 'mixed' && mixedEnabledSources.includes('outlook'))
-    if (needsOutlook && outlookData.trim()) {
-      const lines = outlookData
-        .split('\n')
-        .map((s) => s.trim())
-        .filter((s) => s.includes('----'))
-      // Fisher-Yates shuffle
-      for (let i = lines.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1))
-        ;[lines[i], lines[j]] = [lines[j], lines[i]]
-      }
-      outlookPoolRef.current = lines
-      if (lines.length < totalCount) {
-        addLog(
-          `[Outlook] 警告：邮箱池仅 ${lines.length} 个，本批 ${totalCount} 个任务，超出部分将随机复用（可能撞号）`
-        )
-      } else {
-        addLog(`[Outlook] 邮箱池已就绪 (${lines.length} 个，shuffle 后分配)`)
-      }
-    } else {
-      outlookPoolRef.current = []
-    }
-
-    setPhase('running')
-
-    // 初始化限速器（如启用）
-    if (rateLimitEnabled) {
-      const cfg = {
-        maxPerMinute,
-        burst: burstSize,
-        backoffBaseMs: backoffBaseSec * 1000,
-        backoffMaxMs: backoffMaxSec * 1000,
-        consecutiveFailureThreshold: autoBackoff ? 5 : 999999 // 关闭自动退避时通过大阈值禁用
-      }
-      if (!rateLimiterRef.current) {
-        rateLimiterRef.current = createRateLimiter(cfg)
-      } else {
-        rateLimiterRef.current.updateConfig(cfg)
-        rateLimiterRef.current.reset()
-      }
-      addLog(
-        `[RateLimit] 已启用：${maxPerMinute}/分钟 burst=${burstSize} 退避 ${backoffBaseSec}~${backoffMaxSec}s，自动退避：${autoBackoff ? '开' : '关'}`
-      )
-    } else {
-      rateLimiterRef.current = null
-    }
-
-    // 在任务中心创建任务条目
-    const taskCenter = useTaskStore.getState()
-    const taskCenterId = taskCenter.createTask({
-      kind: 'register-batch',
-      title: retryItems ? `重试 ${totalCount} 个失败任务` : `批量注册 ${totalCount} 个账号`,
-      subtitle: `${mode === 'outlook' ? 'Outlook' : mode === 'tempmail' ? 'TempMail.Plus' : mode === 'proton' ? 'Proton' : mode === 'gptmail' ? 'GPTmail' : mode === 'mixed' ? 'Mixed' : 'Manual'}，并发 ${concurrency}${proxyPoolConfig.enabled ? ' + 代理池' : ''}${rateLimitEnabled ? ` + ${maxPerMinute}/分钟` : ''}`,
-      total: totalCount,
-      onPause: () => {
-        batchPause.current = true
-        setIsPaused(true)
-        useTaskStore.getState().updateTask(taskCenterId, { status: 'paused' })
-      },
-      onResume: () => {
-        batchPause.current = false
-        setIsPaused(false)
-        useTaskStore.getState().updateTask(taskCenterId, { status: 'running' })
-      },
-      onCancel: () => {
-        batchAbort.current = true
-        window.api.registrationCancel()
-      }
-    })
-    currentTaskCenterId.current = taskCenterId
-
-    // 并发池执行
-    const executing = new Set<Promise<void>>()
-    let launched = 0
-
-    for (let i = 0; i < items.length; i++) {
-      if (batchAbort.current) {
-        addLog(
-          t('register.batchStopped')
-            .replace('{done}', String(launched))
-            .replace('{total}', String(totalCount))
-        )
-        break
-      }
-
-      // 暂停：等待恢复
-      while (batchPause.current && !batchAbort.current) {
-        await new Promise((r) => setTimeout(r, 500))
-      }
-      if (batchAbort.current) break
-
-      // 限速：等待令牌（含退避）
-      if (rateLimiterRef.current) {
-        await rateLimiterRef.current.waitForSlot({
-          get aborted() {
-            return batchAbort.current
-          }
-        })
-        if (batchAbort.current) break
-      }
-
-      const itemId = items[i].id
-      const taskId = `batch-${itemId.slice(0, 8)}`
-      taskIdToItemId.current.set(taskId, itemId)
-      addLog(`--- Batch ${i + 1}/${totalCount} ---`)
-      launched++
-
-      const task = (async () => {
-        const outcome = await runSingleWithRetry(itemId, taskId, batchRetries)
-        taskIdToItemId.current.delete(taskId)
-        await handleBatchOutcome(itemId, outcome)
-        // 上报限速器结果（用于动态退避 + 风控判定）
-        if (rateLimiterRef.current) {
-          rateLimiterRef.current.reportResult(outcome.success)
-        }
-        // 上报任务中心进度
-        useTaskStore.getState().updateTask(taskCenterId, {
-          done: _batchDone,
-          successCount: _batchSuccess,
-          failedCount: _batchFail,
-          progress: Math.round((_batchDone / totalCount) * 100)
-        })
-      })()
-
-      const tracked = task.finally(() => executing.delete(tracked))
-      executing.add(tracked)
-
-      // 控制并发数：池满时等待空位
-      if (executing.size >= concurrency) {
-        await Promise.race(executing)
-      }
-
-      // 每次启动任务后等待间隔（0 则不等待）
-      if (i < items.length - 1 && !batchAbort.current && batchInterval > 0) {
-        await new Promise((r) => setTimeout(r, batchInterval * 1000))
-      }
-    }
-
-    // 等待所有正在执行的任务完成
-    await Promise.all(executing)
-
-    setBatchRunning(false)
-    setIsPaused(false)
-    setPhase('idle')
-    addLog(t('register.batchCompleted'))
-
-    // 完成任务中心条目
-    useTaskStore.getState().completeTask(taskCenterId, {
-      successCount: _batchSuccess,
-      failedCount: _batchFail
-    })
-    currentTaskCenterId.current = null
-
-    // 触发 Webhook 通知
-    void useWebhookStore.getState().triggerEvent('batch-completed', {
-      title: `批量注册${retryItems ? '重试' : ''}完成`,
-      message: `共 ${totalCount} 个任务，成功 ${_batchSuccess}，失败 ${_batchFail}`,
-      level: _batchFail === 0 ? 'success' : _batchSuccess === 0 ? 'error' : 'warn',
-      fields: {
-        模式:
-          mode === 'outlook'
-            ? 'Outlook'
-            : mode === 'tempmail'
-              ? 'TempMail.Plus'
-              : mode === 'proton'
-                ? 'Proton'
-                : mode === 'gptmail'
-                  ? 'GPTmail'
-                  : mode === 'mixed'
-                    ? 'Mixed'
-                    : 'Manual',
-        并发: concurrency,
-        成功: _batchSuccess,
-        失败: _batchFail,
-        总数: totalCount
-      }
-    })
+    setEmail(address)
+    await startSingleRegistration(collectOptions(), t, address)
   }
-
-  /** 暂停 / 恢复批量注册 */
-  const togglePauseBatch = (): void => {
-    if (!batchRunning) return
-    if (batchPause.current) {
-      batchPause.current = false
-      setIsPaused(false)
-      if (currentTaskCenterId.current) {
-        useTaskStore.getState().updateTask(currentTaskCenterId.current, { status: 'running' })
-      }
-    } else {
-      batchPause.current = true
-      setIsPaused(true)
-      if (currentTaskCenterId.current) {
-        useTaskStore.getState().updateTask(currentTaskCenterId.current, { status: 'paused' })
-      }
-    }
+  const startAuto = (): Promise<void> => startSingleRegistration(collectOptions(), t)
+  const submitEmail = (): Promise<void> => submitRegistrationEmail(email, fullName)
+  const submitOTP = (): Promise<void> => submitRegistrationOTP(otp)
+  const cancel = cancelSingleRegistration
+  const importAccount = async (): Promise<void> => {
+    if (result && (await importRegistrationResult(result)))
+      useRegistrationStore.setState({ imported: true })
   }
-
-  const stopBatch = (): void => {
-    batchAbort.current = true
-    // 同时解除暂停，避免暂停态下主循环 / 重试循环卡在 while 等待
-    batchPause.current = false
-    setIsPaused(false)
-    addLog(
-      isEn
-        ? '[Batch] Stopping, aborting in-flight requests...'
-        : '[Batch] 正在停止，已中止在途请求...'
-    )
-    // 取消后端所有在途注册（中断当前正在跑的 registrationStartAuto）
-    window.api.registrationCancel()
-    if (currentTaskCenterId.current) {
-      useTaskStore.getState().cancelTask(currentTaskCenterId.current)
-      currentTaskCenterId.current = null
-    }
-  }
-
-  /** 从失败列表中按筛选条件重试 */
+  const startBatch = (items?: BatchItem[]): Promise<boolean> =>
+    startRegistrationBatch(collectOptions(), t, items)
+  const stopBatch = stopRegistrationBatch
+  const togglePauseBatch = toggleRegistrationPause
   const retryFailed = (filter?: 'network' | 'otp_timeout' | 'rate_limit' | 'all'): void => {
-    const failedItems = _batchItems.filter((it) => {
-      if (it.status !== 'failed' && it.status !== 'import_failed') return false
-      if (!filter || filter === 'all') return true
-      return classifyError(it.error) === filter
-    })
-    if (failedItems.length === 0) {
-      addLog(`[Retry] 没有匹配的失败任务可重试`)
-      return
-    }
-    addLog(`[Retry] 重试 ${failedItems.length} 个失败任务（筛选: ${filter || 'all'}）`)
-    void startBatch(failedItems)
+    const failed = batchItems.filter(
+      (item) =>
+        ['failed', 'import_failed'].includes(item.status) &&
+        (!filter || filter === 'all' || classifyError(item.error) === filter)
+    )
+    if (failed.length) void startBatch(failed)
+    else addLog('[Retry] 没有匹配的失败任务可重试')
   }
-
-  // 导入历史中的账号
-  const importHistoryItem = async (item: HistoryItem): Promise<void> => {
-    if (!item.result || item.result.status !== 'success' || !item.result.refreshToken) return
-    const r = item.result
-
-    try {
-      const verifyResult = await window.api.verifyAccountCredentials({
-        refreshToken: r.refreshToken!,
-        clientId: r.clientId!,
-        clientSecret: r.clientSecret!,
-        region: r.region || 'us-east-1',
-        authMethod: 'IdC',
-        provider: 'BuilderId'
-      })
-
-      const now = Date.now()
-      const defaultUsage = { current: 0, limit: 0, percentUsed: 0, lastUpdated: now }
-
-      if (verifyResult.success && verifyResult.data) {
-        const expiresAt = verifyResult.data.expiresIn
-          ? now + verifyResult.data.expiresIn * 1000
-          : now + 3600000
-        const usage = verifyResult.data.usage
-          ? {
-              ...verifyResult.data.usage,
-              percentUsed:
-                verifyResult.data.usage.limit > 0
-                  ? Math.round(
-                      (verifyResult.data.usage.current / verifyResult.data.usage.limit) * 100
-                    )
-                  : 0,
-              lastUpdated: now
-            }
-          : defaultUsage
-
-        addAccount({
-          email: verifyResult.data.email || r.email,
-          idp: 'BuilderId',
-          status: 'active',
-          credentials: {
-            refreshToken: r.refreshToken!,
-            clientId: r.clientId!,
-            clientSecret: r.clientSecret!,
-            accessToken: verifyResult.data.accessToken || r.accessToken || '',
-            csrfToken: '',
-            region: r.region || 'us-east-1',
-            authMethod: 'IdC' as const,
-            provider: 'BuilderId' as const,
-            expiresAt
-          },
-          subscription: {
-            type:
-              (verifyResult.data.subscriptionType as
-                | 'Free'
-                | 'Pro'
-                | 'Pro_Plus'
-                | 'Enterprise'
-                | 'Teams') || 'Free',
-            title: verifyResult.data.subscriptionTitle || 'Free Tier'
-          },
-          usage,
-          tags: [],
-          lastUsedAt: now
-        })
-      } else {
-        addAccount({
-          email: r.email,
-          idp: 'BuilderId',
-          status: 'active',
-          credentials: {
-            refreshToken: r.refreshToken!,
-            clientId: r.clientId!,
-            clientSecret: r.clientSecret!,
-            accessToken: r.accessToken || '',
-            csrfToken: '',
-            region: r.region || 'us-east-1',
-            authMethod: 'IdC' as const,
-            provider: 'BuilderId' as const,
-            expiresAt: now + 3600000
-          },
-          subscription: { type: 'Free', title: 'Free Tier' },
-          usage: defaultUsage,
-          tags: [],
-          lastUsedAt: now
-        })
-      }
-
-      setHistory((prev) => prev.map((h) => (h.id === item.id ? { ...h, imported: true } : h)))
-    } catch {
-      /* ignore */
-    }
-  }
-
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <PageHeader icon={<UserPlus />} title={t('register.title')} />
@@ -3856,7 +1612,8 @@ export function RegisterPage(): React.JSX.Element {
                       (!tempMailDomain.trim() || !tempMailEmail.trim() || !tempMailEpin.trim())) ||
                     (mode === 'gptmail' && !gptMailDomain.trim()) ||
                     (mode === 'proton' && !protonBaseEmail.trim()) ||
-                    (mode === 'mixed' && pickNextSource() == null)
+                    (mode === 'mixed' &&
+                      !eligibleRegistrationSources(collectCurrentConfig()).length)
                   }
                 >
                   <Play className="h-4 w-4" />
@@ -3900,8 +1657,7 @@ export function RegisterPage(): React.JSX.Element {
                   className="w-7 p-0"
                   title={isEn ? 'Clear logs' : '清空日志'}
                   onClick={() => {
-                    _logs = []
-                    setLogs([])
+                    clearRegistrationLogs()
                   }}
                 >
                   <Trash2 className="h-4 w-4" />
@@ -3990,7 +1746,7 @@ export function RegisterPage(): React.JSX.Element {
                               if (!file) return
                               try {
                                 const text = await file.text()
-                                const arr = JSON.parse(text) as RegisterTemplate[]
+                                const arr = parseTemplates(JSON.parse(text))
                                 if (!Array.isArray(arr)) throw new Error('文件格式无效')
                                 const merged = [...arr, ...templates]
                                 // 按 ID 去重，新文件优先
@@ -4065,7 +1821,7 @@ export function RegisterPage(): React.JSX.Element {
                     value={batchCount}
                     onChange={(e) => {
                       const v = parseInt(e.target.value)
-                      if (!isNaN(v) && v >= 1) setBatchCount(v)
+                      if (!isNaN(v) && v >= 1) setBatchCount(boundedInteger(v, 1, 1, 100))
                     }}
                     onBlur={() => {
                       if (batchCount < 1) setBatchCount(1)
@@ -4083,7 +1839,7 @@ export function RegisterPage(): React.JSX.Element {
                     value={batchInterval}
                     onChange={(e) => {
                       const v = parseInt(e.target.value)
-                      if (!isNaN(v) && v >= 0) setBatchInterval(v)
+                      if (!isNaN(v) && v >= 0) setBatchInterval(boundedInteger(v, 5, 0, 300))
                     }}
                     disabled={batchRunning}
                     className="w-24"
@@ -4098,7 +1854,7 @@ export function RegisterPage(): React.JSX.Element {
                     value={batchRetries}
                     onChange={(e) => {
                       const v = parseInt(e.target.value)
-                      if (!isNaN(v) && v >= 0) setBatchRetries(v)
+                      if (!isNaN(v) && v >= 0) setBatchRetries(boundedInteger(v, 1, 0, 10))
                     }}
                     disabled={batchRunning}
                     className="w-24"
@@ -4113,7 +1869,7 @@ export function RegisterPage(): React.JSX.Element {
                     value={batchConcurrency}
                     onChange={(e) => {
                       const v = parseInt(e.target.value)
-                      if (!isNaN(v) && v >= 1) setBatchConcurrency(v)
+                      if (!isNaN(v) && v >= 1) setBatchConcurrency(boundedInteger(v, 1, 1, 100))
                     }}
                     onBlur={() => {
                       if (batchConcurrency < 1) setBatchConcurrency(1)
@@ -4132,7 +1888,8 @@ export function RegisterPage(): React.JSX.Element {
                       (!tempMailDomain.trim() || !tempMailEmail.trim() || !tempMailEpin.trim())) ||
                     (mode === 'gptmail' && !gptMailDomain.trim()) ||
                     (mode === 'proton' && !protonBaseEmail.trim()) ||
-                    (mode === 'mixed' && pickNextSource() == null)
+                    (mode === 'mixed' &&
+                      !eligibleRegistrationSources(collectCurrentConfig()).length)
                   }
                 >
                   {batchRunning ? (
@@ -4280,12 +2037,7 @@ export function RegisterPage(): React.JSX.Element {
                                 : `重置今日已用配额（当前 ${dailyQuotaUsed}）？`
                             )
                           ) {
-                            setDailyQuotaUsedState(0)
-                            try {
-                              localStorage.setItem(dailyQuotaKey, '0')
-                            } catch {
-                              /* ignore */
-                            }
+                            resetRegistrationQuota()
                             addLog(
                               isEn
                                 ? "[Quota] Today's quota counter reset"
@@ -4606,7 +2358,7 @@ export function RegisterPage(): React.JSX.Element {
                 <div className="space-y-3">
                   <div className="flex flex-wrap items-center gap-2 text-body">
                     <span className="font-medium">
-                      {t('register.batchProgress')}: {batchDone}/{batchCount}
+                      {t('register.batchProgress')}: {batchDone}/{batchItems.length}
                     </span>
                     <Badge
                       variant="outline"
@@ -4622,7 +2374,7 @@ export function RegisterPage(): React.JSX.Element {
                     </Badge>
                   </div>
                   <Progress
-                    value={batchCount > 0 ? (batchDone / batchCount) * 100 : 0}
+                    value={batchCount > 0 ? (batchDone / Math.max(1, batchItems.length)) * 100 : 0}
                     className="h-2"
                   />
 
@@ -4630,7 +2382,7 @@ export function RegisterPage(): React.JSX.Element {
                   {batchItems.length > 0 && (
                     <div className="max-h-60 overflow-y-auto border rounded-panel bg-muted">
                       {batchItems.map((item) => (
-                        <BatchItemRow key={item.id} item={item} t={t} batchClock={batchClock} />
+                        <BatchItemRow key={item.id} item={item} t={t} />
                       ))}
                     </div>
                   )}
@@ -4730,51 +2482,7 @@ export function RegisterPage(): React.JSX.Element {
             </CardHeader>
             <CardContent className="p-0">
               <div className="max-h-48 overflow-y-auto">
-                {history.map((item) => {
-                  const fp = item.result?.fingerprint
-                  return (
-                    <div
-                      key={item.id}
-                      className="flex items-center justify-between gap-2 px-2.5 py-[9px] border-b last:border-b-0 hover:bg-muted/50 transition-colors"
-                    >
-                      <div className="flex items-center gap-3 flex-1 min-w-0">
-                        {item.status === 'success' ? (
-                          <CheckCircle2 className="h-4 w-4 text-success-text flex-shrink-0" />
-                        ) : (
-                          <XCircle className="h-4 w-4 text-danger-text flex-shrink-0" />
-                        )}
-                        <span className="font-mono text-caption truncate">{item.email}</span>
-                        <span className="text-caption text-muted-foreground flex-shrink-0">
-                          {new Date(item.time).toLocaleTimeString()}
-                        </span>
-                        {/* 指纹摘要徽章（B7） */}
-                        {fp && (
-                          <span
-                            className="inline-flex h-5 max-w-[180px] shrink-0 items-center truncate rounded-full bg-muted px-[7px] text-badge font-medium font-mono text-muted-foreground cursor-help"
-                            title={`Chrome ${fp.chromeVer}\nUA: ${fp.ua}\nGPU: ${fp.gpuVendor} ${fp.gpuModel}\nCanvas: ${fp.canvasHash}\nScreen: ${fp.screen.width}x${fp.screen.height}\nProxy: ${fp.proxyUrl || '(direct)'}\nExit IP: ${fp.exitIP || 'N/A'}`}
-                          >
-                            🔒 {fp.chromeVer.split('.')[0]}・{fp.screen.width}×{fp.screen.height}
-                            {fp.exitIP ? `・${fp.exitIP}` : ''}
-                          </span>
-                        )}
-                      </div>
-                      {item.status === 'success' && item.result?.refreshToken && (
-                        <Badge
-                          variant="outline"
-                          className={cn(
-                            'cursor-pointer',
-                            item.imported
-                              ? 'text-success-text border-success/20'
-                              : 'text-primary border-primary/30 hover:bg-primary/10'
-                          )}
-                          onClick={() => !item.imported && importHistoryItem(item)}
-                        >
-                          {item.imported ? t('register.imported') : t('register.historyImport')}
-                        </Badge>
-                      )}
-                    </div>
-                  )
-                })}
+                <RegistrationHistoryRows history={history} t={t} />
               </div>
             </CardContent>
           </Card>
@@ -4784,13 +2492,73 @@ export function RegisterPage(): React.JSX.Element {
   )
 }
 
+const RegistrationHistoryRows = memo(function RegistrationHistoryRows({
+  history,
+  t
+}: {
+  history: HistoryItem[]
+  t: (key: string) => string
+}): React.ReactNode {
+  return (
+    <>
+      {history.map((item) => {
+        const fp = item.result?.fingerprint
+        return (
+          <div
+            key={item.id}
+            className="flex items-center justify-between gap-2 px-2.5 py-[9px] border-b last:border-b-0 hover:bg-muted/50 transition-colors"
+          >
+            <div className="flex items-center gap-3 flex-1 min-w-0">
+              {item.status === 'success' ? (
+                <CheckCircle2 className="h-4 w-4 text-success-text flex-shrink-0" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger-text flex-shrink-0" />
+              )}
+              <span className="font-mono text-caption truncate">{item.email}</span>
+              <span className="text-caption text-muted-foreground flex-shrink-0">
+                {new Date(item.time).toLocaleTimeString()}
+              </span>
+              {/* 指纹摘要徽章（B7） */}
+              {fp && (
+                <span
+                  className="inline-flex h-5 max-w-[180px] shrink-0 items-center truncate rounded-full bg-muted px-[7px] text-badge font-medium font-mono text-muted-foreground cursor-help"
+                  title={`Chrome ${fp.chromeVer}\nUA: ${fp.ua}\nGPU: ${fp.gpuVendor} ${fp.gpuModel}\nCanvas: ${fp.canvasHash}\nScreen: ${fp.screen.width}x${fp.screen.height}\nProxy: ${fp.proxyUrl || '(direct)'}\nExit IP: ${fp.exitIP || 'N/A'}`}
+                >
+                  🔒 {fp.chromeVer.split('.')[0]}・{fp.screen.width}×{fp.screen.height}
+                  {fp.exitIP ? `・${fp.exitIP}` : ''}
+                </span>
+              )}
+            </div>
+            {item.status === 'success' && item.result?.refreshToken && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  'cursor-pointer',
+                  item.imported
+                    ? 'text-success-text border-success/20'
+                    : 'text-primary border-primary/30 hover:bg-primary/10'
+                )}
+                onClick={() => !item.imported && importRegistrationHistory(item)}
+              >
+                {item.imported ? t('register.imported') : t('register.historyImport')}
+              </Badge>
+            )}
+          </div>
+        )
+      })}
+    </>
+  )
+})
+
 // ============ 注册结果分析报表（视觉升级版） ============
 
 interface RegisterAnalyticsProps {
   history: HistoryItem[]
 }
 
-function RegisterAnalyticsReport({ history }: RegisterAnalyticsProps): React.ReactNode {
+const RegisterAnalyticsReport = memo(function RegisterAnalyticsReport({
+  history
+}: RegisterAnalyticsProps): React.ReactNode {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const analytics = useMemo(() => {
@@ -5129,7 +2897,7 @@ function RegisterAnalyticsReport({ history }: RegisterAnalyticsProps): React.Rea
       </CardContent>
     </Card>
   )
-}
+})
 
 /** 24 小时分布 SVG 图（平滑曲线 + 渐变填充） */
 function HourDistributionChart({

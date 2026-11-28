@@ -1,3 +1,5 @@
+import { useProxyLogs } from '../../hooks/useProxyLogs'
+import type { ProxyLogEntry as LogEntry } from '../../../../shared/proxyLogs'
 import { PageHeader } from '../layout/PageHeader'
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import {
@@ -17,14 +19,6 @@ import {
 import { Button, Badge, Input } from '../ui'
 import { useTranslation } from '../../hooks/useTranslation'
 import { useVirtualizer } from '@tanstack/react-virtual'
-
-interface LogEntry {
-  timestamp: string
-  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
-  category: string
-  message: string
-  data?: unknown
-}
 
 type LogLevel = 'ALL' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
 
@@ -60,8 +54,6 @@ const LEVEL_BTN_ACTIVE: Record<string, string> = {
 export function LogsPage() {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
-  const [logs, setLogs] = useState<LogEntry[]>([])
-  const [totalCount, setTotalCount] = useState(0)
   const [filter, setFilter] = useState('')
   const [levelFilter, setLevelFilter] = useState<LogLevel>('ALL')
   const [categoryFilter, setCategoryFilter] = useState('all')
@@ -71,41 +63,10 @@ export function LogsPage() {
     return localStorage.getItem('systemLogs_displayLimit') || '5000'
   })
   const [isAtBottom, setIsAtBottom] = useState(true)
-  const [isLoading, setIsLoading] = useState(false)
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null)
-  const [newLogCount, setNewLogCount] = useState(0)
   const containerRef = useRef<HTMLDivElement>(null)
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const prevLogCount = useRef(0)
-
-  const fetchLogs = useCallback(async () => {
-    try {
-      const fetchCount = displayLimit === 'all' ? undefined : parseInt(displayLimit) || undefined
-      const [allLogs, count] = await Promise.all([
-        window.api.proxyGetLogs(fetchCount),
-        window.api.proxyGetLogsCount()
-      ])
-      const newLogs = allLogs as LogEntry[]
-      setLogs(newLogs)
-      setTotalCount(count)
-      // 如果用户不在底部，累计新日志数
-      if (!isAtBottom && newLogs.length > prevLogCount.current) {
-        setNewLogCount((prev) => prev + (newLogs.length - prevLogCount.current))
-      }
-      prevLogCount.current = newLogs.length
-    } catch {
-      // ignore
-    }
-  }, [isAtBottom, displayLimit])
-
-  useEffect(() => {
-    setIsLoading(true)
-    fetchLogs().finally(() => setIsLoading(false))
-    pollRef.current = setInterval(fetchLogs, 1500)
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current)
-    }
-  }, [fetchLogs])
+  const { logs, totalCount, loading: isLoading, newLogCount, setNewLogCount, refresh: fetchLogs, clear: handleClear } =
+    useProxyLogs(true, displayLimit === 'all' ? 50000 : Number(displayLimit) || 5000, isAtBottom)
 
   // 持久化 displayLimit
   useEffect(() => {
@@ -134,13 +95,6 @@ export function LogsPage() {
       setIsAtBottom(true)
       setNewLogCount(0)
     }
-  }
-
-  const handleClear = async () => {
-    await window.api.proxyClearLogs()
-    setLogs([])
-    setTotalCount(0)
-    setNewLogCount(0)
   }
 
   const handleExport = () => {

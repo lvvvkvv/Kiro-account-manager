@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow'
 import { TokenRefreshSchedule } from './TokenRefreshSchedule'
 import { createPortal } from 'react-dom'
 import { useState, useEffect } from 'react'
@@ -103,11 +104,18 @@ export function AccountDetailDialog({
   account,
   onRefresh,
   isRefreshing
-}: AccountDetailDialogProps) {
+}: AccountDetailDialogProps): React.ReactNode {
   const [models, setModels] = useState<ModelInfo[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
   const [modelsError, setModelsError] = useState<string | null>(null)
-  const { maskEmail, maskNickname, privacyMode, usagePrecision } = useAccountsStore()
+  const { maskEmail, maskNickname, privacyMode, usagePrecision } = useAccountsStore(
+    useShallow((state) => ({
+      maskEmail: state.maskEmail,
+      maskNickname: state.maskNickname,
+      privacyMode: state.privacyMode,
+      usagePrecision: state.usagePrecision
+    }))
+  )
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
@@ -663,7 +671,12 @@ function ProxyBindingSection({
   isEn: boolean
 }): React.ReactNode {
   const { proxyPool, accountProxyBindings, bindAccountsToProxy, unbindAccountFromProxy } =
-    useAccountsStore()
+    useAccountsStore(useShallow((state) => ({
+    proxyPool: state.proxyPool,
+    accountProxyBindings: state.accountProxyBindings,
+    bindAccountsToProxy: state.bindAccountsToProxy,
+    unbindAccountFromProxy: state.unbindAccountFromProxy
+  })))
   const [open, setOpen] = useState(false)
 
   const boundProxyId = accountProxyBindings[accountId]

@@ -14,6 +14,7 @@
 // WARN: 标注「Proton DOM 依赖点」的选择器随 Proton 改版可能失效，届时只需更新本文件。
 
 import { BrowserWindow, session, type Session } from 'electron'
+import { checkAborted, sleep, waitFor, withDeadline } from './async'
 
 const PARTITION = 'persist:proton'
 // 真实 Chrome UA，去掉 Electron 标识，降低被 Proton 风控/拒绝的概率
@@ -21,6 +22,7 @@ const CHROME_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
 // 验证码邮件一般落 inbox；如需覆盖垃圾箱可改为 all-mail
 const PROTON_INBOX_URL = 'https://mail.proton.me/u/0/inbox'
+const appliedProxies = new WeakMap<Session, string>()
 
 let win: BrowserWindow | null = null
 
@@ -44,22 +46,32 @@ function resolveSettingsProxy(explicit?: string): string {
   ).trim()
 }
 
-function applyProxy(sess: Session, proxy?: string): Promise<void> {
+async function applyProxy(sess: Session, proxy?: string): Promise<void> {
   const resolved = resolveSettingsProxy(proxy)
+  if (appliedProxies.get(sess) === resolved) return
   if (resolved) {
     console.log(`[Proton] 走设置代理: ${resolved.replace(/:[^:@/]+@/, ':***@')}`)
-    return sess.setProxy({ proxyRules: resolved })
+    await sess.setProxy({ proxyRules: resolved })
+    appliedProxies.set(sess, resolved)
+    return
   }
   // 设置里未配代理 → 跟随系统代理（Proton 在受限网络下通常需要代理才能访问）
   console.log('[Proton] 设置未配代理，跟随系统代理')
-  return sess.setProxy({ mode: 'system' })
+  await sess.setProxy({ mode: 'system' })
+  appliedProxies.set(sess, resolved)
 }
 
 /** 懒创建（或复用）Proton 窗口。show=true 时显示并聚焦，便于用户手动登录 */
-async function ensureWindow(show: boolean, proxy?: string): Promise<BrowserWindow> {
+async function ensureWindow(
+  show: boolean,
+  proxy?: string,
+  signal?: AbortSignal
+): Promise<BrowserWindow> {
+  checkAborted(signal)
   const sess = session.fromPartition(PARTITION)
-  // 每次都按「设置里的代理」刷新 session 代理：设置变更后下次登录/取码即生效（窗口复用也更新）
+  // 设置变更后更新代理；同一配置下复用连接，避免每次扫描重置 session 代理。
   await applyProxy(sess, proxy)
+  checkAborted(signal)
 
   if (win && !win.isDestroyed()) {
     if (show) {
@@ -92,33 +104,34 @@ async function ensureWindow(show: boolean, proxy?: string): Promise<BrowserWindo
     return { action: 'deny' }
   })
 
+  const current = win
   const closed = (): void => {
-    win = null
+    if (win === current) win = null
   }
   win.on('closed', closed)
 
   await loadAndWait(win, PROTON_INBOX_URL)
+  checkAborted(signal)
   return win
 }
 
 /** 加载 URL 并等待页面 dom-ready（带超时兜底） */
 function loadAndWait(w: BrowserWindow, url: string, timeoutMs = 30000): Promise<void> {
-  return new Promise((resolve) => {
-    let done = false
-    const finish = (): void => {
-      if (done) return
-      done = true
-      w.webContents.removeListener('dom-ready', finish)
-      resolve()
+  return new Promise((resolve, reject) => {
+    const finish = (error?: Error): void => {
+      clearTimeout(timer)
+      w.webContents.removeListener('dom-ready', ready)
+      w.removeListener('closed', closed)
+      if (error) reject(error)
+      else resolve()
     }
-    w.webContents.once('dom-ready', finish)
-    w.loadURL(url).catch(() => finish())
-    setTimeout(finish, timeoutMs)
+    const ready = (): void => finish()
+    const closed = (): void => finish(new Error('Proton 窗口已关闭'))
+    const timer = setTimeout(() => finish(new Error('Proton 页面加载超时')), timeoutMs)
+    w.webContents.once('dom-ready', ready)
+    w.once('closed', closed)
+    void w.loadURL(url).catch((error) => finish(error))
   })
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms))
 }
 
 /** 通过当前 URL + DOM 判断是否已登录 Proton Mail */
@@ -148,22 +161,28 @@ export async function openProtonLogin(
   proxy?: string
 ): Promise<{ success: boolean; loggedIn: boolean; error?: string }> {
   try {
-    const w = await ensureWindow(true, proxy)
-    // 给页面一点时间完成 Proton 的自动跳转（已登录直达 inbox / 未登录跳 login）
-    await sleep(1200)
-    const loggedIn = await checkLoggedIn(w)
-    return { success: true, loggedIn }
+    return await withMailbox(async (signal) => {
+      const w = await ensureWindow(true, proxy, signal)
+      await sleep(1200, signal)
+      return { success: true, loggedIn: await checkLoggedIn(w) }
+    })
   } catch (err) {
-    return { success: false, loggedIn: false, error: err instanceof Error ? err.message : String(err) }
+    return {
+      success: false,
+      loggedIn: false,
+      error: err instanceof Error ? err.message : String(err)
+    }
   }
 }
 
 /** 查询当前 Proton 登录态（不弹窗：窗口不存在则后台静默创建检测） */
 export async function getProtonLoginStatus(proxy?: string): Promise<{ loggedIn: boolean }> {
   try {
-    const w = await ensureWindow(false, proxy)
-    await sleep(600)
-    return { loggedIn: await checkLoggedIn(w) }
+    return await withMailbox(async (signal) => {
+      const w = await ensureWindow(false, proxy, signal)
+      await sleep(600, signal)
+      return { loggedIn: await checkLoggedIn(w) }
+    })
   } catch {
     return { loggedIn: false }
   }
@@ -173,6 +192,9 @@ export async function getProtonLoginStatus(proxy?: string): Promise<{ loggedIn: 
 export function closeProtonWindow(): void {
   if (win && !win.isDestroyed()) win.destroy()
   win = null
+  scanOffset = 0
+  lastInboxLoad = 0
+  receivedCodes.clear()
 }
 
 // ===== 取码 =====
@@ -181,7 +203,8 @@ interface ScanResult {
   code: string
   from: 'body' | 'body-nocode' | 'wrong-recipient' | 'none' | 'error'
   matched: boolean
-  aws?: boolean
+  nextOffset?: number
+  messages?: Array<{ address: string; code: string }>
   snippet?: string
   err?: string
 }
@@ -190,15 +213,17 @@ interface ScanResult {
  * 在已解密的收件箱中查找「发给当前注册地址」那封 AWS 验证码邮件的验证码。
  * 三重定位（鲁棒优先）：
  *   1) 发件人筛选：只看发件人为 no-reply@signin.aws 的邮件，排除「Response Required」等非验证码 AWS 邮件；
- *   2) 读前两封：验证码邮件有时不是最新一封（会被其它邮件挤后），故对候选最多点开两封；
+ *   2) 每轮读取两封候选并推进游标，避免长时间占用共享窗口；
  *   3) 收件人精确匹配：用邮件头收件人原样带点地址区分同母号不同点号变体的旧码。
- * 收件人读不到时，因发件人已确认是 AWS 验证码邮件，退化为信任有码的那封。
+ * 收件人读不到时，正文必须包含完整目标地址。
  * @param address 当前注册使用的收件地址（点号变体，原样含点）
  */
-function buildScanScript(address: string): string {
+function buildScanScript(address: string, offset = 0): string {
   const addrFull = JSON.stringify(address.trim().toLowerCase())
   return `(async () => {
     const addrFull = ${addrFull};
+    let nextOffset = 0;
+    const messages = [];
     const extractCode = (t) => { const m = (t||'').match(/\\b\\d{6}\\b/g); return m ? m[m.length-1] : ''; };
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const fire = (el, type) => el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
@@ -255,10 +280,13 @@ function buildScanScript(address: string): string {
     const listSels = ['[data-testid="message-item"]','[data-shortcut-target="item-container"]','.items-column-list [role="row"]','.item-container-wrapper','.item-container'];
     let items = [];
     for (const s of listSels) { const e = [...document.querySelectorAll(s)]; if (e.length) { items = e; break; } }
-    if (!items[0]) return { code: '', from: 'none', matched: false };
-    // 优先只看发件人为 AWS 验证码地址的邮件；筛不到时回退看前两封（兜底，防发件人 DOM 改版）
+    if (!items[0]) return { messages, nextOffset, code: '', from: 'none', matched: false };
+    // 优先 AWS 验证码邮件；DOM 改版时仍按游标扫描候选并校验收件地址。
     const awsItems = items.filter((it) => senderOf(it) === SENDER);
-    const candidates = (awsItems.length ? awsItems : items).slice(0, 2);
+    const allCandidates = awsItems.length ? awsItems : items;
+    const start = ${offset} % allCandidates.length;
+    const candidates = allCandidates.slice(start, start + 2);
+    nextOffset = (start + candidates.length) % allCandidates.length;
     const results = [];
     for (let i = 0; i < candidates.length; i++) {
       try {
@@ -276,28 +304,30 @@ function buildScanScript(address: string): string {
         const r = {
           i,
           hasRecip: recipients.size > 0,
-          match: recipients.has(addrFull),
+          match: recipients.has(addrFull) || (recipients.size === 0 && ((body || '').toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_\`{|}~-]+@[a-z0-9.-]+/g) || []).some(a => a.replace(/[.,;]+$/, '') === addrFull)),
           code: extractCode(body),
           recipText: Array.from(recipients).join(',').slice(0, 100),
           bodySnip: body.slice(0, 100)
         };
         results.push(r);
         // 早停：收件人精确匹配 + 有码 → 当前注册地址那封的验证码（最高置信）
-        if (r.match && r.code) return { code: r.code, from: 'body', matched: true, snippet: 'aws#' + i + ' ' + r.bodySnip };
+        if (r.code) {
+          const targets = recipients.size ? [...recipients] : ((body || '').toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_\`{|}~-]+@[a-z0-9.-]+/g) || []);
+          for (const address of targets) messages.push({ address: address.replace(/[.,;]+$/, ''), code: r.code });
+        }
       } catch (e) {
         results.push({ i, hasRecip: false, match: false, code: '', recipText: '', bodySnip: 'err=' + String(e) });
       }
     }
-    // 收件人读不到但有码（发件人已确认是 AWS 验证码邮件，可信）→ 退化采用
-    const noRecipCode = results.find((r) => !r.hasRecip && r.code);
-    if (noRecipCode) return { code: noRecipCode.code, from: 'body', matched: false, snippet: 'aws#' + noRecipCode.i + ' no-recipients; ' + noRecipCode.bodySnip };
+    const match = results.find(r => r.match && r.code);
+    if (match) return { messages, nextOffset, code: match.code, from: 'body', matched: true };
     // 收件人精确匹配但还没读到码（邮件刚到正在渲染）
     const matchNoCode = results.find((r) => r.match && !r.code);
-    if (matchNoCode) return { code: '', from: 'body-nocode', matched: true, snippet: 'aws#' + matchNoCode.i + ' ' + matchNoCode.bodySnip };
+    if (matchNoCode) return { messages, nextOffset, code: '', from: 'body-nocode', matched: true, snippet: 'aws#' + matchNoCode.i + ' ' + matchNoCode.bodySnip };
     // 有码但收件人是别的变体 → 不是当前的，继续等
     const wrongRecip = results.find((r) => r.code && r.hasRecip && !r.match);
-    if (wrongRecip) return { code: '', from: 'wrong-recipient', matched: false, snippet: 'aws#' + wrongRecip.i + ' recipients=' + wrongRecip.recipText };
-    return { code: '', from: 'body-nocode', matched: false, snippet: 'awsItems=' + awsItems.length + '; ' + results.map((r) => '#' + r.i + (r.code ? '+code' : '-nocode') + ' r=' + (r.recipText || 'none')).join(' | ').slice(0, 170) };
+    if (wrongRecip) return { messages, nextOffset, code: '', from: 'wrong-recipient', matched: false, snippet: 'aws#' + wrongRecip.i + ' recipients=' + wrongRecip.recipText };
+    return { messages, nextOffset, code: '', from: 'body-nocode', matched: false, snippet: 'awsItems=' + awsItems.length + '; ' + results.map((r) => '#' + r.i + (r.code ? '+code' : '-nocode') + ' r=' + (r.recipText || 'none')).join(' | ').slice(0, 170) };
   })()`
 }
 
@@ -318,67 +348,92 @@ interface WaitProtonOtpOptions {
   proxy?: string
 }
 
-// 单窗口单收件箱：并发取码会互相打架（同时导航/点开同一窗口），故串行化排队。
-// 批量并发注册时建议把 Proton 源的并发设为 1；即便设了更高并发，这里也会强制串行取码。
-let otpQueue: Promise<unknown> = Promise.resolve()
-
-export function waitProtonOtp(address: string, opts: WaitProtonOtpOptions): Promise<string> {
-  const run = otpQueue.then(
-    () => runWaitProtonOtp(address, opts),
-    () => runWaitProtonOtp(address, opts)
-  )
-  // 保持队列链不被某次 reject 中断
-  otpQueue = run.catch(() => undefined)
-  return run
+// Serialize one DOM interaction, not an entire OTP wait. A cancelled caller leaves no queued navigation.
+let domQueue: Promise<unknown> = Promise.resolve()
+let scanOffset = 0
+let lastInboxLoad = 0
+const waitingAddresses = new Map<string, number>()
+const receivedCodes = new Map<string, string>()
+function withMailbox<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  const task = domQueue.then(async () => {
+    checkAborted(signal)
+    try {
+      // If Chromium hangs, destroy that page before allowing another DOM interaction.
+      return await withDeadline(work, 35000)
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('超时')) closeProtonWindow()
+      throw error
+    }
+  })
+  domQueue = task.catch(() => {})
+  return waitFor(task, signal)
 }
 
-async function runWaitProtonOtp(address: string, opts: WaitProtonOtpOptions): Promise<string> {
-  const log = opts.log ?? ((): void => {})
-  const w = await ensureWindow(false, opts.proxy)
-
-  if (!(await checkLoggedIn(w))) {
-    throw new Error('Proton 未登录，请先在「登录 Proton」窗口完成登录')
-  }
-
-  // 取码前导航到 inbox 确保处于最新收件箱视图
-  await loadAndWait(w, PROTON_INBOX_URL)
-  await sleep(1500)
-
-  // Proton 取码是「点开邮件读本地 DOM」，无网络 API 限流顾虑，且点开本身已自带耗时，
-  // 故轮询间隔不沿用网络型邮箱的 intervalSec(默认3s)，钳到 ≤1s 让验证码到达后更快被读到。
-  const pollMs = Math.min(Math.max(opts.intervalSec * 1000, 250), 1000)
-  const maxRetries = Math.max(1, Math.floor((opts.timeoutSec * 1000) / pollMs))
-  const script = buildScanScript(address)
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    if (opts.signal?.aborted) throw new Error('注册已取消')
-
-    // 每 ~20 轮 reload 一次兜底（防止 SPA 长时间不刷新漏收）
-    if (attempt > 1 && attempt % 20 === 0) {
-      await loadAndWait(w, PROTON_INBOX_URL)
-      await sleep(1200)
-    }
-
-    try {
-      const res = (await w.webContents.executeJavaScript(script, true)) as ScanResult
-      if (res && res.code && res.from === 'body') {
-        // 收件人精确匹配当前注册地址（或收件人读不到时正文去点匹配）+ 读到 6 位码 → 当前邮件的验证码
-        log(`[Proton] 验证码: ${res.code} (${res.matched ? '收件人精确匹配' : '正文去点兜底匹配'})`)
-        return res.code
-      } else if (res && res.from === 'wrong-recipient') {
-        if (attempt % 8 === 0) log(`[Proton] 最新邮件收件人非当前地址，等待当前验证码... ${res.snippet || ''}`)
-      } else if (res && res.from === 'body-nocode') {
-        if (attempt % 8 === 0) log(`[Proton] ${res.matched ? '已打开当前邮件但未提取到码' : '暂无匹配邮件'}: ${res.snippet || ''}`)
-      } else if (res && res.from === 'error') {
-        if (attempt % 10 === 0) log(`[Proton] 取码脚本异常: ${res.err}`)
+export function waitProtonOtp(address: string, opts: WaitProtonOtpOptions): Promise<string> {
+  const target = address.trim().toLowerCase()
+  waitingAddresses.set(target, (waitingAddresses.get(target) || 0) + 1)
+  return withDeadline(
+    async (signal) => {
+      const log = opts.log ?? ((): void => {})
+      let attempt = 0
+      const pollMs = Math.min(Math.max(opts.intervalSec * 1000, 250), 1000)
+      for (;;) {
+        checkAborted(signal)
+        const result = await withMailbox(async (domSignal) => {
+          const cached = receivedCodes.get(target)
+          if (cached) return { code: cached, from: 'body', matched: true } as ScanResult
+          const w = await ensureWindow(false, opts.proxy, domSignal)
+          checkAborted(signal)
+          if (!(await checkLoggedIn(w)))
+            throw new Error('Proton 未登录，请先在「登录 Proton」窗口完成登录')
+          checkAborted(signal)
+          checkAborted(domSignal)
+          if (Date.now() - lastInboxLoad > 20000 || !w.webContents.getURL().includes('/inbox')) {
+            await loadAndWait(w, PROTON_INBOX_URL)
+            await sleep(1200)
+            lastInboxLoad = Date.now()
+            checkAborted(signal)
+            checkAborted(domSignal)
+          }
+          const res = (await withDeadline(
+            () => w.webContents.executeJavaScript(buildScanScript(address, scanOffset), true),
+            8000
+          )) as ScanResult
+          checkAborted(domSignal)
+          scanOffset = res.nextOffset ?? scanOffset
+          for (const mail of res.messages || []) {
+            if (waitingAddresses.has(mail.address)) receivedCodes.set(mail.address, mail.code)
+          }
+          checkAborted(signal)
+          return res
+        }, signal).catch((error) => {
+          checkAborted(signal)
+          if (error instanceof Error && error.message.includes('未登录')) throw error
+          if (++attempt % 10 === 0) log(`[Proton] 读取失败: ${error}`)
+          return undefined
+        })
+        checkAborted(signal)
+        attempt++
+        if (result?.code && result.from === 'body' && result.matched) {
+          log(`[Proton] 验证码: ${result.code} (收件地址匹配)`)
+          return result.code
+        }
+        if (attempt % 10 === 0) log('[Proton] 等待当前地址的验证码...')
+        await sleep(pollMs, signal)
       }
-    } catch (err) {
-      if (attempt % 10 === 0) log(`[Proton] [${attempt}/${maxRetries}] 读取失败: ${err}`)
+    },
+    opts.timeoutSec * 1000,
+    opts.signal,
+    `等待验证码超时 (${opts.timeoutSec}s)`
+  ).finally(() => {
+    const remaining = (waitingAddresses.get(target) || 1) - 1
+    if (remaining) waitingAddresses.set(target, remaining)
+    else {
+      waitingAddresses.delete(target)
+      receivedCodes.delete(target)
     }
-
-    if (attempt % 10 === 0) log(`[Proton] [${attempt}/${maxRetries}] 暂无验证码...`)
-    await sleep(pollMs)
-  }
-
-  throw new Error(`等待验证码超时 (${opts.timeoutSec}s)`)
+  })
 }

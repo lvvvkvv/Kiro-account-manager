@@ -113,3 +113,10 @@ export const DEFAULT_PROXY_POOL_CONFIG: ProxyPoolConfig = {
   autoValidateConcurrency: 5,
   upstreamProxy: ''
 }
+
+export interface ProxyImportEntry {
+  url: string
+  label?: string
+  source?: string
+  tags?: string[]
+}

@@ -1,3 +1,5 @@
+import { withDeadline } from './async'
+
 const DELTA = 0x9e3779b9 >>> 0
 const FALLBACK_KEY: [number, number, number, number] = [1888420705, 2576816180, 2347232058, 874813317]
 const FALLBACK_VER = '4.0.0'
@@ -7,6 +9,7 @@ let cachedKey: [number, number, number, number] | null = null
 let cachedVersion = ''
 let cachedIdentifier = ''
 let refreshPromise: Promise<void> | null = null
+let retryAfter = 0
 
 function extractFromAppJS(js: string): {
   key: [number, number, number, number] | null
@@ -37,21 +40,25 @@ function extractFromAppJS(js: string): {
 export async function refreshAppJSConfig(
   fetchFn: (url: string, init?: RequestInit) => Promise<Response>
 ): Promise<void> {
-  if (cachedKey) return
+  if (cachedKey || Date.now() < retryAfter) return
   if (refreshPromise) return refreshPromise
 
   refreshPromise = (async () => {
     if (cachedKey) return
     try {
-      const resp = await fetchFn('https://us-east-1.signin.aws/assets/js/app.js', {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-          Accept: '*/*',
-          Referer: 'https://us-east-1.signin.aws/'
-        }
-      })
-      const js = await resp.text()
+      const js = await withDeadline(async (signal) => {
+        const resp = await fetchFn('https://us-east-1.signin.aws/assets/js/app.js', {
+          signal,
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+            Accept: '*/*',
+            Referer: 'https://us-east-1.signin.aws/'
+          }
+        })
+        if (!resp.ok) throw new Error(`app.js HTTP ${resp.status}`)
+        return await resp.text()
+      }, 20000)
       if (js) {
         const result = extractFromAppJS(js)
         if (result.key) cachedKey = result.key
@@ -64,13 +71,17 @@ export async function refreshAppJSConfig(
 
     if (!cachedKey) {
       console.log('[xxtea] 使用 fallback 密钥')
-      cachedKey = [...FALLBACK_KEY] as [number, number, number, number]
+      retryAfter = Date.now() + 60000
     }
     if (!cachedVersion) cachedVersion = FALLBACK_VER
     if (!cachedIdentifier) cachedIdentifier = FALLBACK_IDENTIFIER
   })()
 
-  return refreshPromise
+  try {
+    await refreshPromise
+  } finally {
+    refreshPromise = null
+  }
 }
 
 export function getTESVersion(): string {

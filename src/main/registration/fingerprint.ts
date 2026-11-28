@@ -29,18 +29,16 @@ function getCrc32Table(): Uint32Array {
 // ============ OrderedMap ============
 
 export class OrderedMap {
-  private keys: string[] = []
   private values: Map<string, unknown> = new Map()
 
   set(key: string, value: unknown): void {
-    if (!this.values.has(key)) this.keys.push(key)
     this.values.set(key, value)
   }
 
   toJSON(): string {
     const parts: string[] = []
-    for (const k of this.keys) {
-      parts.push(`${JSON.stringify(k)}:${JSON.stringify(this.values.get(k))}`)
+    for (const [key, value] of this.values) {
+      parts.push(`${JSON.stringify(key)}:${JSON.stringify(value)}`)
     }
     return `{${parts.join(',')}}`
   }
@@ -145,17 +143,25 @@ function genMetricsFirstLoad(pageType: string): Record<string, number> {
   }
   switch (pageType) {
     case 'profile':
-      m.batt = 5 + randInt(21); m.fp2 = 1 + randInt(8)
-      m.browser = randInt(4); m.capabilities = 1 + randInt(8)
-      m.dnt = randInt(4); m.input = 8 + randInt(23); m.canvas = 5 + randInt(16)
+      m.batt = 5 + randInt(21)
+      m.fp2 = 1 + randInt(8)
+      m.browser = randInt(4)
+      m.capabilities = 1 + randInt(8)
+      m.dnt = randInt(4)
+      m.input = 8 + randInt(23)
+      m.canvas = 5 + randInt(16)
       break
     case 'signup':
-      m.script = randInt(3); m.batt = randInt(6)
-      m.fp2 = randInt(4); m.gpu = 3 + randInt(6)
+      m.script = randInt(3)
+      m.batt = randInt(6)
+      m.fp2 = randInt(4)
+      m.gpu = 3 + randInt(6)
       break
     default:
-      m.script = randInt(3); m.auto = randInt(3)
-      m.browser = randInt(3); m.gpu = 3 + randInt(6)
+      m.script = randInt(3)
+      m.auto = randInt(3)
+      m.browser = randInt(3)
+      m.gpu = 3 + randInt(6)
   }
   return m
 }
@@ -172,22 +178,38 @@ function genMetricsPageSubmit(): Record<string, number> {
 function genInteraction(eventType: string): Record<string, unknown> {
   if (eventType === 'PageLoad' || eventType === 'first_load') {
     return {
-      clicks: 0, touches: 0, keyPresses: 0,
-      cuts: 0, copies: 0, pastes: 0,
-      keyPressTimeIntervals: [], mouseClickPositions: [],
-      keyCycles: [], mouseCycles: [], touchCycles: []
+      clicks: 0,
+      touches: 0,
+      keyPresses: 0,
+      cuts: 0,
+      copies: 0,
+      pastes: 0,
+      keyPressTimeIntervals: [],
+      mouseClickPositions: [],
+      keyCycles: [],
+      mouseCycles: [],
+      touchCycles: []
     }
   }
   const nClicks = 1 + randInt(3)
   const nKeys = 3 + randInt(8)
   const nIntervals = Math.max(1, Math.floor(nKeys / 3)) + randInt(Math.max(1, Math.floor(nKeys / 2) - Math.floor(nKeys / 3) + 1))
-  const nCycles = Math.max(2, Math.floor(nKeys / 2)) + randInt(Math.max(1, Math.floor(nKeys * 2 / 3) - Math.floor(nKeys / 2) + 1))
+  const nCycles =
+    Math.max(2, Math.floor(nKeys / 2)) +
+    randInt(Math.max(1, Math.floor((nKeys * 2) / 3) - Math.floor(nKeys / 2) + 1))
 
   return {
-    clicks: nClicks, touches: 0, keyPresses: nKeys,
-    cuts: 0, copies: 0, pastes: 0,
+    clicks: nClicks,
+    touches: 0,
+    keyPresses: nKeys,
+    cuts: 0,
+    copies: 0,
+    pastes: 0,
     keyPressTimeIntervals: Array.from({ length: nIntervals }, () => 80 + randInt(621)),
-    mouseClickPositions: Array.from({ length: nClicks }, () => `${400 + randInt(401)},${300 + randInt(201)}`),
+    mouseClickPositions: Array.from(
+      { length: nClicks },
+      () => `${400 + randInt(401)},${300 + randInt(201)}`
+    ),
     keyCycles: Array.from({ length: nCycles }, () => 20 + randInt(281)),
     mouseCycles: Array.from({ length: nClicks }, () => 50 + randInt(101)),
     touchCycles: []
@@ -195,7 +217,9 @@ function genInteraction(eventType: string): Record<string, unknown> {
 }
 
 function genFormField(
-  startMs: number, emailLen: number, email: string,
+  startMs: number,
+  emailLen: number,
+  email: string,
   interaction: Record<string, unknown>
 ): Record<string, unknown> {
   const fieldTs = startMs - (10 + randInt(41))
@@ -215,13 +239,23 @@ function genFormField(
 
   return {
     [fieldName]: {
-      clicks: 1, touches: 0, keyPresses: nKeys,
-      cuts: 0, copies: 0, pastes: 0,
+      clicks: 1,
+      touches: 0,
+      keyPresses: nKeys,
+      cuts: 0,
+      copies: 0,
+      pastes: 0,
       keyPressTimeIntervals: intervals,
       mouseClickPositions: [`${100 + randInt(151)}.5,${10 + randInt(11)}.5`],
-      keyCycles, mouseCycles: [80 + randInt(71)], touchCycles: [],
-      width: 180, height: 32, totalFocusTime: 0,
-      checksum: cksum, autocomplete: false, prefilled: false
+      keyCycles,
+      mouseCycles: [80 + randInt(71)],
+      touchCycles: [],
+      width: 180,
+      height: 32,
+      totalFocusTime: 0,
+      checksum: cksum,
+      autocomplete: false,
+      prefilled: false
     }
   }
 }
@@ -241,24 +275,17 @@ export function buildFingerprintData(
   locationURL: string,
   referrer: string,
   nowMs: number,
-  ctx: FingerprintContext | null,
+  ctx: FingerprintContext,
   pageType: string,
   eventType: string,
   timeOnPage: number,
   emailLen: number,
   email: string
 ): OrderedMap {
-  const canvasHash = ctx ? ctx.canvasHash : identity.canvasHash
-  const histogram = ctx ? ctx.histogramBins : identity.histogramBase
-
-  const perfTiming = ctx ? getPerfTiming(ctx, nowMs) : genPerfTiming(nowMs)
-
-  let lsUbid: string
-  if (ctx) {
-    lsUbid = getLsUbid(ctx, pageType)
-  } else {
-    lsUbid = `${identity.lsubidPrefixSignin}-${String(randInt(10000000)).padStart(7, '0')}-${String(randInt(10000000)).padStart(7, '0')}:${Math.floor(perfTiming.loadEventEnd / 1000)}`
-  }
+  const canvasHash = ctx.canvasHash
+  const histogram = ctx.histogramBins
+  const perfTiming = getPerfTiming(ctx, nowMs)
+  const lsUbid = getLsUbid(ctx, pageType)
 
   let dynamicURLs: string[]
   let scriptsElapsed: number
@@ -269,7 +296,7 @@ export function buildFingerprintData(
     case 'profile':
       dynamicURLs = [`/dist/main/app_${identity.webpackHash}.min.js`]
       scriptsElapsed = 0
-      historyLength = (eventType === 'PageLoad' || eventType === 'first_load') ? 2 : 3
+      historyLength = eventType === 'PageLoad' || eventType === 'first_load' ? 2 : 3
       isCompatible = true
       break
     case 'signup':
@@ -298,7 +325,7 @@ export function buildFingerprintData(
   let startTime: number
   if (eventType !== 'PageLoad' && eventType !== 'first_load' && timeOnPage > 0) {
     startTime = endMs - timeOnPage
-  } else if (ctx) {
+  } else {
     if (eventType === 'first_load') {
       startTime = getStartTime(ctx, nowMs - (500 + randInt(501)))
     } else if (eventType === 'PageLoad' && pageType === 'profile') {
@@ -306,8 +333,6 @@ export function buildFingerprintData(
     } else {
       startTime = getStartTime(ctx, nowMs)
     }
-  } else {
-    startTime = nowMs
   }
 
   const pluginsStr = formatPlugins(identity.plugins)
@@ -318,8 +343,11 @@ export function buildFingerprintData(
   result.set('start', startTime)
   result.set('interaction', interaction)
   result.set('scripts', {
-    dynamicUrls: dynamicURLs, inlineHashes: [],
-    elapsed: scriptsElapsed, dynamicUrlCount: dynamicURLs.length, inlineHashesCount: 0
+    dynamicUrls: dynamicURLs,
+    inlineHashes: [],
+    elapsed: scriptsElapsed,
+    dynamicUrlCount: dynamicURLs.length,
+    inlineHashesCount: 0
   })
   result.set('history', { length: historyLength })
   result.set('battery', {})
@@ -341,18 +369,28 @@ export function buildFingerprintData(
   result.set('webDriver', false)
   result.set('capabilities', {
     css: {
-      textShadow: 1, WebkitTextStroke: 1, boxShadow: 1,
-      borderRadius: 1, borderImage: 1, opacity: 1,
-      transform: 1, transition: 1
+      textShadow: 1,
+      WebkitTextStroke: 1,
+      boxShadow: 1,
+      borderRadius: 1,
+      borderImage: 1,
+      opacity: 1,
+      transform: 1,
+      transition: 1
     },
     js: {
-      audio: true, geolocation: true, localStorage: 'supported',
-      touch: false, video: true, webWorker: true
+      audio: true,
+      geolocation: true,
+      localStorage: 'supported',
+      touch: false,
+      video: true,
+      webWorker: true
     },
     elapsed: 0
   })
   result.set('gpu', {
-    vendor: identity.gpuVendor, model: identity.gpuModel,
+    vendor: identity.gpuVendor,
+    model: identity.gpuModel,
     extensions: identity.webGLExts
   })
   result.set('dnt', null)
@@ -368,7 +406,12 @@ export function buildFingerprintData(
     }
   }
 
-  if (pageType === 'profile' && eventType !== 'PageLoad' && eventType !== 'first_load' && emailLen > 0) {
+  if (
+    pageType === 'profile' &&
+    eventType !== 'PageLoad' &&
+    eventType !== 'first_load' &&
+    emailLen > 0
+  ) {
     result.set('form', genFormField(nowMs, emailLen, email, interaction))
   } else {
     result.set('form', {})
@@ -388,7 +431,7 @@ export function generateFingerprint(
   identity: BrowserIdentity,
   locationURL: string,
   referrer: string,
-  ctx: FingerprintContext | null,
+  ctx: FingerprintContext,
   pageType: string,
   eventType: string,
   timeOnPage: number,
